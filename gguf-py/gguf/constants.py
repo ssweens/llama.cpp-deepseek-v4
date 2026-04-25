@@ -127,6 +127,7 @@ class Keys:
         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+        NUM_HASH_LAYERS                   = "{arch}.num_hash_layers"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         POOLING_TYPE                      = "{arch}.pooling_type"
         LOGIT_SCALE                       = "{arch}.logit_scale"
@@ -145,6 +146,10 @@ class Keys:
         INTERLEAVE_MOE_LAYER_STEP         = "{arch}.interleave_moe_layer_step"
         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
+        SWIGLU_LIMIT                      = "{arch}.swiglu_limit"
+        HYPERCONNECTION_MULT              = "{arch}.hyperconnection.mult"
+        HYPERCONNECTION_SINKHORN_ITERS    = "{arch}.hyperconnection.sinkhorn_iters"
+        HYPERCONNECTION_EPS               = "{arch}.hyperconnection.eps"
         ALTUP_ACTIVE_IDX                  = "{arch}.altup.active_idx"
         ALTUP_NUM_INPUTS                  = "{arch}.altup.num_inputs"
         EMBD_LENGTH_PER_LAYER_INP         = "{arch}.embedding_length_per_layer_input"
@@ -171,6 +176,13 @@ class Keys:
         ICLR_LORA_RANK               = "{arch}.attention.iclr_lora_rank"
         VALUE_RESIDUAL_MIX_LORA_RANK = "{arch}.attention.value_residual_mix_lora_rank"
         GATE_LORA_RANK               = "{arch}.attention.gate_lora_rank"
+        OUTPUT_LORA_RANK             = "{arch}.attention.o_lora_rank"
+        OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
+        INDEX_HEAD_COUNT             = "{arch}.attention.index_head_count"
+        INDEX_HEAD_DIM               = "{arch}.attention.index_head_dim"
+        INDEX_TOPK                   = "{arch}.attention.index_topk"
+        COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
+        COMPRESS_ROPE_THETA          = "{arch}.attention.compress_rope_theta"
         REL_BUCKETS_COUNT            = "{arch}.attention.relative_buckets_count"
         SLIDING_WINDOW               = "{arch}.attention.sliding_window"
         SCALE                        = "{arch}.attention.scale"
@@ -442,6 +454,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK         = auto()
     DEEPSEEK2        = auto()
     DEEPSEEK2OCR     = auto()
+    DEEPSEEK4        = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -647,6 +660,29 @@ class MODEL_TENSOR(IntEnum):
     ATTN_V_B             = auto()
     ATTN_Q_A_NORM        = auto()
     ATTN_KV_A_NORM       = auto()
+    ATTN_WKV             = auto()
+    ATTN_O_A             = auto()
+    ATTN_O_B             = auto()
+    ATTN_COMPRESSOR_WKV  = auto()
+    ATTN_COMPRESSOR_WGATE = auto()
+    ATTN_COMPRESSOR_APE  = auto()
+    ATTN_COMPRESSOR_NORM = auto()
+    ATTN_INDEXER_Q_B     = auto()
+    ATTN_INDEXER_WEIGHTS_PROJ = auto()
+    ATTN_INDEXER_COMPRESSOR_WKV = auto()
+    ATTN_INDEXER_COMPRESSOR_WGATE = auto()
+    ATTN_INDEXER_COMPRESSOR_APE = auto()
+    ATTN_INDEXER_COMPRESSOR_NORM = auto()
+    HC_HEAD_FN           = auto()
+    HC_HEAD_BASE         = auto()
+    HC_HEAD_SCALE        = auto()
+    HC_ATTN_FN           = auto()
+    HC_ATTN_BASE         = auto()
+    HC_ATTN_SCALE        = auto()
+    HC_FFN_FN            = auto()
+    HC_FFN_BASE          = auto()
+    HC_FFN_SCALE         = auto()
+    FFN_GATE_TID2EID     = auto()
     FFN_SUB_NORM         = auto()
     ATTN_SUB_NORM        = auto()
     DEC_ATTN_NORM        = auto()
@@ -928,6 +964,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK:         "deepseek",
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -1132,6 +1169,29 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_V_B:                  "blk.{bid}.attn_v_b",
     MODEL_TENSOR.ATTN_Q_A_NORM:             "blk.{bid}.attn_q_a_norm",
     MODEL_TENSOR.ATTN_KV_A_NORM:            "blk.{bid}.attn_kv_a_norm",
+    MODEL_TENSOR.ATTN_WKV:                  "blk.{bid}.attn_wkv",
+    MODEL_TENSOR.ATTN_O_A:                  "blk.{bid}.attn_o_a",
+    MODEL_TENSOR.ATTN_O_B:                  "blk.{bid}.attn_o_b",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_wkv",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_wgate",
+    MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
+    MODEL_TENSOR.ATTN_COMPRESSOR_NORM:      "blk.{bid}.attn_compressor_norm",
+    MODEL_TENSOR.ATTN_INDEXER_Q_B:          "blk.{bid}.attn_indexer_q_b",
+    MODEL_TENSOR.ATTN_INDEXER_WEIGHTS_PROJ: "blk.{bid}.attn_indexer_weights_proj",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WKV:   "blk.{bid}.attn_indexer_compressor_wkv",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WGATE: "blk.{bid}.attn_indexer_compressor_wgate",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_APE:   "blk.{bid}.attn_indexer_compressor_ape",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_NORM:  "blk.{bid}.attn_indexer_compressor_norm",
+    MODEL_TENSOR.HC_HEAD_FN:                "hc_head_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "hc_head_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "hc_head_scale",
+    MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
+    MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
+    MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
+    MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
+    MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
     MODEL_TENSOR.ATTN_SUB_NORM:             "blk.{bid}.attn_sub_norm",
     MODEL_TENSOR.FFN_SUB_NORM:              "blk.{bid}.ffn_sub_norm",
     MODEL_TENSOR.DEC_ATTN_NORM:             "dec.blk.{bid}.attn_norm",
@@ -2816,6 +2876,47 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
+    MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_WKV,
+        MODEL_TENSOR.ATTN_O_A,
+        MODEL_TENSOR.ATTN_O_B,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WKV,
+        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_APE,
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM,
+        MODEL_TENSOR.ATTN_INDEXER_Q_B,
+        MODEL_TENSOR.ATTN_INDEXER_WEIGHTS_PROJ,
+        MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WKV,
+        MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WGATE,
+        MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_APE,
+        MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_NORM,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_TID2EID,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -4028,8 +4129,9 @@ class GGMLQuantizationType(IntEnum):
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX  = 1
-    SIGMOID  = 2
+    SOFTMAX       = 1
+    SIGMOID       = 2
+    SQRT_SOFTPLUS = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h

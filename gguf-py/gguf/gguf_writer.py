@@ -859,6 +859,21 @@ class GGUFWriter:
     def add_experts_per_group(self, count: int) -> None:
         self.add_uint32(Keys.LLM.EXPERTS_PER_GROUP.format(arch=self.arch), count)
 
+    def add_num_hash_layers(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NUM_HASH_LAYERS.format(arch=self.arch), count)
+
+    def add_swiglu_limit(self, value: float) -> None:
+        self.add_float32(Keys.LLM.SWIGLU_LIMIT.format(arch=self.arch), value)
+
+    def add_hyperconnection_mult(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HYPERCONNECTION_MULT.format(arch=self.arch), value)
+
+    def add_hyperconnection_sinkhorn_iters(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HYPERCONNECTION_SINKHORN_ITERS.format(arch=self.arch), value)
+
+    def add_hyperconnection_eps(self, value: float) -> None:
+        self.add_float32(Keys.LLM.HYPERCONNECTION_EPS.format(arch=self.arch), value)
+
     def add_moe_every_n_layers(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MOE_EVERY_N_LAYERS.format(arch=self.arch), value)
 
@@ -930,6 +945,27 @@ class GGUFWriter:
 
     def add_gate_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.GATE_LORA_RANK.format(arch=self.arch), length)
+
+    def add_output_lora_rank(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.OUTPUT_LORA_RANK.format(arch=self.arch), length)
+
+    def add_output_group_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.OUTPUT_GROUP_COUNT.format(arch=self.arch), count)
+
+    def add_index_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.INDEX_HEAD_COUNT.format(arch=self.arch), count)
+
+    def add_index_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.INDEX_HEAD_DIM.format(arch=self.arch), value)
+
+    def add_index_topk(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.INDEX_TOPK.format(arch=self.arch), value)
+
+    def add_compress_ratios(self, values: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.COMPRESS_RATIOS.format(arch=self.arch), values)
+
+    def add_compress_rope_theta(self, value: float) -> None:
+        self.add_float32(Keys.Attention.COMPRESS_ROPE_THETA.format(arch=self.arch), value)
 
     def add_relative_attn_buckets_count(self, value: int) -> None:
         self.add_uint32(Keys.Attention.REL_BUCKETS_COUNT.format(arch=self.arch), value)

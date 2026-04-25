@@ -14,6 +14,7 @@ enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4,
 };
 
 enum llama_swa_type {
@@ -71,10 +72,19 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> deepseek4_compress_ratios;
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+    uint32_t n_lora_o           = 0;
+    uint32_t n_o_groups         = 0;
+    uint32_t n_head_index       = 0;
+    uint32_t n_embd_head_index  = 0;
+    uint32_t n_attn_index_topk  = 0;
+    uint32_t n_hash_layers      = 0;
+    uint32_t n_hc               = 0;
+    uint32_t n_hc_sinkhorn_iters = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
@@ -112,6 +122,7 @@ struct llama_hparams {
     uint32_t n_lora_gate            = 0;
 
     float    rope_attn_factor = 1.0f;
+    float    rope_freq_base_compress = 0.0f;
     float    rope_freq_base_train;
     float    rope_freq_base_train_swa  = 10000.0f;
     float    rope_freq_scale_train;
@@ -156,6 +167,8 @@ struct llama_hparams {
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
+    float f_swiglu_limit   = 0.0f;
+    float f_hc_eps         = 1e-6f;
 
     // Additional scale factors (Granite/Granite MoE)
     float f_residual_scale  = 0.0f;

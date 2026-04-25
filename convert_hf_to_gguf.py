@@ -9252,6 +9252,406 @@ class Mistral3Model(TextModel):
 
     def write(self):
         self.impl.write()
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._expert_cache: dict[tuple[int, str], dict[int, dict[str, Tensor]]] = {}
+
+    @staticmethod
+    def _scale_e8m0_to_float(scale: Tensor) -> Tensor:
+        if scale.dtype == torch.uint8:
+            return torch.pow(torch.tensor(2.0, dtype=torch.float32), scale.to(torch.float32) - 127.0)
+        return scale.to(torch.float32)
+
+    @classmethod
+    def _dequant_fp8(cls, weight: Tensor, scale: Tensor, block_size: Sequence[int]) -> Tensor:
+        if weight.dtype != torch.float8_e4m3fn:
+            return weight
+
+        if len(block_size) != 2:
+            raise ValueError(f"DeepSeek-V4 FP8 block size must have 2 dimensions, got {block_size}")
+
+        block_m, block_n = block_size
+        weight_f = weight.to(torch.float32)
+        scale_f = cls._scale_e8m0_to_float(scale)
+
+        m, n = weight_f.shape
+        pad_m = (-m) % block_m
+        pad_n = (-n) % block_n
+        if pad_m != 0 or pad_n != 0:
+            weight_f = torch.nn.functional.pad(weight_f, (0, pad_n, 0, pad_m))
+
+        weight_f = weight_f.reshape(
+            (m + pad_m) // block_m,
+            block_m,
+            (n + pad_n) // block_n,
+            block_n,
+        )
+        weight_f = weight_f * scale_f[:, None, :, None]
+        weight_f = weight_f.reshape(m + pad_m, n + pad_n)
+        return weight_f[:m, :n]
+
+    @staticmethod
+    def _is_routed_expert(name: str) -> bool:
+        return ".ffn.experts." in name and ".shared_experts." not in name
+
+    def dequant_model(self):
+        quant_config = self.hparams.get("quantization_config")
+        if not isinstance(quant_config, dict) or quant_config.get("quant_method") != "fp8":
+            return
+
+        block_size = tuple(quant_config.get("weight_block_size", (128, 128)))
+        tensors_to_remove: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith(".scale"):
+                continue
+
+            weight_name = name.removesuffix(".scale") + ".weight"
+            if weight_name not in self.model_tensors:
+                continue
+
+            if self._is_routed_expert(weight_name):
+                # Routed experts are native MXFP4 payloads plus E8M0 scales. Keep
+                # both tensors raw so modify_tensors can assemble GGML MXFP4 blocks.
+                continue
+
+            weight = self.model_tensors[weight_name]
+            scale = self.model_tensors[name]
+            self.model_tensors[weight_name] = lambda w=weight, s=scale, bs=block_size: self._dequant_fp8(w(), s(), bs)
+            tensors_to_remove.append(name)
+
+        for name in tensors_to_remove:
+            self.model_tensors.pop(name, None)
+
+    def set_vocab(self):
+        try:
+            self._set_vocab_gpt2()
+            return
+        except Exception as e:
+            logger.warning("DeepSeek-V4 tokenizer could not be loaded through AutoTokenizer (%s); falling back to tokenizer.json", e)
+
+        from tokenizers import Tokenizer
+
+        tokenizer_path = self.dir_model / "tokenizer.json"
+        if not tokenizer_path.is_file():
+            raise FileNotFoundError(f"DeepSeek-V4 tokenizer fallback requires {tokenizer_path}")
+
+        tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        vocab = tokenizer.get_vocab(with_added_tokens=True)
+        vocab_size = self.hparams["vocab_size"]
+        assert max(vocab.values()) < vocab_size
+
+        # DeepSeek-V4 uses the same tokenizer/pre-tokenizer behavior as the
+        # DeepSeek-V3 family, but older Transformers releases do not know the
+        # deepseek_v4 config type yet and fail before constructing a tokenizer.
+        tokpre = "deepseek-v3"
+        reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in vocab.items()}
+
+        with open(tokenizer_path, "r", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+        added_token_ids = {tok["id"]: tok for tok in tokenizer_json.get("added_tokens", []) if "id" in tok}
+
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+                continue
+
+            token = reverse_vocab[i]
+            tokens.append(token)
+            added = added_token_ids.get(i)
+            if added is None:
+                toktypes.append(gguf.TokenType.NORMAL)
+            elif added.get("special", False) or self.does_token_look_special(token):
+                toktypes.append(gguf.TokenType.CONTROL)
+            else:
+                toktypes.append(gguf.TokenType.USER_DEFINED)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+        self.gguf_writer.add_block_count(self.block_count)
+        self.gguf_writer.add_context_length(hparams["max_position_embeddings"])
+        self.gguf_writer.add_embedding_length(hparams["hidden_size"])
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+        self.gguf_writer.add_head_count(hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count_kv(hparams.get("num_key_value_heads", 1))
+        self.gguf_writer.add_key_length(hparams["head_dim"])
+        self.gguf_writer.add_value_length(hparams["head_dim"])
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_output_lora_rank(hparams["o_lora_rank"])
+        self.gguf_writer.add_output_group_count(hparams["o_groups"])
+        self.gguf_writer.add_index_head_count(hparams["index_n_heads"])
+        self.gguf_writer.add_index_head_dim(hparams["index_head_dim"])
+        self.gguf_writer.add_index_topk(hparams["index_topk"])
+        self.gguf_writer.add_compress_ratios(hparams["compress_ratios"][:self.block_count])
+        self.gguf_writer.add_compress_rope_theta(hparams["compress_rope_theta"])
+        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+        self.gguf_writer.add_hyperconnection_mult(hparams["hc_mult"])
+        self.gguf_writer.add_hyperconnection_sinkhorn_iters(hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hyperconnection_eps(hparams.get("hc_eps", 1e-6))
+        self.gguf_writer.add_num_hash_layers(hparams.get("num_hash_layers", 0))
+        self.gguf_writer.add_swiglu_limit(hparams.get("swiglu_limit", 0.0))
+        self.gguf_writer.add_layer_norm_rms_eps(hparams["rms_norm_eps"])
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_feed_forward_length(hparams["moe_intermediate_size"] * hparams.get("n_shared_experts", 1))
+        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_used_count(hparams["num_experts_per_tok"])
+        self.gguf_writer.add_expert_shared_count(hparams.get("n_shared_experts", 1))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRT_SOFTPLUS)
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_rope_freq_base(hparams.get("rope_theta", 10000.0))
+
+        rope_scaling = hparams.get("rope_scaling") or {}
+        if rope_scaling.get("rope_type", rope_scaling.get("type")) == "yarn" and "factor" in rope_scaling:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            self.gguf_writer.add_rope_scaling_factor(rope_scaling["factor"])
+            self.gguf_writer.add_rope_scaling_orig_ctx_len(rope_scaling["original_max_position_embeddings"])
+            if "beta_fast" in rope_scaling:
+                self.gguf_writer.add_rope_scaling_yarn_beta_fast(rope_scaling["beta_fast"])
+            if "beta_slow" in rope_scaling:
+                self.gguf_writer.add_rope_scaling_yarn_beta_slow(rope_scaling["beta_slow"])
+
+        self.gguf_writer.add_file_type(self.ftype)
+
+    def _map_tensor_name_v4(self, name: str, bid: int | None = None) -> str:
+        top_remap = {
+            "embed.weight": "token_embd.weight",
+            "norm.weight": "output_norm.weight",
+            "head.weight": "output.weight",
+            "hc_head_fn": "hc_head_fn",
+            "hc_head_base": "hc_head_base",
+            "hc_head_scale": "hc_head_scale",
+        }
+        if name in top_remap:
+            return top_remap[name]
+
+        match = re.match(r"layers\.(\d+)\.(.+)", name)
+        if match is None:
+            raise ValueError(f"Can not map DeepSeek-V4 tensor {name!r}")
+
+        layer = int(match.group(1))
+        rest = match.group(2)
+        prefix = f"blk.{layer}."
+
+        remap = {
+            "attn.wq_a.weight": "attn_q_a.weight",
+            "attn.wq_b.weight": "attn_q_b.weight",
+            "attn.q_norm.weight": "attn_q_a_norm.weight",
+            "attn.wkv.weight": "attn_wkv.weight",
+            "attn.kv_norm.weight": "attn_kv_a_norm.weight",
+            "attn.wo_a.weight": "attn_o_a.weight",
+            "attn.wo_b.weight": "attn_o_b.weight",
+            "attn.attn_sink": "attn_sinks.weight",
+            "attn.compressor.wkv.weight": "attn_compressor_wkv.weight",
+            "attn.compressor.wgate.weight": "attn_compressor_wgate.weight",
+            "attn.compressor.ape": "attn_compressor_ape.weight",
+            "attn.compressor.norm.weight": "attn_compressor_norm.weight",
+            "attn.indexer.wq_b.weight": "attn_indexer_q_b.weight",
+            "attn.indexer.weights_proj.weight": "attn_indexer_weights_proj.weight",
+            "attn.indexer.compressor.wkv.weight": "attn_indexer_compressor_wkv.weight",
+            "attn.indexer.compressor.wgate.weight": "attn_indexer_compressor_wgate.weight",
+            "attn.indexer.compressor.ape": "attn_indexer_compressor_ape.weight",
+            "attn.indexer.compressor.norm.weight": "attn_indexer_compressor_norm.weight",
+            "hc_attn_fn": "hc_attn_fn",
+            "hc_attn_base": "hc_attn_base",
+            "hc_attn_scale": "hc_attn_scale",
+            "hc_ffn_fn": "hc_ffn_fn",
+            "hc_ffn_base": "hc_ffn_base",
+            "hc_ffn_scale": "hc_ffn_scale",
+            "ffn.gate.weight": "ffn_gate_inp.weight",
+            "ffn.gate.bias": "exp_probs_b.bias",
+            "ffn.gate.tid2eid": "ffn_gate_tid2eid",
+            "ffn.shared_experts.w1.weight": "ffn_gate_shexp.weight",
+            "ffn.shared_experts.w2.weight": "ffn_down_shexp.weight",
+            "ffn.shared_experts.w3.weight": "ffn_up_shexp.weight",
+            "ffn.experts.w1.weight": "ffn_gate_exps.weight",
+            "ffn.experts.w2.weight": "ffn_down_exps.weight",
+            "ffn.experts.w3.weight": "ffn_up_exps.weight",
+        }
+        if rest in remap:
+            return prefix + remap[rest]
+
+        raise ValueError(f"Can not map DeepSeek-V4 tensor {name!r}")
+
+    @staticmethod
+    def _as_uint8_payload(tensor: Tensor) -> Tensor:
+        if tensor.dtype == torch.uint8:
+            return tensor
+        if tensor.dtype in (torch.int8, torch.float8_e8m0fnu):
+            return tensor.view(torch.uint8)
+        return tensor.to(torch.uint8)
+
+    def _pack_mxfp4_experts(self, weights: list[Tensor], scales: list[Tensor]) -> Tensor:
+        packed_experts: list[Tensor] = []
+        for weight, scale in zip(weights, scales):
+            weight_u8 = self._as_uint8_payload(weight).contiguous()
+            scale_u8 = self._as_uint8_payload(scale).contiguous()
+
+            if weight_u8.shape[-1] * 2 != scale_u8.shape[-1] * 32:
+                raise ValueError(
+                    f"DeepSeek-V4 expert FP4 payload/scale shape mismatch: "
+                    f"weight={tuple(weight_u8.shape)}, scale={tuple(scale_u8.shape)}"
+                )
+
+            n_blocks = scale_u8.shape[-1]
+            blocks = weight_u8.reshape(*weight_u8.shape[:-1], n_blocks, 16)
+            low = blocks & 0x0F
+            high = (blocks >> 4) & 0x0F
+            values = torch.stack((low, high), dim=-1).reshape(*weight_u8.shape[:-1], n_blocks, 32)
+            qs = (values[..., :16] | (values[..., 16:] << 4)).to(torch.uint8)
+            packed = torch.cat((scale_u8.unsqueeze(-1), qs), dim=-1)
+            packed_experts.append(packed.reshape(*weight_u8.shape[:-1], n_blocks * 17))
+
+        return torch.stack(packed_experts, dim=0).contiguous()
+
+    def _maybe_emit_expert_tensor(self, bid: int, proj: str) -> list[tuple[str, Tensor, gguf.GGMLQuantizationType]]:
+        n_experts = self.hparams["n_routed_experts"]
+        cache_key = (bid, proj)
+        experts = self._expert_cache[cache_key]
+        if len(experts) < n_experts or any("weight" not in v or "scale" not in v for v in experts.values()):
+            return []
+
+        weights = [experts[i]["weight"] for i in range(n_experts)]
+        scales = [experts[i]["scale"] for i in range(n_experts)]
+        packed = self._pack_mxfp4_experts(weights, scales)
+        del self._expert_cache[cache_key]
+
+        new_name = self._map_tensor_name_v4(f"layers.{bid}.ffn.experts.{proj}.weight")
+        logger.info(f"Repacked {new_name} with shape {list(packed.shape)} and quantization MXFP4")
+        return [(new_name, packed, gguf.GGMLQuantizationType.MXFP4)]
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor] | tuple[str, Tensor, gguf.GGMLQuantizationType]]:
+        if name.startswith("mtp."):
+            return []
+
+        match = re.match(r"layers\.(\d+)\.", name)
+        if match and int(match.group(1)) >= self.block_count:
+            return []
+
+        expert_match = re.match(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)", name)
+        if expert_match is not None:
+            layer = int(expert_match.group(1))
+            expert = int(expert_match.group(2))
+            proj = expert_match.group(3)
+            suffix = expert_match.group(4)
+            cache = self._expert_cache.setdefault((layer, proj), {})
+            cache.setdefault(expert, {})[suffix] = data_torch
+            return self._maybe_emit_expert_tensor(layer, proj)
+
+        if name.endswith(".scale"):
+            return []
+
+        if name.endswith("ffn.gate.tid2eid"):
+            data_torch = data_torch.to(torch.int32)
+
+        return [(self._map_tensor_name_v4(name, bid), data_torch)]
+
+    def _write_tensor(
+        self,
+        name: str,
+        data_torch: Tensor,
+        old_dtype: torch.dtype,
+        max_name_len: int,
+        bid: int | None,
+        raw_qtype: gguf.GGMLQuantizationType | None = None,
+    ):
+        if raw_qtype is not None:
+            data = self._as_uint8_payload(data_torch).contiguous().numpy()
+            shape = gguf.quant_shape_from_byte_shape(data.shape, raw_qtype)
+            shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+            logger.info(f"{f'%-{max_name_len}s' % f'{name},'} {old_dtype} --> {raw_qtype.name}, shape = {shape_str}")
+            self.gguf_writer.add_tensor(name, data, raw_dtype=raw_qtype)
+            return
+
+        if data_torch.dtype in (torch.int32, torch.int64):
+            if data_torch.dtype == torch.int64:
+                data_torch = data_torch.to(torch.int32)
+            data = data_torch.contiguous().numpy()
+            shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+            logger.info(f"{f'%-{max_name_len}s' % f'{name},'} {old_dtype} --> {data.dtype}, shape = {shape_str}")
+            self.gguf_writer.add_tensor(name, data)
+            return
+
+        if data_torch.dtype not in (torch.float16, torch.float32):
+            data_torch = data_torch.to(torch.float32)
+
+        data = data_torch.numpy()
+        n_dims = len(data.shape)
+        data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, name, bid, n_dims)
+
+        if n_dims <= 1 or name.endswith("_norm.weight"):
+            data_qtype = gguf.GGMLQuantizationType.F32
+
+        if data_qtype is False and name[-7:] not in (".weight", ".lora_a", ".lora_b"):
+            data_qtype = gguf.GGMLQuantizationType.F32
+
+        if isinstance(data_qtype, bool):
+            if self.ftype == gguf.LlamaFileType.ALL_F32:
+                data_qtype = gguf.GGMLQuantizationType.F32
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
+                data_qtype = gguf.GGMLQuantizationType.F16
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                data_qtype = gguf.GGMLQuantizationType.BF16
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
+                data_qtype = gguf.GGMLQuantizationType.Q8_0
+            else:
+                raise ValueError(f"DeepSeek-V4 converter supports f32/f16/bf16/q8_0 outtypes for non-expert tensors, got {self.ftype.name}")
+
+        try:
+            data = gguf.quants.quantize(data, data_qtype)
+        except gguf.QuantError as e:
+            logger.warning("%s, %s", e, "falling back to F16")
+            data_qtype = gguf.GGMLQuantizationType.F16
+            data = gguf.quants.quantize(data, data_qtype)
+
+        shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+        shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+        logger.info(f"{f'%-{max_name_len}s' % f'{name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+        self.gguf_writer.add_tensor(name, data, raw_dtype=data_qtype)
+
+    def prepare_tensors(self):
+        mapped_name_len = max((len(s) for _, s in self.tensor_map.mapping.values()), default=64)
+        max_name_len = max(mapped_name_len, 64) + len(".weight,")
+
+        for name, data_torch in self.get_tensors():
+            if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
+                continue
+
+            old_dtype = data_torch.dtype
+            bid = None
+            for part in name.split("."):
+                if part.isdecimal():
+                    bid = int(part)
+                    break
+
+            for item in self.modify_tensors(data_torch, name, bid):
+                if len(item) == 3:
+                    new_name, new_data, raw_qtype = item
+                    self._write_tensor(new_name, new_data, old_dtype, max_name_len, bid, raw_qtype)
+                else:
+                    new_name, new_data = item
+                    self._write_tensor(new_name, new_data, old_dtype, max_name_len, bid)
+
+        if self._expert_cache:
+            remaining = {
+                f"layer {layer} {proj}": sorted(experts.keys())
+                for (layer, proj), experts in self._expert_cache.items()
+            }
+            raise ValueError(f"Unprocessed DeepSeek-V4 routed experts: {remaining}")
 
 
 @ModelBase.register("MiniMaxM2ForCausalLM")
@@ -13211,6 +13611,8 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
         torch.uint8: np.uint8,
     }
 
@@ -13231,6 +13633,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.bool: np.uint8,
         torch.float8_e4m3fn: np.uint8,
         torch.float8_e5m2: np.uint8,
+        torch.float8_e8m0fnu: np.uint8,
     }
 
     # used for safetensors slices
@@ -13252,6 +13655,10 @@ class LazyTorchTensor(gguf.LazyBase):
         "BOOL": torch.bool,
         "F8_E4M3": torch.float8_e4m3fn,
         "F8_E5M2": torch.float8_e5m2,
+        # Keep E8M0 scales as raw bytes; PyTorch can represent the dtype, but
+        # the converter needs exact scale payloads for FP8 dequantization and
+        # MXFP4 expert preservation.
+        "F8_E8M0": torch.uint8,
     }
 
     def numpy(self) -> gguf.LazyNumpyTensor:
