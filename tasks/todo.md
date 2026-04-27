@@ -253,3 +253,44 @@ Complete DeepSeek-V4 support end-to-end in staged milestones:
     - first plain layer only: Python and llama.cpp both emit `' factorial'`
     - renamed compressed second layer only: Python and llama.cpp both emit `'劳'`
   - this strongly suggests the remaining bug is in two-layer interaction / state propagation precision, not in either single layer by itself
+
+## VALIDATION RESULTS (2026-04-27, post-FP8-dequant fix on v4 GGUF)
+
+### ✅ Prefill works correctly
+- "What is 2+2?" → `The answer is 2 + 2 equals 4.` + EOS  (n=32, CUDA -ngl 8, fa=1, temp=0)
+- First ~10-15 generated tokens are coherent and grammatically/semantically correct.
+
+### ❌ Decode degenerates into token loops past ~10-15 generated tokens
+Reproduced on:
+- CUDA -ngl 8 with fa=1 (Fibonacci prompt): coherent start `def fibonacci(n):\n    if n <= 0:\n        return 0\n` then loops on `a, b = 0\n a, b = 0\n ...`
+- CUDA -ngl 8 with fa=0 (apples prompt): `Let's break it down step by step by step.\n\nLet's break this down step by step:\n\n1. You start with **step by step:\n\n1. **Step by step:\n\n1. **Step:` (loop on "Step:")
+- CUDA -ngl 8 with fa=1 (apples prompt): `Let's break it down step-by-step:\n\n1. Start with 3 apples:  \n3 apples:  \n3 apples: ...` (single-line loop)
+
+The bug is **not** flash-attn-related (reproduces with both -fa 1 and -fa 0).
+The bug is **not** sampling-related (greedy temp=0 top_k=1, no penalties).
+The bug **is** decode-phase: prefill produces correct logits, first decode token correct, then drift starts.
+
+### Hypotheses (in order of suspicion)
+1. **Decode-phase compressed-KV cache update** (`llama-memory-hybrid-iswa.cpp`) — DSv4 has chunked compressors with `compress_ratios=[0,0,4,128,...]`. Each `ratio` decode tokens append a new compressed slot. Off-by-one position or window-shift errors here would corrupt attention as the compressed cache grows.
+2. **Decode-phase mask construction in `deepseek4.cpp`** — we fixed `dsv4_prompt_comp_mask_input` for **prefill** (use absolute pos, `(p1+1)/ratio`). No matching fix verified for decode-phase mask paths.
+3. **HC state stale across decode steps** — hyper-connection feedback may not be reset/propagated correctly per decode token.
+4. **Indexer top-k decode path** — incremental top-k score updates over compressed cache may pick wrong slots after decode begins.
+5. **Antirez BF16 inference is itself untested** — only their IQ2XXS GGUF was validated by antirez, so the shared hybrid-iswa decode logic may be broken at BF16 precision.
+
+### What's known good
+- All weights byte-perfect after dequant fix (verified empirically).
+- Prefill logits produce correct first-token greedy choice.
+- Architecture plumbing and ggml ops produce sensible (not random) output for the first ~15 tokens.
+
+### Diff size that needs review for decode bug
+- `src/models/deepseek4.cpp`: 2795-line diff vs antirez (we diverged for HC state machinery, indexer top-k, FP8 controls).
+- `src/llama-memory-hybrid-iswa.cpp`: 56-line diff vs antirez (purely cosmetic field renames + DSV4_COMPRESSED_DECODE_UBATCH_MAX 128 vs 512). **Logic identical to antirez.**
+
+### Recommended next steps
+1. **Lower DSV4_COMPRESSED_DECODE_UBATCH_MAX back to 512** to match antirez exactly (possibly relevant if our compressor decode batches differently).
+2. **Diff-audit decode-phase code paths** in `deepseek4.cpp` against antirez line-by-line, focus on:
+   - decode-phase compressor mask construction
+   - HC state propagation across decode tokens
+   - indexer top-k decode-phase score accumulation
+3. **Add diagnostic logging** in `dsv4_compressed_kv_state_decode_*` calls to verify positions/slots are incremented correctly.
+4. **Test with antirez's IQ2XXS GGUF on antirez's binary** to confirm the antirez decode path itself works at all (download blocked previously).

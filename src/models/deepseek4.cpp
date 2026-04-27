@@ -802,7 +802,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         }
 
         if (norm != nullptr) {
-            pool = build_norm(pool, norm, nullptr, LLM_NORM_RMS, il_cur);
+            pool = ggml_rms_norm(ctx0, pool, hparams.f_norm_rms_eps);
+            pool = ggml_mul(ctx0, pool, norm);
         }
 
         cb(pool, tag, il_cur);
@@ -965,19 +966,58 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     auto dsv4_build_compressor_decode_chunk = [&](ggml_tensor * x, ggml_tensor * prev_kv_state, ggml_tensor * prev_score_state,
                                                   ggml_tensor * wkv, ggml_tensor * wgate, ggml_tensor * ape, ggml_tensor * norm,
                                                   int64_t head_dim, int64_t compress_ratio, const dsv4_rope_cfg & rope_cfg) -> dsv4_decode_compressor {
+        // Match antirez: project the whole decode chunk once, then view each token's
+        // projected row. This keeps chunked decode graph semantics identical to the
+        // reference path and avoids one matmul subgraph per token.
+        const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
+        ggml_tensor * kv_all = ggml_mul_mat(ctx0, wkv, x);   // [width, n_tokens]
+        ggml_tensor * sc_all = ggml_mul_mat(ctx0, wgate, x);
+        ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx0, ape, GGML_TYPE_F32);
+
         ggml_tensor * kv_state = prev_kv_state;
         ggml_tensor * score_state = prev_score_state;
         ggml_tensor * kv_comp = nullptr;
 
         for (int64_t i = 0; i < n_tokens; ++i) {
             const llama_pos pos_i = ubatch.pos ? ubatch.pos[i] : (llama_pos) i;
-            ggml_tensor * xi = ggml_view_2d(ctx0, x, x->ne[0], 1, x->nb[1], i * x->nb[1]);
+            const int64_t pos_mod = pos_i % compress_ratio;
 
-            dsv4_decode_compressor dec = dsv4_build_compressor_decode(xi, kv_state, score_state, wkv, wgate, ape, norm, head_dim, pos_i, compress_ratio, rope_cfg);
-            kv_state = dec.kv_state;
-            score_state = dec.score_state;
-            if (dec.kv_comp != nullptr) {
-                kv_comp = kv_comp == nullptr ? dec.kv_comp : ggml_concat(ctx0, kv_comp, dec.kv_comp, 2);
+            ggml_tensor * kv_cur = ggml_view_2d(ctx0, kv_all, layout.width, 1, kv_all->nb[1], i * kv_all->nb[1]);
+            ggml_tensor * sc_cur = ggml_view_2d(ctx0, sc_all, layout.width, 1, sc_all->nb[1], i * sc_all->nb[1]);
+            sc_cur = ggml_add(ctx0, sc_cur, ggml_view_2d(ctx0, ape_f, layout.width, 1, ape_f->nb[1], pos_mod * ape_f->nb[1]));
+
+            const int64_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
+            const bool should_compress = (pos_i + 1) % compress_ratio == 0;
+
+            ggml_tensor * row_idx = dsv4_arange_i32(ctx0, row, row + 1);
+            kv_state = ggml_set_rows(ctx0, kv_state, kv_cur, row_idx);
+            score_state = ggml_set_rows(ctx0, score_state, sc_cur, row_idx);
+
+            if (should_compress) {
+                ggml_tensor * kv_pool;
+                ggml_tensor * score_pool;
+
+                if (compress_ratio == 4) {
+                    ggml_tensor * kv_prev = dsv4_view_cols(ctx0, kv_state, head_dim, compress_ratio, 0, 0);
+                    ggml_tensor * kv_curr = dsv4_view_cols(ctx0, kv_state, head_dim, compress_ratio, head_dim, compress_ratio);
+                    ggml_tensor * sc_prev = dsv4_view_cols(ctx0, score_state, head_dim, compress_ratio, 0, 0);
+                    ggml_tensor * sc_curr = dsv4_view_cols(ctx0, score_state, head_dim, compress_ratio, head_dim, compress_ratio);
+
+                    kv_pool = ggml_concat(ctx0, kv_prev, kv_curr, 1);
+                    score_pool = ggml_concat(ctx0, sc_prev, sc_curr, 1);
+
+                    ggml_tensor * shifted_kv = dsv4_view_cols(ctx0, kv_state, layout.width, compress_ratio, 0, compress_ratio);
+                    ggml_tensor * shifted_score = dsv4_view_cols(ctx0, score_state, layout.width, compress_ratio, 0, compress_ratio);
+                    kv_state = ggml_concat(ctx0, shifted_kv, shifted_kv, 1);
+                    score_state = ggml_concat(ctx0, shifted_score, shifted_score, 1);
+                } else {
+                    kv_pool = kv_state;
+                    score_pool = score_state;
+                }
+
+                ggml_tensor * comp_pos = dsv4_arange_i32(ctx0, pos_i + 1 - compress_ratio, pos_i + 2 - compress_ratio);
+                ggml_tensor * cur_comp = dsv4_pool_decode_state(kv_pool, score_pool, norm, comp_pos, head_dim, rope_cfg);
+                kv_comp = kv_comp == nullptr ? cur_comp : ggml_concat(ctx0, kv_comp, cur_comp, 2);
             }
         }
 
@@ -1012,7 +1052,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         q_residual = build_norm(q_residual, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
         cb(q_residual, "attn_q_a_norm", il);
 
-        ggml_tensor * q_residual_fp8_src = ggml_cast(ctx0, q_residual, GGML_TYPE_BF16);
+        ggml_tensor * q_residual_fp8_src = hparams.deepseek4_fp8_wq_b ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
         ggml_tensor * q_residual_fp8 = apply_dense_fp8_qat(q_residual_fp8_src, hparams.deepseek4_fp8_wq_b, "attn_q_a_norm_fp8_qat", il);
         ggml_tensor * Qcur = mul_mat_checked(model.layers[il].wq_b, q_residual_fp8, "attn.wq_b");
         Qcur = cast_dense_fp8_out(Qcur, hparams.deepseek4_fp8_wq_b);
@@ -1224,7 +1264,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         ggml_tensor * idx_kv_3d = ggml_reshape_3d(ctx0, idx_comp, idx_dim, 1, n_comp);
 
                         // Q: matmul wq_b @ q_residual; reshape to [idx_dim, n_index_heads, n_tokens]; partial rope
-                        ggml_tensor * idx_q_inp_src = ggml_cast(ctx0, q_residual, GGML_TYPE_BF16);
+                        ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
                         ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_inp_fp8_qat", il);
                         ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.q_b");
                         idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
@@ -1354,8 +1394,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             dsv4_store_state_segment(ctx0, gf, dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
             dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
 
-            if (dec.kv_comp != nullptr && n_comp_visible > n_comp_before) {
-                dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), dec.kv_comp, n_comp_before, n_comp_visible - n_comp_before);
+            ggml_tensor * kv_comp_new_for_attn = nullptr;
+            const int64_t n_comp_new = n_comp_visible - n_comp_before;
+            if (dec.kv_comp != nullptr && n_comp_new > 0) {
+                // Match antirez and the prompt path: compressed attention KV rows are
+                // partial-RoPE'd first, then FP8-quantized on the nope prefix before
+                // entering the compressed cache. The indexer cache below intentionally
+                // remains BF16/F32 and must not use this quantization step.
+                kv_comp_new_for_attn = apply_fp8_qat_nope_2d(dec.kv_comp, "attn_compressor_decode_qat", il);
+                dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), kv_comp_new_for_attn, n_comp_before, n_comp_new);
             }
 
             if (compress_ratio == 4 && model.layers[il].attn_indexer_compressor_wkv != nullptr && index_state_layout.elems > 0) {
@@ -1390,8 +1437,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
 
             const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
-            ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il));
-            ggml_tensor * k_raw = mctx_swa->get_k(ctx0, il);
+            ggml_tensor * k_store = mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il);
+            ggml_build_forward_expand(gf, k_store);
+
+            ggml_tensor * k_raw_ref = mctx_swa->get_k(ctx0, il);
+            ggml_tensor * k_raw = ggml_view_4d(ctx0, k_store,
+                    k_raw_ref->ne[0], k_raw_ref->ne[1], k_raw_ref->ne[2], k_raw_ref->ne[3],
+                    k_raw_ref->nb[1], k_raw_ref->nb[2], k_raw_ref->nb[3], k_raw_ref->view_offs);
             k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head, 1, k_raw->ne[2]);
             k_raw = as_f32(k_raw);
 
@@ -1400,7 +1452,18 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * attn_mask = inp_attn_iswa->self_kq_mask_swa;
 
             if (n_comp_visible > 0) {
-                ggml_tensor * kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                ggml_tensor * kv_comp_cache = nullptr;
+                if (kv_comp_new_for_attn != nullptr && n_comp_new > 0) {
+                    ggml_tensor * kv_new = ggml_reshape_3d(ctx0, ggml_cont(ctx0, kv_comp_new_for_attn), n_embd_head, 1, n_comp_new);
+                    if (n_comp_before > 0) {
+                        ggml_tensor * kv_old = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_before);
+                        kv_comp_cache = ggml_concat(ctx0, as_f32(kv_old), as_f32(kv_new), 2);
+                    } else {
+                        kv_comp_cache = kv_new;
+                    }
+                } else {
+                    kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                }
                 kv_comp_cache = as_f32(kv_comp_cache);
                 Kall = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
                 Vall = Kall;
@@ -1425,7 +1488,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
                         index_cache = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(index_cache)), idx_dim, 1, n_comp_visible);
 
-                        ggml_tensor * idx_q_inp_src = ggml_cast(ctx0, q_residual, GGML_TYPE_BF16);
+                        ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
                         ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_decode_inp_fp8_qat", il);
                         ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.decode.q_b");
                         idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
@@ -1585,24 +1648,12 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         moe_out = as_f32(moe_out);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * shexp_inp_src = hparams.deepseek4_fp8_shared_expert ? ggml_cast(ctx0, ffn_act_inp, GGML_TYPE_BF16) : ffn_act_inp;
-        ggml_tensor * shexp_inp = apply_dense_fp8_qat(shexp_inp_src, hparams.deepseek4_fp8_shared_expert, "ffn_shexp_inp_fp8_qat", il);
-        ggml_tensor * shexp_up = mul_mat_checked(model.layers[il].ffn_up_shexp, shexp_inp, "ffn.shexp.up");
-        shexp_up = cast_dense_fp8_out(shexp_up, hparams.deepseek4_fp8_shared_expert);
-        cb(shexp_up, "ffn_shexp_up", il);
-
-        ggml_tensor * shexp_gate = mul_mat_checked(model.layers[il].ffn_gate_shexp, shexp_inp, "ffn.shexp.gate");
-        shexp_gate = cast_dense_fp8_out(shexp_gate, hparams.deepseek4_fp8_shared_expert);
-        cb(shexp_gate, "ffn_shexp_gate", il);
-
-        ggml_tensor * shexp_hidden = ggml_swiglu_split(ctx0, as_f32(shexp_gate), as_f32(shexp_up));
-        shexp_hidden = as_f32(shexp_hidden);
-        cb(shexp_hidden, "ffn_shexp_swiglu", il);
-
-        ggml_tensor * shexp_hidden_fp8_src = hparams.deepseek4_fp8_shared_expert ? ggml_cast(ctx0, shexp_hidden, GGML_TYPE_BF16) : shexp_hidden;
-        shexp_hidden = apply_dense_fp8_qat(shexp_hidden_fp8_src, hparams.deepseek4_fp8_shared_expert, "ffn_shexp_hidden_fp8_qat", il);
-        ggml_tensor * shexp_out = mul_mat_checked(model.layers[il].ffn_down_shexp, shexp_hidden, "ffn.shexp.down");
-        shexp_out = cast_dense_fp8_out(shexp_out, hparams.deepseek4_fp8_shared_expert);
+        ggml_tensor * shexp_out = build_ffn(ffn_act_inp,
+                model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, il);
         shexp_out = as_f32(shexp_out);
         cb(shexp_out, "ffn_shexp_out", il);
 

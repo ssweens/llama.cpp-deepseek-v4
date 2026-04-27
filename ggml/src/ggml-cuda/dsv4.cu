@@ -381,27 +381,28 @@ void ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, struct g
 // Partial RoPE: copies nope dims, applies YaRN RoPE to last n_dims.
 // Grid: (ne01, ne02, ne03), threads: min(256, ne00).
 
-static __device__ void rope_yarn_ramp_device(const float low, const float high, const int i0,
-                                              float * cos_theta, float * sin_theta,
-                                              float theta_scaled, float ext_factor,
-                                              float attn_factor) {
-    const float ramp = fminf(1.0f, fmaxf(0.0f, (i0 / 2 - low) / fmaxf(0.001f, high - low)));
-    const float mix  = (1.0f - ramp) * ext_factor;
-    theta_scaled = theta_scaled * (1.0f - mix) + theta_scaled / (mix == 0.0f ? 1.0f : mix) * mix;
-    *cos_theta = cosf(theta_scaled) * attn_factor;
-    *sin_theta = sinf(theta_scaled) * attn_factor;
+// CPU-parity YaRN, mirrors ggml-cpu/ops.cpp:rope_yarn_ramp / rope_yarn.
+// IMPORTANT: dsv4_apply_rope_tail callers pass an attn_factor that has
+// already been divided by (1 + 0.1*log(1/freq_scale)) so that the YaRN
+// magnitude scaling embedded in this function cancels out. Any change
+// to the magnitude path here must keep that contract.
+static __device__ float rope_yarn_ramp_device(float low, float high, int i0) {
+    const float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
 }
 
-static __device__ void rope_yarn_device(float theta, float freq_scale, float lo, float hi,
-                                        int i0, float ext_factor, float attn_factor,
+static __device__ void rope_yarn_device(float theta_extrap, float freq_scale, float lo, float hi,
+                                        int i0, float ext_factor, float mscale,
                                         float * cos_theta, float * sin_theta) {
-    const float theta_scaled = theta * freq_scale;
-    if (ext_factor == 0.0f) {
-        *cos_theta = cosf(theta_scaled) * attn_factor;
-        *sin_theta = sinf(theta_scaled) * attn_factor;
-    } else {
-        rope_yarn_ramp_device(lo, hi, i0, cos_theta, sin_theta, theta_scaled, ext_factor, attn_factor);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = rope_yarn_ramp_device(lo, hi, i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
+    *cos_theta = cosf(theta) * mscale;
+    *sin_theta = sinf(theta) * mscale;
 }
 
 static __device__ void rope_yarn_corr_dims_device(int n_dims, int n_ctx_orig, float freq_base,
