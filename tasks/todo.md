@@ -294,3 +294,31 @@ The bug **is** decode-phase: prefill produces correct logits, first decode token
    - indexer top-k decode-phase score accumulation
 3. **Add diagnostic logging** in `dsv4_compressed_kv_state_decode_*` calls to verify positions/slots are incremented correctly.
 4. **Test with antirez's IQ2XXS GGUF on antirez's binary** to confirm the antirez decode path itself works at all (download blocked previously).
+
+## VALIDATION RESULTS (2026-04-27, post CUDA YaRN-parity fix on commit 405e3ef18)
+
+### ✅ End-to-end inference works on both backends
+| Test | Backend | n  | Result |
+|------|---------|----|--------|
+| Regression: "What is 2+2?" | CUDA -ngl 8 | 32  | ✅ "2 + 2 = 4" + EOS |
+| Apples math reasoning | CUDA -ngl 8  | 64  | ✅ Coherent step-by-step |
+| Apples math reasoning | CUDA -ngl 8  | 128 | ✅ Complete, \boxed{6} + EOS |
+| Apples math reasoning | CUDA -ngl 16 | 96  | ✅ Complete, \boxed{6} + EOS |
+| Apples math reasoning | CPU only     | 128 | ✅ Token-for-token match with CUDA |
+| Fibonacci Python code | CUDA -ngl 8  | 128 | ✅ Correct iterative impl, EOS |
+| Honeybees prose       | CUDA -ngl 8  | 256 | ✅ 124 tokens fluent factual, EOS |
+
+### Known limits (not regressions)
+- `-ngl 24` and above OOMs against 32 GiB 5090 VRAM with BF16 GGUF.
+  - Resolved naturally once MXFP4 GGUF is rebuilt for routed experts.
+
+### Open follow-ups (not blockers)
+1. Rebuild MXFP4 GGUF with new wire format. Routed experts at MXFP4 should
+   fit much higher `-ngl` and exercise the CUDA mxfp4-q8_0 path end-to-end.
+2. Run llama-perplexity on a small calibration set to numerically verify
+   parity vs. antirez's BF16 baseline.
+3. Long-context test (n_ctx >= 65536) once a sufficiently long prompt and
+   GGUF that fits in working set are available.
+4. Multi-turn chat formatting test using the official DSv4 Jinja template.
+5. Test multi-batch prefill (chunked prompt > n_batch) to exercise the
+   compressor chunk path beyond decode chunks.
