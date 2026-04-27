@@ -865,14 +865,14 @@ class GGUFWriter:
     def add_swiglu_limit(self, value: float) -> None:
         self.add_float32(Keys.LLM.SWIGLU_LIMIT.format(arch=self.arch), value)
 
-    def add_hyperconnection_mult(self, value: int) -> None:
-        self.add_uint32(Keys.LLM.HYPERCONNECTION_MULT.format(arch=self.arch), value)
+    def add_hyperconnection_count(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HYPERCONNECTION_COUNT.format(arch=self.arch), value)
 
-    def add_hyperconnection_sinkhorn_iters(self, value: int) -> None:
-        self.add_uint32(Keys.LLM.HYPERCONNECTION_SINKHORN_ITERS.format(arch=self.arch), value)
+    def add_hyperconnection_sinkhorn_iterations(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.HYPERCONNECTION_SINKHORN_ITERATIONS.format(arch=self.arch), value)
 
-    def add_hyperconnection_eps(self, value: float) -> None:
-        self.add_float32(Keys.LLM.HYPERCONNECTION_EPS.format(arch=self.arch), value)
+    def add_hyperconnection_epsilon(self, value: float) -> None:
+        self.add_float32(Keys.LLM.HYPERCONNECTION_EPSILON.format(arch=self.arch), value)
 
     def add_moe_every_n_layers(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MOE_EVERY_N_LAYERS.format(arch=self.arch), value)
@@ -966,6 +966,12 @@ class GGUFWriter:
 
     def add_compress_rope_theta(self, value: float) -> None:
         self.add_float32(Keys.Attention.COMPRESS_ROPE_THETA.format(arch=self.arch), value)
+
+    def add_attention_output_lora_rank(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.OUTPUT_LORA_RANK.format(arch=self.arch), value)
+
+    def add_hash_layer_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.HASH_LAYER_COUNT.format(arch=self.arch), count)
 
     def add_relative_attn_buckets_count(self, value: int) -> None:
         self.add_uint32(Keys.Attention.REL_BUCKETS_COUNT.format(arch=self.arch), value)

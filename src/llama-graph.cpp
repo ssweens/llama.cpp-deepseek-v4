@@ -11,6 +11,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1320,7 +1322,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1340,7 +1343,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        selected_experts_in
     );
 }
 
@@ -1367,10 +1371,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * selected_experts_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
-    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    const bool weight_before_ffn  = arch == LLM_ARCH_LLAMA4;     // for llama4, we apply the sigmoid-ed weights before the FFN
+    const bool weight_before_down = arch == LLM_ARCH_DEEPSEEK4;  // DeepSeek-V4 applies routed weights after SwiGLU and before w2
 
     ggml_tensor * logits = nullptr;
 
@@ -1399,6 +1405,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            {
+                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
             } break;
         default:
             GGML_ABORT("fatal error");
@@ -1450,9 +1460,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
-    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    cb(selected_experts, "ffn_moe_topk", il);
+    ggml_tensor * selected_experts = selected_experts_in;
+    if (selected_experts == nullptr) {
+        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        cb(selected_experts, "ffn_moe_topk", il);
+    } else {
+        cb(selected_experts, "ffn_moe_topk", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
@@ -1579,10 +1594,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate_exps) {
+                constexpr float eps = 1e-6f;
+
+                if (arch == LLM_ARCH_DEEPSEEK4) {
+                    const float limit = hparams.f_swiglu_limit;
+                    if (limit > eps) {
+                        cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                        cb(cur, "ffn_moe_gate_clamped", il);
+
+                        up = ggml_clamp(ctx0, up, -limit, limit);
+                        cb(up, "ffn_moe_up_clamped", il);
+
+                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
+                        cb(gate_act, "ffn_moe_silu", il);
+
+                        cur = ggml_mul(ctx0, gate_act, up);
+                        cb(cur, "ffn_moe_swiglu_limited", il);
+                        break;
+                    }
+                }
+
                 // Step35: per-layer clamp for routed experts
                 if (arch == LLM_ARCH_STEP35 && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
-                    constexpr float eps = 1e-6f;
                     if (limit > eps) {
                         ggml_tensor * gate_act = ggml_silu(ctx0, cur);
                         cb(gate_act, "ffn_moe_silu", il);
@@ -1643,6 +1677,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    if (weight_before_down) {
+        cur = ggml_mul(ctx0, cur, weights);
+        cb(cur, "ffn_moe_weighted_swiglu", il);
+    }
+
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
@@ -1660,7 +1699,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !weight_before_down) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }

@@ -9298,6 +9298,18 @@ class DeepseekV4Model(TextModel):
     def _is_routed_expert(name: str) -> bool:
         return ".ffn.experts." in name and ".shared_experts." not in name
 
+    @staticmethod
+    def _ignore_fp8_scale_artifact(weight_name: str) -> bool:
+        # Reserved for future tensors whose `.scale` companions should be
+        # ignored. The grouped output projection pre-stage (wo_a / attn_o_a)
+        # IS scale-aware: the official DeepSeek-V4 inference convert.py
+        # explicitly dequantizes wo_a using its FP8 block scales and stores
+        # the result as BF16. Skipping that step turns wo_a into raw FP8
+        # byte values — ~3000× magnitude error per layer — producing
+        # multilingual garbage logits.
+        del weight_name
+        return False
+
     def dequant_model(self):
         quant_config = self.hparams.get("quantization_config")
         if not isinstance(quant_config, dict) or quant_config.get("quant_method") != "fp8":
@@ -9317,6 +9329,10 @@ class DeepseekV4Model(TextModel):
             if self._is_routed_expert(weight_name):
                 # Routed experts are native MXFP4 payloads plus E8M0 scales. Keep
                 # both tensors raw so modify_tensors can assemble GGML MXFP4 blocks.
+                continue
+
+            if self._ignore_fp8_scale_artifact(weight_name):
+                tensors_to_remove.append(name)
                 continue
 
             weight = self.model_tensors[weight_name]
@@ -9381,6 +9397,9 @@ class DeepseekV4Model(TextModel):
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_writer)
 
+    def _has_tensor_suffix(self, suffix: str) -> bool:
+        return any(name.endswith(suffix) for name in self.model_tensors)
+
     def set_gguf_parameters(self):
         hparams = self.hparams
         self.gguf_writer.add_block_count(self.block_count)
@@ -9392,25 +9411,39 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_key_length(hparams["head_dim"])
         self.gguf_writer.add_value_length(hparams["head_dim"])
         self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
-        self.gguf_writer.add_output_lora_rank(hparams["o_lora_rank"])
+        self.gguf_writer.add_attention_output_lora_rank(hparams["o_lora_rank"])
         self.gguf_writer.add_output_group_count(hparams["o_groups"])
         self.gguf_writer.add_index_head_count(hparams["index_n_heads"])
         self.gguf_writer.add_index_head_dim(hparams["index_head_dim"])
         self.gguf_writer.add_index_topk(hparams["index_topk"])
         self.gguf_writer.add_compress_ratios(hparams["compress_ratios"][:self.block_count])
         self.gguf_writer.add_compress_rope_theta(hparams["compress_rope_theta"])
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.dense_fp8", (hparams.get("quantization_config") or {}).get("quant_method") == "fp8")
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_qkv",
+                                  self._has_tensor_suffix('.attn.wq_a.scale') or self._has_tensor_suffix('.attn.wq_b.scale') or self._has_tensor_suffix('.attn.wkv.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_a", self._has_tensor_suffix('.attn.wq_a.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_b", self._has_tensor_suffix('.attn.wq_b.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wkv", self._has_tensor_suffix('.attn.wkv.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_out", self._has_tensor_suffix('.attn.wo_b.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.indexer_q", self._has_tensor_suffix('.attn.indexer.wq_b.scale'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.shared_expert",
+                                  self._has_tensor_suffix('.ffn.shared_experts.w1.scale') or self._has_tensor_suffix('.ffn.shared_experts.w2.scale') or self._has_tensor_suffix('.ffn.shared_experts.w3.scale'))
         self.gguf_writer.add_sliding_window(hparams["sliding_window"])
-        self.gguf_writer.add_hyperconnection_mult(hparams["hc_mult"])
-        self.gguf_writer.add_hyperconnection_sinkhorn_iters(hparams["hc_sinkhorn_iters"])
-        self.gguf_writer.add_hyperconnection_eps(hparams.get("hc_eps", 1e-6))
-        self.gguf_writer.add_num_hash_layers(hparams.get("num_hash_layers", 0))
-        self.gguf_writer.add_swiglu_limit(hparams.get("swiglu_limit", 0.0))
+        self.gguf_writer.add_hyperconnection_count(hparams["hc_mult"])
+        self.gguf_writer.add_hyperconnection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hyperconnection_epsilon(hparams.get("hc_eps", 1e-6))
+        self.gguf_writer.add_hash_layer_count(hparams.get("num_hash_layers", 0))
+        swiglu_limit = float(hparams.get("swiglu_limit", 0.0))
+        if swiglu_limit > 0.0:
+            self.gguf_writer.add_swiglu_clamp_exp([swiglu_limit] * self.block_count)
         self.gguf_writer.add_layer_norm_rms_eps(hparams["rms_norm_eps"])
         self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
         self.gguf_writer.add_expert_shared_feed_forward_length(hparams["moe_intermediate_size"] * hparams.get("n_shared_experts", 1))
         self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
         self.gguf_writer.add_expert_used_count(hparams["num_experts_per_tok"])
         self.gguf_writer.add_expert_shared_count(hparams.get("n_shared_experts", 1))
+        self.gguf_writer.add_expert_weights_scale(hparams.get("routed_scaling_factor", 1.5))
+        self.gguf_writer.add_expert_weights_norm(hparams.get("norm_topk_prob", True))
         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRT_SOFTPLUS)
         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
         self.gguf_writer.add_rope_freq_base(hparams.get("rope_theta", 10000.0))
@@ -9432,9 +9465,9 @@ class DeepseekV4Model(TextModel):
             "embed.weight": "token_embd.weight",
             "norm.weight": "output_norm.weight",
             "head.weight": "output.weight",
-            "hc_head_fn": "hc_head_fn",
-            "hc_head_base": "hc_head_base",
-            "hc_head_scale": "hc_head_scale",
+            "hc_head_fn": "output_hc_fn.weight",
+            "hc_head_base": "output_hc_base.weight",
+            "hc_head_scale": "output_hc_scale.weight",
         }
         if name in top_remap:
             return top_remap[name]
@@ -9448,33 +9481,35 @@ class DeepseekV4Model(TextModel):
         prefix = f"blk.{layer}."
 
         remap = {
+            "attn_norm.weight": "attn_norm.weight",
+            "ffn_norm.weight": "ffn_norm.weight",
             "attn.wq_a.weight": "attn_q_a.weight",
             "attn.wq_b.weight": "attn_q_b.weight",
             "attn.q_norm.weight": "attn_q_a_norm.weight",
-            "attn.wkv.weight": "attn_wkv.weight",
+            "attn.wkv.weight": "attn_kv.weight",
             "attn.kv_norm.weight": "attn_kv_a_norm.weight",
-            "attn.wo_a.weight": "attn_o_a.weight",
-            "attn.wo_b.weight": "attn_o_b.weight",
+            "attn.wo_a.weight": "attn_output_a.weight",
+            "attn.wo_b.weight": "attn_output_b.weight",
             "attn.attn_sink": "attn_sinks.weight",
-            "attn.compressor.wkv.weight": "attn_compressor_wkv.weight",
-            "attn.compressor.wgate.weight": "attn_compressor_wgate.weight",
+            "attn.compressor.wkv.weight": "attn_compressor_kv.weight",
+            "attn.compressor.wgate.weight": "attn_compressor_gate.weight",
             "attn.compressor.ape": "attn_compressor_ape.weight",
             "attn.compressor.norm.weight": "attn_compressor_norm.weight",
-            "attn.indexer.wq_b.weight": "attn_indexer_q_b.weight",
-            "attn.indexer.weights_proj.weight": "attn_indexer_weights_proj.weight",
-            "attn.indexer.compressor.wkv.weight": "attn_indexer_compressor_wkv.weight",
-            "attn.indexer.compressor.wgate.weight": "attn_indexer_compressor_wgate.weight",
-            "attn.indexer.compressor.ape": "attn_indexer_compressor_ape.weight",
-            "attn.indexer.compressor.norm.weight": "attn_indexer_compressor_norm.weight",
-            "hc_attn_fn": "hc_attn_fn",
-            "hc_attn_base": "hc_attn_base",
-            "hc_attn_scale": "hc_attn_scale",
-            "hc_ffn_fn": "hc_ffn_fn",
-            "hc_ffn_base": "hc_ffn_base",
-            "hc_ffn_scale": "hc_ffn_scale",
+            "attn.indexer.wq_b.weight": "indexer.attn_q_b.weight",
+            "attn.indexer.weights_proj.weight": "indexer.proj.weight",
+            "attn.indexer.compressor.wkv.weight": "indexer_compressor_kv.weight",
+            "attn.indexer.compressor.wgate.weight": "indexer_compressor_gate.weight",
+            "attn.indexer.compressor.ape": "indexer_compressor_ape.weight",
+            "attn.indexer.compressor.norm.weight": "indexer_compressor_norm.weight",
+            "hc_attn_fn": "hc_attn_fn.weight",
+            "hc_attn_base": "hc_attn_base.weight",
+            "hc_attn_scale": "hc_attn_scale.weight",
+            "hc_ffn_fn": "hc_ffn_fn.weight",
+            "hc_ffn_base": "hc_ffn_base.weight",
+            "hc_ffn_scale": "hc_ffn_scale.weight",
             "ffn.gate.weight": "ffn_gate_inp.weight",
             "ffn.gate.bias": "exp_probs_b.bias",
-            "ffn.gate.tid2eid": "ffn_gate_tid2eid",
+            "ffn.gate.tid2eid": "ffn_gate_tid2eid.weight",
             "ffn.shared_experts.w1.weight": "ffn_gate_shexp.weight",
             "ffn.shared_experts.w2.weight": "ffn_down_shexp.weight",
             "ffn.shared_experts.w3.weight": "ffn_up_shexp.weight",
@@ -9518,21 +9553,32 @@ class DeepseekV4Model(TextModel):
 
         return torch.stack(packed_experts, dim=0).contiguous()
 
-    def _maybe_emit_expert_tensor(self, bid: int, proj: str) -> list[tuple[str, Tensor, gguf.GGMLQuantizationType]]:
+    def _maybe_emit_expert_tensor(self, bid: int, proj: str) -> list[tuple[str, Tensor] | tuple[str, Tensor, gguf.GGMLQuantizationType]]:
         n_experts = self.hparams["n_routed_experts"]
         cache_key = (bid, proj)
         experts = self._expert_cache[cache_key]
-        if len(experts) < n_experts or any("weight" not in v or "scale" not in v for v in experts.values()):
+        if len(experts) < n_experts or any("weight" not in v for v in experts.values()):
             return []
 
         weights = [experts[i]["weight"] for i in range(n_experts)]
-        scales = [experts[i]["scale"] for i in range(n_experts)]
-        packed = self._pack_mxfp4_experts(weights, scales)
-        del self._expert_cache[cache_key]
-
         new_name = self._map_tensor_name_v4(f"layers.{bid}.ffn.experts.{proj}.weight")
-        logger.info(f"Repacked {new_name} with shape {list(packed.shape)} and quantization MXFP4")
-        return [(new_name, packed, gguf.GGMLQuantizationType.MXFP4)]
+
+        # Official DeepSeek-V4 checkpoints store routed experts as raw MXFP4 payload + scale.
+        # Small synthetic/debug checkpoints may keep them as regular float/BF16 weights.
+        if all("scale" in v for v in experts.values()):
+            scales = [experts[i]["scale"] for i in range(n_experts)]
+            packed = self._pack_mxfp4_experts(weights, scales)
+            del self._expert_cache[cache_key]
+            logger.info(f"Repacked {new_name} with shape {list(packed.shape)} and quantization MXFP4")
+            return [(new_name, packed, gguf.GGMLQuantizationType.MXFP4)]
+
+        if any("scale" in v for v in experts.values()):
+            raise ValueError(f"DeepSeek-V4 expert tensor mix is inconsistent for layer={bid} proj={proj}")
+
+        merged = torch.stack(weights, dim=0).contiguous()
+        del self._expert_cache[cache_key]
+        logger.info(f"Merged {new_name} with shape {list(merged.shape)} as floating-point routed experts")
+        return [(new_name, merged)]
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor] | tuple[str, Tensor, gguf.GGMLQuantizationType]]:
         if name.startswith("mtp."):
@@ -9624,6 +9670,15 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_tensor(name, data, raw_dtype=data_qtype)
 
     def prepare_tensors(self):
+        # CRITICAL: Run FP8 dequantization for dense weights (wq_a, wq_b, wkv,
+        # wo_a, wo_b, indexer.wq_b, shared_experts.w*). Without this, the raw
+        # FP8 byte values get directly cast to BF16 without applying their
+        # E8M0 block scales, producing weights with magnitudes ~3000× too
+        # large. The official DeepSeek-V4 inference convert.py applies these
+        # scales explicitly. Routed experts (FP4) have their own packing path
+        # in modify_tensors and are skipped by dequant_model.
+        self.dequant_model()
+
         mapped_name_len = max((len(s) for _, s in self.tensor_map.mapping.values()), default=64)
         max_name_len = max(mapped_name_len, 64) + len(".weight,")
 

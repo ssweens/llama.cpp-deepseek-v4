@@ -74,6 +74,16 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> deepseek4_compress_ratios;
 
+    bool     deepseek4_dense_fp8 = false;
+    bool     deepseek4_fp8_attn_qkv = false;
+    bool     deepseek4_fp8_wq_a = false;
+    bool     deepseek4_fp8_wq_b = false;
+    bool     deepseek4_fp8_wkv = false;
+    bool     deepseek4_fp8_attn_out = false;
+    bool     deepseek4_fp8_indexer_q = false;
+    bool     deepseek4_fp8_shared_expert = false;
+    uint32_t deepseek4_sliding_window = 0;
+    uint32_t deepseek4_state_size = 0;
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;

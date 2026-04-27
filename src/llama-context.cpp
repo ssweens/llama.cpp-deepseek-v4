@@ -2070,6 +2070,9 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        return std::max<uint32_t>(n_tokens * 80, 128u * model.n_tensors());
+    }
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
@@ -2211,6 +2214,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
+                if ((uint32_t) il >= model.hparams.n_layer) {
+                    LLAMA_LOG_WARN("%s: skipping norm backend pin for out-of-range layer index %d (%u layers)\n", __func__, il, model.hparams.n_layer);
+                    return;
+                }
+
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

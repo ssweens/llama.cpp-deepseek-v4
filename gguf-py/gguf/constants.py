@@ -128,6 +128,7 @@ class Keys:
         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
         NUM_HASH_LAYERS                   = "{arch}.num_hash_layers"
+        HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         POOLING_TYPE                      = "{arch}.pooling_type"
         LOGIT_SCALE                       = "{arch}.logit_scale"
@@ -147,9 +148,9 @@ class Keys:
         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
         SWIGLU_LIMIT                      = "{arch}.swiglu_limit"
-        HYPERCONNECTION_MULT              = "{arch}.hyperconnection.mult"
-        HYPERCONNECTION_SINKHORN_ITERS    = "{arch}.hyperconnection.sinkhorn_iters"
-        HYPERCONNECTION_EPS               = "{arch}.hyperconnection.eps"
+        HYPERCONNECTION_COUNT             = "{arch}.hyper_connection.count"
+        HYPERCONNECTION_SINKHORN_ITERATIONS = "{arch}.hyper_connection.sinkhorn_iterations"
+        HYPERCONNECTION_EPSILON           = "{arch}.hyper_connection.epsilon"
         ALTUP_ACTIVE_IDX                  = "{arch}.altup.active_idx"
         ALTUP_NUM_INPUTS                  = "{arch}.altup.num_inputs"
         EMBD_LENGTH_PER_LAYER_INP         = "{arch}.embedding_length_per_layer_input"
@@ -176,13 +177,13 @@ class Keys:
         ICLR_LORA_RANK               = "{arch}.attention.iclr_lora_rank"
         VALUE_RESIDUAL_MIX_LORA_RANK = "{arch}.attention.value_residual_mix_lora_rank"
         GATE_LORA_RANK               = "{arch}.attention.gate_lora_rank"
-        OUTPUT_LORA_RANK             = "{arch}.attention.o_lora_rank"
+        OUTPUT_LORA_RANK             = "{arch}.attention.output_lora_rank"
         OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
-        INDEX_HEAD_COUNT             = "{arch}.attention.index_head_count"
-        INDEX_HEAD_DIM               = "{arch}.attention.index_head_dim"
-        INDEX_TOPK                   = "{arch}.attention.index_topk"
+        INDEX_HEAD_COUNT             = "{arch}.attention.indexer.head_count"
+        INDEX_HEAD_DIM               = "{arch}.attention.indexer.key_length"
+        INDEX_TOPK                   = "{arch}.attention.indexer.top_k"
         COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
-        COMPRESS_ROPE_THETA          = "{arch}.attention.compress_rope_theta"
+        COMPRESS_ROPE_THETA          = "{arch}.attention.compress_rope_freq_base"
         REL_BUCKETS_COUNT            = "{arch}.attention.relative_buckets_count"
         SLIDING_WINDOW               = "{arch}.attention.sliding_window"
         SCALE                        = "{arch}.attention.scale"
@@ -1170,21 +1171,21 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_Q_A_NORM:             "blk.{bid}.attn_q_a_norm",
     MODEL_TENSOR.ATTN_KV_A_NORM:            "blk.{bid}.attn_kv_a_norm",
     MODEL_TENSOR.ATTN_WKV:                  "blk.{bid}.attn_wkv",
-    MODEL_TENSOR.ATTN_O_A:                  "blk.{bid}.attn_o_a",
-    MODEL_TENSOR.ATTN_O_B:                  "blk.{bid}.attn_o_b",
-    MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_wkv",
-    MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_wgate",
+    MODEL_TENSOR.ATTN_O_A:                  "blk.{bid}.attn_output_a",
+    MODEL_TENSOR.ATTN_O_B:                  "blk.{bid}.attn_output_b",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
+    MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
     MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
     MODEL_TENSOR.ATTN_COMPRESSOR_NORM:      "blk.{bid}.attn_compressor_norm",
-    MODEL_TENSOR.ATTN_INDEXER_Q_B:          "blk.{bid}.attn_indexer_q_b",
-    MODEL_TENSOR.ATTN_INDEXER_WEIGHTS_PROJ: "blk.{bid}.attn_indexer_weights_proj",
-    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WKV:   "blk.{bid}.attn_indexer_compressor_wkv",
-    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WGATE: "blk.{bid}.attn_indexer_compressor_wgate",
-    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_APE:   "blk.{bid}.attn_indexer_compressor_ape",
-    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_NORM:  "blk.{bid}.attn_indexer_compressor_norm",
-    MODEL_TENSOR.HC_HEAD_FN:                "hc_head_fn",
-    MODEL_TENSOR.HC_HEAD_BASE:              "hc_head_base",
-    MODEL_TENSOR.HC_HEAD_SCALE:             "hc_head_scale",
+    MODEL_TENSOR.ATTN_INDEXER_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.ATTN_INDEXER_WEIGHTS_PROJ: "blk.{bid}.indexer.proj",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WKV:   "blk.{bid}.indexer_compressor_kv",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_WGATE: "blk.{bid}.indexer_compressor_gate",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_APE:   "blk.{bid}.indexer_compressor_ape",
+    MODEL_TENSOR.ATTN_INDEXER_COMPRESSOR_NORM:  "blk.{bid}.indexer_compressor_norm",
+    MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
     MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
     MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
     MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",

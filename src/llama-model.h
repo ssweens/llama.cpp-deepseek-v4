@@ -452,6 +452,26 @@ struct llama_layer {
     // openai-moe
     struct ggml_tensor * attn_sinks = nullptr;
 
+    // deepseek4 compressor / indexer
+    struct ggml_tensor * attn_compressor_wkv           = nullptr;
+    struct ggml_tensor * attn_compressor_wgate         = nullptr;
+    struct ggml_tensor * attn_compressor_ape           = nullptr;
+    struct ggml_tensor * attn_compressor_norm          = nullptr;
+    struct ggml_tensor * attn_indexer_q_b              = nullptr;
+    struct ggml_tensor * attn_indexer_weights_proj     = nullptr;
+    struct ggml_tensor * attn_indexer_compressor_wkv   = nullptr;
+    struct ggml_tensor * attn_indexer_compressor_wgate = nullptr;
+    struct ggml_tensor * attn_indexer_compressor_ape   = nullptr;
+    struct ggml_tensor * attn_indexer_compressor_norm  = nullptr;
+
+    // deepseek4 hyper-connection
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -549,6 +569,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // deepseek4 hyper-connection head
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
 
     std::vector<llama_layer> layers;
 

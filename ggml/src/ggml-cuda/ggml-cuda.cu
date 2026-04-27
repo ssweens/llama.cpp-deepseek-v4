@@ -37,6 +37,7 @@
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
+#include "ggml-cuda/dsv4.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/softcap.cuh"
@@ -2865,6 +2866,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ROPE:
             ggml_cuda_op_rope(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            ggml_cuda_op_dsv4_hc_split_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+            ggml_cuda_op_dsv4_hc_weighted_sum(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_EXPAND:
+            ggml_cuda_op_dsv4_hc_expand(ctx, dst);
+            break;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            ggml_cuda_op_dsv4_fp8_kv_quantize(ctx, dst);
+            break;
+        case GGML_OP_DSV4_ROPE_TAIL:
+            ggml_cuda_op_dsv4_rope_tail(ctx, dst);
+            break;
         case GGML_OP_ROPE_BACK:
             ggml_cuda_op_rope_back(ctx, dst);
             break;
@@ -5172,6 +5188,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+        case GGML_OP_DSV4_HC_WEIGHTED_SUM:
+        case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+        case GGML_OP_DSV4_ROPE_TAIL:
             return true;
 
         default:
