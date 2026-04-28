@@ -430,14 +430,22 @@ static ggml_tensor * dsv4_view_state_segment(ggml_context * ctx, ggml_tensor * s
     return ggml_view_2d(ctx, state_all, width, rows, width * state_all->nb[0], state_off * state_all->nb[0]);
 }
 
-static void dsv4_store_state_segment(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * src, ggml_tensor * dst_state, int64_t state_size, uint32_t head, int64_t state_off) {
+// Store state for one or more sequences into the recurrent state buffer.
+// src shape: {elems} for single-seq, or {elems, n_seqs} for multi-seq.
+// Writes to n_seqs consecutive cells starting at head.
+static void dsv4_store_state_segment(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * src, ggml_tensor * dst_state, int64_t state_size, uint32_t head, int64_t state_off, int64_t n_seqs = 1) {
     GGML_ASSERT(src != nullptr && dst_state != nullptr);
-    const int64_t n = ggml_nelements(src);
     src = ggml_cont(ctx, src);
-    src = ggml_reshape_1d(ctx, src, n);
+    const int64_t elems_per_seq = ggml_nelements(src) / n_seqs;
 
-    ggml_tensor * dst_view = ggml_view_1d(ctx, dst_state, n, (head * state_size + state_off) * ggml_element_size(dst_state));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst_view));
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        ggml_tensor * src_s = (n_seqs == 1)
+            ? ggml_reshape_1d(ctx, src, elems_per_seq)
+            : ggml_reshape_1d(ctx, ggml_view_2d(ctx, src, elems_per_seq, 1, src->nb[1], s * src->nb[1]), elems_per_seq);
+        ggml_tensor * dst_view = ggml_view_1d(ctx, dst_state, elems_per_seq,
+                ((head + s) * state_size + state_off) * ggml_element_size(dst_state));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, src_s, dst_view));
+    }
 }
 
 static void dsv4_store_cache_rows(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * dst_cache, ggml_tensor * src, int64_t row_start, int64_t n_rows) {
@@ -493,6 +501,9 @@ static ggml_tensor * dsv4_shift_overlap_state(ggml_context * ctx, ggml_tensor * 
     return ggml_concat(ctx, pad, prev, 2);
 }
 
+// Build compressor prefill state for one or more sequences.
+// x: {n_embd, n_seq_tokens} for single-seq, or {n_embd, n_seq_tokens, n_seqs} for multi-seq.
+// Returns state pair where each tensor is {width, rows} for single-seq or {width, rows, n_seqs}.
 static dsv4_state_pair dsv4_build_compressor_prefill_state(
         ggml_context * ctx,
         ggml_tensor  * x,
@@ -500,41 +511,70 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
         ggml_tensor  * wgate,
         ggml_tensor  * ape,
         int64_t        head_dim,
-        int64_t        n_tokens,
-        int64_t        compress_ratio) {
+        int64_t        n_seq_tokens,
+        int64_t        compress_ratio,
+        int64_t        n_seqs = 1) {
     const dsv4_state_layout layout = dsv4_make_state_layout(compress_ratio, head_dim);
 
-    const int64_t cutoff    = (n_tokens / compress_ratio) * compress_ratio;
-    const int64_t remainder = n_tokens - cutoff;
+    const int64_t cutoff    = (n_seq_tokens / compress_ratio) * compress_ratio;
+    const int64_t remainder = n_seq_tokens - cutoff;
 
+    // ggml_mul_mat naturally batches over dim 2+, so these produce
+    // {width, n_seq_tokens} for n_seqs==1 or {width, n_seq_tokens, n_seqs} for n_seqs>1.
     ggml_tensor * kv    = ggml_mul_mat(ctx, wkv, x);
     ggml_tensor * score = ggml_mul_mat(ctx, wgate, x);
     ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx, ape, GGML_TYPE_F32);
 
+    // Helper to create filled tensors that broadcast across n_seqs
+    auto new_filled = [&](int64_t w, int64_t h, float val) -> ggml_tensor * {
+        if (n_seqs <= 1) {
+            return dsv4_new_filled_2d(ctx, w, h, val);
+        }
+        ggml_tensor * t2 = dsv4_new_filled_2d(ctx, w, h, val);
+        // Reshape to {w, h, 1} and repeat to {w, h, n_seqs}
+        t2 = ggml_reshape_3d(ctx, t2, w, h, 1);
+        return ggml_repeat_4d(ctx, t2, w, h, n_seqs, 1);
+    };
+
+    // View helper: for 2D/3D tensors, view rows [start, start+count) per sequence
+    auto view_rows = [&](ggml_tensor * t, int64_t w, int64_t count, int64_t start) -> ggml_tensor * {
+        if (n_seqs <= 1) {
+            return ggml_view_2d(ctx, t, w, count, t->nb[1], start * t->nb[1]);
+        }
+        return ggml_view_3d(ctx, t, w, count, n_seqs, t->nb[1], t->nb[2], start * t->nb[1]);
+    };
+
     if (compress_ratio == 4) {
-        ggml_tensor * kv_prev    = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, 0.0f);
-        ggml_tensor * score_prev = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
+        ggml_tensor * kv_prev    = new_filled(layout.width, compress_ratio, 0.0f);
+        ggml_tensor * score_prev = new_filled(layout.width, compress_ratio, -INFINITY);
 
         if (cutoff >= compress_ratio) {
-            kv_prev = ggml_view_2d(ctx, kv, layout.width, compress_ratio, kv->nb[1], (cutoff - compress_ratio) * kv->nb[1]);
-            score_prev = ggml_view_2d(ctx, score, layout.width, compress_ratio, score->nb[1], (cutoff - compress_ratio) * score->nb[1]);
+            kv_prev = view_rows(kv, layout.width, compress_ratio, cutoff - compress_ratio);
+            score_prev = view_rows(score, layout.width, compress_ratio, cutoff - compress_ratio);
             score_prev = ggml_add(ctx, score_prev, ape_f);
         }
 
-        ggml_tensor * kv_curr    = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, 0.0f);
-        ggml_tensor * score_curr = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
+        ggml_tensor * kv_curr    = new_filled(layout.width, compress_ratio, 0.0f);
+        ggml_tensor * score_curr = new_filled(layout.width, compress_ratio, -INFINITY);
 
         if (remainder > 0) {
-            ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, layout.width, remainder, kv->nb[1], cutoff * kv->nb[1]);
-            ggml_tensor * sc_rem = ggml_view_2d(ctx, score, layout.width, remainder, score->nb[1], cutoff * score->nb[1]);
-            sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
+            ggml_tensor * kv_rem = view_rows(kv, layout.width, remainder, cutoff);
+            ggml_tensor * sc_rem = view_rows(score, layout.width, remainder, cutoff);
+            if (n_seqs <= 1) {
+                sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
+            } else {
+                // Broadcast ape across n_seqs
+                ggml_tensor * ape_slice = ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0);
+                ape_slice = ggml_reshape_3d(ctx, ape_slice, layout.width, remainder, 1);
+                sc_rem = ggml_add(ctx, sc_rem, ape_slice);
+            }
 
             if (remainder == compress_ratio) {
                 kv_curr = kv_rem;
                 score_curr = sc_rem;
             } else {
-                kv_curr = ggml_concat(ctx, kv_rem, dsv4_new_filled_2d(ctx, layout.width, compress_ratio - remainder, 0.0f), 1);
-                score_curr = ggml_concat(ctx, sc_rem, dsv4_new_filled_2d(ctx, layout.width, compress_ratio - remainder, -INFINITY), 1);
+                kv_curr = ggml_concat(ctx, kv_rem, new_filled(layout.width, compress_ratio - remainder, 0.0f), 1);
+                score_curr = ggml_concat(ctx, sc_rem, new_filled(layout.width, compress_ratio - remainder, -INFINITY), 1);
             }
         }
 
@@ -544,20 +584,26 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
         };
     }
 
-    ggml_tensor * kv_state    = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, 0.0f);
-    ggml_tensor * score_state = dsv4_new_filled_2d(ctx, layout.width, compress_ratio, -INFINITY);
+    ggml_tensor * kv_state    = new_filled(layout.width, compress_ratio, 0.0f);
+    ggml_tensor * score_state = new_filled(layout.width, compress_ratio, -INFINITY);
 
     if (remainder > 0) {
-        ggml_tensor * kv_rem = ggml_view_2d(ctx, kv, layout.width, remainder, kv->nb[1], cutoff * kv->nb[1]);
-        ggml_tensor * sc_rem = ggml_view_2d(ctx, score, layout.width, remainder, score->nb[1], cutoff * score->nb[1]);
-        sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
+        ggml_tensor * kv_rem = view_rows(kv, layout.width, remainder, cutoff);
+        ggml_tensor * sc_rem = view_rows(score, layout.width, remainder, cutoff);
+        if (n_seqs <= 1) {
+            sc_rem = ggml_add(ctx, sc_rem, ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0));
+        } else {
+            ggml_tensor * ape_slice = ggml_view_2d(ctx, ape_f, layout.width, remainder, ape_f->nb[1], 0);
+            ape_slice = ggml_reshape_3d(ctx, ape_slice, layout.width, remainder, 1);
+            sc_rem = ggml_add(ctx, sc_rem, ape_slice);
+        }
 
         if (remainder == compress_ratio) {
             kv_state = kv_rem;
             score_state = sc_rem;
         } else {
-            kv_state = ggml_concat(ctx, kv_rem, dsv4_new_filled_2d(ctx, layout.width, compress_ratio - remainder, 0.0f), 1);
-            score_state = ggml_concat(ctx, sc_rem, dsv4_new_filled_2d(ctx, layout.width, compress_ratio - remainder, -INFINITY), 1);
+            kv_state = ggml_concat(ctx, kv_rem, new_filled(layout.width, compress_ratio - remainder, 0.0f), 1);
+            score_state = ggml_concat(ctx, sc_rem, new_filled(layout.width, compress_ratio - remainder, -INFINITY), 1);
         }
     }
 
@@ -713,9 +759,17 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return ggml_reshape_3d(ctx0, flat, n_embd, n_hc, flat->ne[1]);
     };
 
+    // build_compressed_pool: processes inp tokens in windows of size `ratio`.
+    // For multi-seq (n_seqs > 1), inp is {n_embd, n_tokens} where n_tokens = n_seq_tokens * n_seqs.
+    // The lambda uses the captured n_seq_tokens variable (set per-layer) to respect sequence boundaries.
     auto build_compressed_pool = [&](ggml_tensor * inp, ggml_tensor * wkv, ggml_tensor * wgate, ggml_tensor * ape, ggml_tensor * norm,
                                      int64_t out_dim, int64_t head_dim, uint32_t ratio, const char * tag, int il_cur) -> ggml_tensor * {
-        if (wkv == nullptr || wgate == nullptr || ratio == 0 || n_tokens < (int64_t) ratio) {
+        // Use the per-layer n_seq_tokens and n_seqs captured from the enclosing scope.
+        // For single-seq, n_seq_tokens == n_tokens; for multi-seq, n_seq_tokens < n_tokens.
+        const int64_t local_n_seq_tokens = ubatch.n_seq_tokens;
+        const int64_t local_n_seqs       = ubatch.n_seqs;
+
+        if (wkv == nullptr || wgate == nullptr || ratio == 0 || local_n_seq_tokens < (int64_t) ratio) {
             return nullptr;
         }
 
@@ -731,22 +785,38 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             GGML_ASSERT(norm->ne[0] == head_dim);
         }
 
-        const int64_t n_tok_usable = (n_tokens / (int64_t) ratio) * (int64_t) ratio;
-        const int64_t n_windows = n_tok_usable / (int64_t) ratio;
-        if (n_windows == 0) {
+        // Windows are computed per-sequence to avoid crossing sequence boundaries.
+        const int64_t n_tok_usable_per_seq = (local_n_seq_tokens / (int64_t) ratio) * (int64_t) ratio;
+        const int64_t n_windows_per_seq = n_tok_usable_per_seq / (int64_t) ratio;
+        if (n_windows_per_seq == 0) {
             return nullptr;
         }
 
-        ggml_tensor * kv = mul_mat_checked(wkv, inp, "compressor.wkv");        // [out_dim, n_tokens]
-        ggml_tensor * gate = mul_mat_checked(wgate, inp, "compressor.wgate");   // [out_dim, n_tokens]
+        // For multi-seq, reshape inp to {n_embd, n_seq_tokens, n_seqs} so mul_mat batches correctly
+        ggml_tensor * inp_ms = (local_n_seqs > 1)
+            ? ggml_reshape_3d(ctx0, inp, n_embd, local_n_seq_tokens, local_n_seqs)
+            : inp;
+        ggml_tensor * kv = mul_mat_checked(wkv, inp_ms, "compressor.wkv");
+        ggml_tensor * gate = mul_mat_checked(wgate, inp_ms, "compressor.wgate");
 
-        if (n_tok_usable < n_tokens) {
-            kv = ggml_view_2d(ctx0, kv, out_dim, n_tok_usable, kv->nb[1], 0);
-            gate = ggml_view_2d(ctx0, gate, out_dim, n_tok_usable, gate->nb[1], 0);
+        // Trim to usable tokens per sequence
+        if (n_tok_usable_per_seq < local_n_seq_tokens) {
+            if (local_n_seqs > 1) {
+                kv   = ggml_view_3d(ctx0, kv,   out_dim, n_tok_usable_per_seq, local_n_seqs, kv->nb[1], kv->nb[2], 0);
+                gate = ggml_view_3d(ctx0, gate, out_dim, n_tok_usable_per_seq, local_n_seqs, gate->nb[1], gate->nb[2], 0);
+            } else {
+                kv   = ggml_view_2d(ctx0, kv,   out_dim, n_tok_usable_per_seq, kv->nb[1], 0);
+                gate = ggml_view_2d(ctx0, gate, out_dim, n_tok_usable_per_seq, gate->nb[1], 0);
+            }
         }
 
-        ggml_tensor * kv_3d = ggml_reshape_3d(ctx0, kv, out_dim, ratio, n_windows);      // [out_dim, ratio, n_windows]
-        ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate, out_dim, ratio, n_windows);  // [out_dim, ratio, n_windows]
+        // Reshape into windows. For multi-seq: {out_dim, ratio, n_windows_per_seq * n_seqs}
+        // The windows within each sequence are contiguous, so this is safe.
+        const int64_t total_windows = n_windows_per_seq * local_n_seqs;
+        ggml_tensor * kv_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, ggml_cont(ctx0, kv), out_dim, n_tok_usable_per_seq * local_n_seqs) : kv;
+        ggml_tensor * gate_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, ggml_cont(ctx0, gate), out_dim, n_tok_usable_per_seq * local_n_seqs) : gate;
+        ggml_tensor * kv_3d = ggml_reshape_3d(ctx0, kv_flat, out_dim, ratio, total_windows);
+        ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate_flat, out_dim, ratio, total_windows);
 
         if (ape != nullptr) {
             ggml_tensor * ape_f32 = as_f32(ape);
@@ -756,50 +826,76 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
         ggml_tensor * pool = nullptr;
         if (ratio == 4 && out_dim == 2 * head_dim) {
-            ggml_tensor * kv_a = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, n_windows, kv_3d->nb[1], kv_3d->nb[2], 0);
-            ggml_tensor * kv_b = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, n_windows, kv_3d->nb[1], kv_3d->nb[2], kv_3d->nb[0] * head_dim);
-            ggml_tensor * gate_a = ggml_view_3d(ctx0, gate_3d, head_dim, ratio, n_windows, gate_3d->nb[1], gate_3d->nb[2], 0);
-            ggml_tensor * gate_b = ggml_view_3d(ctx0, gate_3d, head_dim, ratio, n_windows, gate_3d->nb[1], gate_3d->nb[2], gate_3d->nb[0] * head_dim);
+            ggml_tensor * kv_a = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, total_windows, kv_3d->nb[1], kv_3d->nb[2], 0);
+            ggml_tensor * kv_b = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, total_windows, kv_3d->nb[1], kv_3d->nb[2], kv_3d->nb[0] * head_dim);
+            ggml_tensor * gate_a = ggml_view_3d(ctx0, gate_3d, head_dim, ratio, total_windows, gate_3d->nb[1], gate_3d->nb[2], 0);
+            ggml_tensor * gate_b = ggml_view_3d(ctx0, gate_3d, head_dim, ratio, total_windows, gate_3d->nb[1], gate_3d->nb[2], gate_3d->nb[0] * head_dim);
 
+            // Shifted window: for each sequence, the first window gets zero/neg-inf,
+            // subsequent windows get the previous window's values.
+            // For multi-seq, reshape to 4D {head_dim, ratio, n_windows_per_seq, n_seqs},
+            // shift within dim 2 (per-sequence), then flatten back.
+            // Build shifted window: for each sequence, prepend a zero/neg-inf window
+            // and take windows [0..n_windows_per_seq-2] as the "previous" values.
+            // We loop over sequences at graph-build time (cheap) to avoid 4D reshapes
+            // that would require ggml_cont copies of non-contiguous views.
             ggml_tensor * kv_a_shift;
             ggml_tensor * gate_a_shift;
-            if (n_windows > 1) {
-                ggml_tensor * kv_a_prev = ggml_view_3d(ctx0, kv_a, head_dim, ratio, n_windows - 1, kv_a->nb[1], kv_a->nb[2], 0);
-                ggml_tensor * gate_a_prev = ggml_view_3d(ctx0, gate_a, head_dim, ratio, n_windows - 1, gate_a->nb[1], gate_a->nb[2], 0);
-                ggml_tensor * kv_zero = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, kv_a, head_dim, ratio, 1, kv_a->nb[1], kv_a->nb[2], 0)), 0.0f);
-                ggml_tensor * gate_neg_inf = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, gate_a, head_dim, ratio, 1, gate_a->nb[1], gate_a->nb[2], 0)), -INFINITY);
-                kv_a_shift = ggml_concat(ctx0, kv_zero, kv_a_prev, 2);
-                gate_a_shift = ggml_concat(ctx0, gate_neg_inf, gate_a_prev, 2);
+            if (n_windows_per_seq > 1) {
+                // Build per-sequence shifted views, then concat across sequences.
+                std::vector<ggml_tensor *> kv_parts, gate_parts;
+                for (int64_t s = 0; s < local_n_seqs; ++s) {
+                    const int64_t win_off = s * n_windows_per_seq;
+                    // Previous windows [0..n_windows_per_seq-2] for this sequence
+                    ggml_tensor * kv_a_prev_s = ggml_view_3d(ctx0, kv_a, head_dim, ratio, n_windows_per_seq - 1,
+                                                              kv_a->nb[1], kv_a->nb[2], win_off * kv_a->nb[2]);
+                    ggml_tensor * gate_a_prev_s = ggml_view_3d(ctx0, gate_a, head_dim, ratio, n_windows_per_seq - 1,
+                                                               gate_a->nb[1], gate_a->nb[2], win_off * gate_a->nb[2]);
+                    // Zero/neg-inf initial window
+                    ggml_tensor * kv_zero_s = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, kv_a, head_dim, ratio, 1,
+                                                          kv_a->nb[1], kv_a->nb[2], win_off * kv_a->nb[2])), 0.0f);
+                    ggml_tensor * gate_ninf_s = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, gate_a, head_dim, ratio, 1,
+                                                           gate_a->nb[1], gate_a->nb[2], win_off * gate_a->nb[2])), -INFINITY);
+                    kv_parts.push_back(ggml_concat(ctx0, kv_zero_s, kv_a_prev_s, 2));
+                    gate_parts.push_back(ggml_concat(ctx0, gate_ninf_s, gate_a_prev_s, 2));
+                }
+                // Concat all sequences' shifted windows along dim 2
+                kv_a_shift = kv_parts[0];
+                gate_a_shift = gate_parts[0];
+                for (int64_t s = 1; s < local_n_seqs; ++s) {
+                    kv_a_shift = ggml_concat(ctx0, kv_a_shift, kv_parts[s], 2);
+                    gate_a_shift = ggml_concat(ctx0, gate_a_shift, gate_parts[s], 2);
+                }
             } else {
                 kv_a_shift = ggml_fill(ctx0, ggml_cont(ctx0, kv_a), 0.0f);
                 gate_a_shift = ggml_fill(ctx0, ggml_cont(ctx0, gate_a), -INFINITY);
             }
 
-            ggml_tensor * kv_ov = ggml_concat(ctx0, kv_a_shift, kv_b, 1);        // [head_dim, 2*ratio, n_windows]
-            ggml_tensor * gate_ov = ggml_concat(ctx0, gate_a_shift, gate_b, 1);  // [head_dim, 2*ratio, n_windows]
+            ggml_tensor * kv_ov = ggml_concat(ctx0, kv_a_shift, kv_b, 1);        // [head_dim, 2*ratio, total_windows]
+            ggml_tensor * gate_ov = ggml_concat(ctx0, gate_a_shift, gate_b, 1);  // [head_dim, 2*ratio, total_windows]
 
-            ggml_tensor * gate_s = ggml_permute(ctx0, gate_ov, 1, 0, 2, 3);      // [2*ratio, head_dim, n_windows]
+            ggml_tensor * gate_s = ggml_permute(ctx0, gate_ov, 1, 0, 2, 3);      // [2*ratio, head_dim, total_windows]
             ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, gate_s));
-            w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                // [head_dim, 2*ratio, n_windows]
+            w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                // [head_dim, 2*ratio, total_windows]
 
             ggml_tensor * pooled = ggml_mul(ctx0, kv_ov, w);
-            pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                      // [2*ratio, head_dim, n_windows]
+            pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                      // [2*ratio, head_dim, total_windows]
             pooled = ggml_cont(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
-            pooled = ggml_sum_rows(ctx0, pooled);                                  // [1, head_dim, n_windows]
-            pool = ggml_reshape_2d(ctx0, pooled, head_dim, n_windows);             // [head_dim, n_windows]
+            pooled = ggml_sum_rows(ctx0, pooled);                                  // [1, head_dim, total_windows]
+            pool = ggml_reshape_2d(ctx0, pooled, head_dim, total_windows);          // [head_dim, total_windows]
         } else {
-            ggml_tensor * gate_s = ggml_permute(ctx0, gate_3d, 1, 0, 2, 3);       // [ratio, out_dim, n_windows]
+            ggml_tensor * gate_s = ggml_permute(ctx0, gate_3d, 1, 0, 2, 3);       // [ratio, out_dim, total_windows]
             ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, gate_s));
-            w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                 // [out_dim, ratio, n_windows]
+            w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                 // [out_dim, ratio, total_windows]
 
             ggml_tensor * pooled = ggml_mul(ctx0, kv_3d, w);
-            pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                       // [ratio, out_dim, n_windows]
+            pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                       // [ratio, out_dim, total_windows]
             pooled = ggml_cont(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
-            pooled = ggml_sum_rows(ctx0, pooled);                                   // [1, out_dim, n_windows]
-            pool = ggml_reshape_2d(ctx0, pooled, out_dim, n_windows);               // [out_dim, n_windows]
+            pooled = ggml_sum_rows(ctx0, pooled);                                   // [1, out_dim, total_windows]
+            pool = ggml_reshape_2d(ctx0, pooled, out_dim, total_windows);            // [out_dim, total_windows]
 
             if (out_dim != head_dim) {
-                pool = ggml_view_2d(ctx0, pool, head_dim, n_windows, pool->nb[1], 0);
+                pool = ggml_view_2d(ctx0, pool, head_dim, total_windows, pool->nb[1], 0);
             }
         }
 
@@ -1136,6 +1232,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
         };
 
+        const int64_t n_seqs       = ubatch.n_seqs;
+        const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
         if (compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             if (has_hybrid_iswa) {
                 const int64_t state_size = hparams.n_embd_r();
@@ -1144,15 +1243,21 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 prev_sc_state_all = build_rs(inp_rs, inp_rs->mctx->get_s_l(il), state_size, ubatch.n_seqs);
 
                 if (is_prefill) {
-                    dsv4_state_pair state = dsv4_build_compressor_prefill_state(ctx0, attn_inp,
+                    // For multi-seq, reshape attn_inp to {n_embd, n_seq_tokens, n_seqs}
+                    // so the compressor processes each sequence independently.
+                    ggml_tensor * attn_inp_3d = (n_seqs > 1)
+                        ? ggml_reshape_3d(ctx0, attn_inp, n_embd, n_seq_tokens, n_seqs)
+                        : attn_inp;
+                    dsv4_state_pair state = dsv4_build_compressor_prefill_state(ctx0, attn_inp_3d,
                             model.layers[il].attn_compressor_wkv,
                             model.layers[il].attn_compressor_wgate,
                             model.layers[il].attn_compressor_ape,
                             n_embd_head,
-                            n_tokens,
-                            compress_ratio);
-                    dsv4_store_state_segment(ctx0, gf, state.kv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
-                    dsv4_store_state_segment(ctx0, gf, state.score, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
+                            n_seq_tokens,
+                            compress_ratio,
+                            n_seqs);
+                    dsv4_store_state_segment(ctx0, gf, state.kv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0, n_seqs);
+                    dsv4_store_state_segment(ctx0, gf, state.score, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0, n_seqs);
                 }
             }
 
@@ -1181,15 +1286,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     index_state_layout = dsv4_make_state_layout(compress_ratio, hparams.n_embd_head_index);
                     if (is_prefill) {
                         const int64_t state_size = hparams.n_embd_r();
-                        dsv4_state_pair index_state = dsv4_build_compressor_prefill_state(ctx0, attn_inp,
+                        ggml_tensor * attn_inp_3d = (n_seqs > 1)
+                            ? ggml_reshape_3d(ctx0, attn_inp, n_embd, n_seq_tokens, n_seqs)
+                            : attn_inp;
+                        dsv4_state_pair index_state = dsv4_build_compressor_prefill_state(ctx0, attn_inp_3d,
                                 model.layers[il].attn_indexer_compressor_wkv,
                                 model.layers[il].attn_indexer_compressor_wgate,
                                 model.layers[il].attn_indexer_compressor_ape,
                                 hparams.n_embd_head_index,
-                                n_tokens,
-                                compress_ratio);
-                        dsv4_store_state_segment(ctx0, gf, index_state.kv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
-                        dsv4_store_state_segment(ctx0, gf, index_state.score, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
+                                n_seq_tokens,
+                                compress_ratio,
+                                n_seqs);
+                        dsv4_store_state_segment(ctx0, gf, index_state.kv, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
+                        dsv4_store_state_segment(ctx0, gf, index_state.score, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
                     }
                 }
                 GGML_ASSERT(model.layers[il].attn_indexer_q_b->ne[0] == hparams.n_lora_q);
@@ -1423,6 +1532,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         }
 
         if (!use_prompt_sparse_attn && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
+            // For multi-seq decode, each token belongs to a different sequence.
+            // We use seq_id from token 0; for n_seqs > 1 with equal_seqs,
+            // all tokens within a sub-batch share the same seq_id.
             const llama_seq_id seq_id = ubatch.seq_id[0][0];
             const int64_t state_size = hparams.n_embd_r();
 
@@ -1448,8 +1560,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             model.layers[il].attn_compressor_norm,
                             n_embd_head, compress_ratio, rope_cfg);
 
-            dsv4_store_state_segment(ctx0, gf, dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0);
-            dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0);
+            dsv4_store_state_segment(ctx0, gf, dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0, n_seqs);
+            dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0, n_seqs);
 
             ggml_tensor * kv_comp_new_for_attn = nullptr;
             const int64_t n_comp_new = n_comp_visible - n_comp_before;
@@ -1482,8 +1594,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                 model.layers[il].attn_indexer_compressor_norm,
                                 hparams.n_embd_head_index, compress_ratio, rope_cfg);
 
-                dsv4_store_state_segment(ctx0, gf, idx_dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems);
-                dsv4_store_state_segment(ctx0, gf, idx_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems);
+                dsv4_store_state_segment(ctx0, gf, idx_dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
+                dsv4_store_state_segment(ctx0, gf, idx_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
 
                 if (idx_dec.kv_comp != nullptr && n_comp_visible > n_comp_before) {
                     ggml_tensor * idx_comp_new = idx_dec.kv_comp;
