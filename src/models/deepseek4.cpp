@@ -1138,7 +1138,6 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
         if (compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             if (has_hybrid_iswa) {
-                GGML_ASSERT(ubatch.n_seqs == 1);
                 const int64_t state_size = hparams.n_embd_r();
                 attn_state_layout = dsv4_make_state_layout(compress_ratio, n_embd_head);
                 prev_kv_state_all = build_rs(inp_rs, inp_rs->mctx->get_r_l(il), state_size, ubatch.n_seqs);
