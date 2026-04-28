@@ -231,6 +231,11 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
+    // Some ops (e.g. ARANGE) have no inputs; the collector is only interested in MUL_MAT/MUL_MAT_ID,
+    // so safely return false for any tensor without a src0 weight.
+    if (src0 == nullptr) {
+        return false;
+    }
     std::string wname = filter_tensor_name(src0->name);
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;

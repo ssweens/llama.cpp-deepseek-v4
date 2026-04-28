@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -830,6 +832,23 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    // Per-graph mask tensor cache. Many DSV4 mask tensors depend only on
+    // (kind, ratio, n_tokens, n_topk) and are identical across layers that
+    // share those parameters. We cache them so the scheduler only sees a
+    // small number of GGML_TENSOR_FLAG_INPUT tensors instead of one per
+    // layer per mask kind. This is required for multi-GPU pipeline
+    // parallelism (GGML_SCHED_MAX_SPLIT_INPUTS=30 in upstream ggml).
+    std::unordered_map<std::string, ggml_tensor *> mask_cache;
+    auto cache_mask = [&](const std::string & key, auto && create) -> ggml_tensor * {
+        auto it = mask_cache.find(key);
+        if (it != mask_cache.end()) {
+            return it->second;
+        }
+        ggml_tensor * t = create();
+        mask_cache.emplace(key, t);
+        return t;
+    };
+
     struct dsv4_rope_cfg {
         int32_t n_ctx_orig;
         float freq_base;
@@ -1201,10 +1220,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         const uint32_t prompt_window_size = hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : (uint32_t) n_tokens;
         bool use_prompt_sparse_attn = false;
         if (n_tokens > 1) {
-            ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
-            ggml_set_input(raw_mask);
-            ggml_set_name(raw_mask, "dsv4_prompt_window_mask");
-            res->add_input(std::make_unique<dsv4_prompt_window_mask_input>(raw_mask, prompt_window_size, hparams.use_alibi, cparams.causal_attn));
+            ggml_tensor * raw_mask = cache_mask(
+                "prompt_window:" + std::to_string(prompt_window_size) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
+                [&]() {
+                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_prompt_window_mask");
+                    res->add_input(std::make_unique<dsv4_prompt_window_mask_input>(t, prompt_window_size, hparams.use_alibi, cparams.causal_attn));
+                    return t;
+                });
 
             ggml_tensor * Kall = Kcur;
             ggml_tensor * Vall = Vcur;
@@ -1213,15 +1237,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             if (c_pool != nullptr) {
                 const int64_t n_comp = c_pool->ne[1];
                 if (n_comp > 0) {
-                    std::vector<int32_t> comp_rows(n_comp);
-                    for (int64_t i = 0; i < n_comp; ++i) {
-                        comp_rows[i] = int32_t(i * compress_ratio);
-                    }
-
-                    ggml_tensor * comp_pos_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_comp);
-                    ggml_set_input(comp_pos_idx);
-                    ggml_set_name(comp_pos_idx, "dsv4_comp_pos_idx");
-                    res->add_input(std::make_unique<dsv4_static_i32_input>(comp_pos_idx, comp_rows));
+                    ggml_tensor * comp_pos_idx = cache_mask(
+                        "comp_pos_idx:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp),
+                        [&]() {
+                            std::vector<int32_t> comp_rows(n_comp);
+                            for (int64_t i = 0; i < n_comp; ++i) {
+                                comp_rows[i] = int32_t(i * compress_ratio);
+                            }
+                            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_comp);
+                            ggml_set_input(t);
+                            ggml_set_name(t, "dsv4_comp_pos_idx");
+                            res->add_input(std::make_unique<dsv4_static_i32_input>(t, comp_rows));
+                            return t;
+                        });
 
                     ggml_tensor * inp_pos_2d = ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens);
                     ggml_tensor * comp_pos = ggml_get_rows(ctx0, inp_pos_2d, comp_pos_idx);
@@ -1302,10 +1330,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp, n_tokens);
                         cb(idx_scores, "attn_indexer_scores", il);
 
-                        ggml_tensor * idx_valid_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
-                        ggml_set_input(idx_valid_mask);
-                        ggml_set_name(idx_valid_mask, "dsv4_prompt_comp_valid_mask");
-                        res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(idx_valid_mask, n_comp, compress_ratio, false, cparams.causal_attn));
+                        ggml_tensor * idx_valid_mask = cache_mask(
+                            "prompt_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp) + ":" + std::to_string((int)cparams.causal_attn),
+                            [&]() {
+                                ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
+                                ggml_set_input(t);
+                                ggml_set_name(t, "dsv4_prompt_comp_valid_mask");
+                                res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp, compress_ratio, false, cparams.causal_attn));
+                                return t;
+                            });
 
                         idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
                         idx_prior = idx_scores;
@@ -1316,10 +1349,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             idx_sel = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
                             cb(idx_sel, "attn_indexer_topk", il);
 
-                            ggml_tensor * idx_rank_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_idx_topk, n_tokens, 1);
-                            ggml_set_input(idx_rank_mask);
-                            ggml_set_name(idx_rank_mask, "dsv4_prompt_comp_rank_mask");
-                            res->add_input(std::make_unique<dsv4_prompt_comp_rank_mask_input>(idx_rank_mask, n_idx_topk, compress_ratio));
+                            ggml_tensor * idx_rank_mask = cache_mask(
+                                "prompt_idx_rank:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_idx_topk),
+                                [&]() {
+                                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_idx_topk, n_tokens, 1);
+                                    ggml_set_input(t);
+                                    ggml_set_name(t, "dsv4_prompt_comp_rank_mask");
+                                    res->add_input(std::make_unique<dsv4_prompt_comp_rank_mask_input>(t, n_idx_topk, compress_ratio));
+                                    return t;
+                                });
 
                             ggml_tensor * idx_sel_3d = ggml_reshape_3d(ctx0, ggml_cont(ctx0, idx_sel), n_idx_topk, n_tokens, 1);
                             ggml_tensor * comp_mask_rows = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_comp, n_tokens, 1);
@@ -1331,10 +1369,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     }
 
                     if (comp_mask == nullptr) {
-                        comp_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp, n_tokens, 1, 1);
-                        ggml_set_input(comp_mask);
-                        ggml_set_name(comp_mask, "dsv4_prompt_comp_mask");
-                        res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(comp_mask, n_comp, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                        comp_mask = cache_mask(
+                            "prompt_comp:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
+                            [&]() {
+                                ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp, n_tokens, 1, 1);
+                                ggml_set_input(t);
+                                ggml_set_name(t, "dsv4_prompt_comp_mask");
+                                res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                                return t;
+                            });
                     }
 
                     if (!(raw_mask->ne[1] == comp_mask->ne[1] && raw_mask->ne[2] == comp_mask->ne[2] && raw_mask->ne[3] == comp_mask->ne[3])) {
@@ -1478,10 +1521,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp_visible);
 
                     if (n_tokens == 1 && n_idx_topk >= (int32_t) n_comp_visible) {
-                        comp_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
-                        ggml_set_input(comp_mask);
-                        ggml_set_name(comp_mask, "dsv4_decode_comp_mask_all_visible");
-                        res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(comp_mask, n_comp_visible, compress_ratio, false, cparams.causal_attn));
+                        comp_mask = cache_mask(
+                            "decode_comp_all_visible:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
+                            [&]() {
+                                ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
+                                ggml_set_input(t);
+                                ggml_set_name(t, "dsv4_decode_comp_mask_all_visible");
+                                res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, false, cparams.causal_attn));
+                                return t;
+                            });
                     } else if (n_idx_topk > 0) {
                         // Indexer scores decode: matches antirez/dsv4_build_indexer_scores_prefill semantics.
                         // (We use the prefill flow because n_tokens may be > 1 in chunked decode.)
@@ -1515,10 +1563,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         idx_scores = ggml_sum_rows(ctx0, idx_scores);
                         idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp_visible, n_tokens);
 
-                        ggml_tensor * idx_valid_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens);
-                        ggml_set_input(idx_valid_mask);
-                        ggml_set_name(idx_valid_mask, "dsv4_decode_comp_valid_mask");
-                        res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(idx_valid_mask, n_comp_visible, compress_ratio, false, cparams.causal_attn));
+                        ggml_tensor * idx_valid_mask = cache_mask(
+                            "decode_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
+                            [&]() {
+                                ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens);
+                                ggml_set_input(t);
+                                ggml_set_name(t, "dsv4_decode_comp_valid_mask");
+                                res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, false, cparams.causal_attn));
+                                return t;
+                            });
                         idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
 
                         ggml_tensor * idx_topk = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
@@ -1528,10 +1581,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
 
                 if (comp_mask == nullptr) {
-                    comp_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
-                    ggml_set_input(comp_mask);
-                    ggml_set_name(comp_mask, "dsv4_decode_comp_mask");
-                    res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(comp_mask, n_comp_visible, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                    comp_mask = cache_mask(
+                        "decode_comp:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
+                        [&]() {
+                            ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
+                            ggml_set_input(t);
+                            ggml_set_name(t, "dsv4_decode_comp_mask");
+                            res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                            return t;
+                        });
                 }
 
                 if (comp_mask->type != attn_mask->type) {
@@ -1622,7 +1680,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(ffn_act_inp, "ffn_norm", il);
 
         ggml_tensor * selected_experts_in = nullptr;
-        if ((uint32_t) il < hparams.n_hash_layers && model.layers[il].ffn_gate_inp_b != nullptr && res->t_inp_tokens != nullptr) {
+        if ((uint32_t) il < hparams.n_hash_layers &&
+            model.layers[il].ffn_gate_inp_b != nullptr &&
+            res->t_inp_tokens != nullptr &&
+            !cparams.warmup) {
+            // Hash-MoE path: pick experts directly from a per-token lookup table.
+            // Skipped during warmup because warmup runs an empty graph reservation
+            // where t_inp_tokens may exist but is not a real token stream and the
+            // shape relationship between ffn_gate_inp_b and n_expert_used cannot
+            // be relied on (matches antirez's `!cparams.warmup` guard).
             GGML_ASSERT(model.layers[il].ffn_gate_inp_b->ne[0] == n_expert_used);
             selected_experts_in = ggml_get_rows(ctx0, model.layers[il].ffn_gate_inp_b, res->t_inp_tokens);
             cb(selected_experts_in, "ffn_hash_selected_experts", il);

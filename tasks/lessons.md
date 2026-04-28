@@ -44,3 +44,30 @@
 - **Lesson 1 — kernel parity:** When porting a math kernel (especially RoPE, YaRN, softmax_ext, sinks) from CPU reference to CUDA, mirror the CPU function _line for line_ first. Optimize only after byte-level/numerical parity is verified by `test-backend-ops` or by full-model decode equality.
 - **Lesson 2 — scheduler reach:** `-ngl 0` is not equivalent to “CPU only” in a `GGML_CUDA=ON` build. Ops without explicit placement still get scheduled to CUDA if available. To validate “CPU semantics,” either build with `GGML_CUDA=OFF` or run with `CUDA_VISIBLE_DEVICES=` cleared. Don’t conflate `-ngl 0` with “CUDA out of the picture.”
 - **Lesson 3 — magnitude correction contracts:** When the call site pre-cancels a YaRN magnitude factor (`attn_factor /= 1 + 0.1 * log(1/freq_scale)`), the kernel _must_ apply that factor internally for the cancellation to work. Document this contract in code at both ends. We added a comment block above the CUDA YaRN helpers stating this contract.
+
+## DSv4 Q2 quantization, full GPU offload, and tooling fixes (2026-04-27)
+
+### Things that broke until fixed
+1. **`llama-quantize` failed on i32 hash-MoE table.** `blk.X.ffn_gate_tid2eid.weight` is type i32 (per-token expert lookup) and must not be quantized. Added skip in `tensor_allows_quantization` in `src/llama-quant.cpp` next to the existing `ffn_gate_inp.weight` skip.
+2. **`llama-imatrix` segfaulted on ARANGE ops.** Our DSv4 graph emits `ggml_arange` (e.g. for grouped-output ids) which has no `src[0]`. The imatrix collector dereferenced `src0->name` unconditionally. Added a `if (src0 == nullptr) return false;` guard.
+3. **`llama-imatrix`/`llama-perplexity` warmup hit `n_seqs == 1` assertion.** Our hash-MoE branch did not gate on `!cparams.warmup` like antirez. Added the warmup guard to the `selected_experts_in` block in `src/models/deepseek4.cpp`. Important documented contract: during warmup `t_inp_tokens` may exist but is not a real token stream and the shape relationship between `ffn_gate_inp_b` and `n_expert_used` cannot be relied on.
+4. **Multi-GPU pipeline parallelism hit `GGML_SCHED_MAX_SPLIT_INPUTS=30` assertion.** Our DSv4 graph emitted ~5 mask input tensors per ratio>0 layer. With 41 such layers that is ~200 distinct graph inputs, and the upstream ggml scheduler caps split inputs at 30. The first instinct to bump the constant was wrong — that is a shared global constant not a model-specific knob. Correct fix: cache mask tensors by `(kind, ratio, n_tokens, n_topk)` within a single graph build. All layers with the same parameters now share one input tensor. Reduced graph input count to ~7 well under any plausible cap. Implemented as an `unordered_map<string, ggml_tensor*>` cache scoped to the graph constructor in `src/models/deepseek4.cpp`.
+
+### Imatrix workflow lessons
+- IQ2_XXS strictly requires imatrix (`llama_model_quantize: failed to quantize: this quantization requires an imatrix!`). Q2_K does not, but Q2_K is a *mixed* recipe that promotes `ffn_down` to Q3_K, blowing up DSv4 size to 96 GiB. Pure Q2_K is 87 GiB. To fit DSv4-Flash (284B params, 142B active) on 88 GiB total VRAM with KV/compute headroom, IQ2_XXS (70 GiB) is the right target.
+- Imatrix capture under `--no-mmap` blows up RAM (model is 154 GiB, RAM is 124 GiB) — keep mmap enabled.
+- Imatrix on DSv4 takes ~85 min for 32 chunks at -ngl 8 BF16. Acceptable.
+- `--process-output` is required if you want to capture imatrix for `output.weight` and the output HC tensors. Without it you must override those tensors via `--tensor-type` to a non-imatrix-needing type (Q8_0, Q4_K, Q6_K).
+- Our grouped-output projection reshapes `wq` from 2D to 3D for `ggml_mul_mat_id`. The imatrix collector records the shape under the reshaped tensor's name, which has a `" (reshaped)"` suffix and 8x rolled-up size mismatch with the underlying 2D weight. Two workarounds:
+  - Strip the suffix in the imatrix file by rewriting via `gguf` Python (not byte-edit; offsets matter).
+  - Delete `attn_output_a` entries and override the tensor via `--tensor-type-file` to Q4_K (which does not require imatrix).
+- `llama-bench` uses `/` as `--tensor-split` separator while `llama-cli` and `llama-completion` use `,`. Easy to miss.
+- `--ngl 99` is "CPU only" trap-worthy in a `GGML_CUDA=ON` build: even with no model layers offloaded, the scheduler will still place ops on CUDA. To validate CPU semantics, use `CUDA_VISIBLE_DEVICES=` or build with `GGML_CUDA=OFF`. (Already in lessons; restated because the user reasonably questioned whether I was customizing.)
+
+### Performance summary (post-fixes, IQ2_XXS, fully on 3 GPUs)
+- pp128: **146 t/s**
+- pp512: **185 t/s**
+- tg32:  **48 t/s**
+- tg128: **54 t/s**
+- 16K context summary task: 174 t/s prefill on 6569 input tokens, 10 t/s decode
+- IQ2_XXS quality: greedy non-thinking chat is coherent (`6 apples` math correct with EOS). Thinking-mode greedy decoding can loop because 2.06 bpw is too lossy for sustained long-form reasoning.
