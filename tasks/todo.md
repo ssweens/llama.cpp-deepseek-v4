@@ -82,6 +82,22 @@ Complete DeepSeek-V4 support end-to-end in staged milestones:
 
 ## Immediate Follow-up
 
+### Active Plan: CUDA FA enablement + grouped-output imatrix cleanup
+
+- [ ] Trace the exact CUDA Flash Attention rejection path for DeepSeek-V4 `head_dim=512`, `gqa_ratio=64`, and arbitrary KV lengths.
+- [ ] Inspect the 512-dim CUDA FA kernels (`fattn.cu`, `fattn-common.cuh`, related MMA/tile helpers) to separate true kernel constraints from conservative dispatch gating.
+- [ ] Implement a generic CUDA/backend-side fix so 512-dim FA stays on-GPU for non-256-aligned KV lengths instead of falling back off-path.
+- [ ] Validate correctness for `-fa 1` on short prompt/decode runs against existing coherent CPU / CUDA `-fa 0` behavior.
+- [~] Benchmark `llama-bench` (`pp128`, `pp512`, `tg32`, `tg128`) before/after and confirm the FA path is actually used on CUDA.
+  - [x] Confirmed upstream 512-dim FA dispatch was wrongly gated on `K->ne[1] % 256 == 0`; removed that gate from the CUDA MMA path so DeepSeek-V4 no longer falls off the 512-dim FA kernel on arbitrary KV lengths.
+  - [x] Measured `-fa 1` after the gate fix: prefill improved materially (`pp128 ~233`, `pp512 ~333`) versus the pre-fix CPU/off-path behavior, confirming FA stays on a valid CUDA path.
+  - [ ] Remaining gap: the current 512-dim CUDA FA kernels are still materially slower than the non-FA CUDA attention path for DeepSeek-V4 (`-fa 0` remains much faster), so kernel-choice / kernel-quality work is still open.
+- [x] Trace the real `attn_output_a` imatrix mismatch from graph emission through `tools/imatrix/imatrix.cpp` and `src/llama-quant.cpp`.
+- [x] Implement the proper grouped-output imatrix/quant mapping so DeepSeek-V4 IQ/Q2 quantization no longer needs manual imatrix cleanup or `--tensor-type-file` workarounds.
+  - [x] Generic collector fix: `ggml_mul_mat_id` fed by reshaped 2D weights now collapses imatrix stats back onto the base 2D tensor name/shape instead of emitting fake per-group `(reshaped)` entries.
+  - [x] Validated with a one-chunk DeepSeek-V4 smoke imatrix and IQ2_XXS dry-run: `blk.X.attn_output_a.weight` quantizes directly with no size mismatch and no tensor-type override.
+- [ ] Run quality gates for touched code paths, update docs/tasks review, and prepare commit/push handoff.
+
 - [ ] Trace DeepSeek-V4 official chat/output encoding end-to-end before further graph changes.
   - [ ] Use the official HF `encoding/encoding_dsv4.py` contract as the source of truth.
   - [ ] Stop using legacy `deepseek3` assumptions for validation; verify with DSML / `<think>` handling and raw-output parsing.

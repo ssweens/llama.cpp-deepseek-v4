@@ -1,5 +1,12 @@
 # Lessons
 
+- When the user rejects a workaround and asks for the real fix, do not present a runtime flag fallback (`disable FA`, manual script cleanup, etc.) as the answer.
+  - Trace the backend/runtime rejection path to the exact code gate first.
+  - Only present a workaround as temporary diagnostic evidence, never as the implementation target.
+- Do not rebuild reflexively after a small edit when the immediate task is read-only diagnosis.
+  - First state exactly what code changed and why a rebuild is or is not required.
+  - Keep investigation steps separate from implementation validation so the user never has to ask what triggered a build.
+
 - When validating a new model family, do not guess the chat/output format from nearby models.
   - Trace the official source of truth end-to-end first: HF README/docs, encoding or chat-template files, converter metadata injection, GGUF metadata, and llama.cpp parser selection.
   - If the upstream release does not ship a Jinja chat template, do not treat a nearby built-in template as equivalent without proof.

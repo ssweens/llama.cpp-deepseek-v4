@@ -1403,6 +1403,21 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_v(ctx0, Vcur, inp_attn_kv->get_v_idxs(), il));
             }
 
+            // Pad the combined KV-length to a multiple of 8 so the F16 mask row stride is
+            // 16-byte aligned -- required by the CUDA FA kernel's cp_async mask loads.
+            // ggml_pad zero-fills; the zero-padded K/V positions produce QK dot-products of
+            // zero, and the corresponding zero-padded mask positions (0.0 = "attend") add a
+            // tiny eps to the softmax denominator.  For actual inference n_kv >= 128 (always
+            // 8-aligned), so this only fires during scheduler reservation with small test
+            // shapes where numerical accuracy is irrelevant.
+            if (cparams.flash_attn && full_mask->ne[0] % 8 != 0) {
+                const int64_t pad_n = ((full_mask->ne[0] + 7) / 8 * 8) - full_mask->ne[0];
+                // Kall/Vall are [head_dim, n_head_kv, n_kv, 1] before permute; pad dim 2 (n_kv).
+                Kall      = ggml_pad(ctx0, Kall,      0, 0, (int)pad_n, 0);
+                Vall      = ggml_pad(ctx0, Vall,      0, 0, (int)pad_n, 0);
+                // Mask is [n_kv, n_tokens, 1, 1]; pad dim 0.
+                full_mask = ggml_pad(ctx0, full_mask, (int)pad_n, 0, 0, 0);
+            }
             full_mask = ggml_cast(ctx0, full_mask, GGML_TYPE_F16);
             cur = build_attn_mha(Qcur, Kall, Vall, nullptr, full_mask, model.layers[il].attn_sinks, nullptr, kq_scale, il);
             use_prompt_sparse_attn = true;
@@ -1597,6 +1612,14 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
 
                 attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
+            }
+
+            // Pad KV-length to a multiple of 8 for FA mask alignment (see prompt-path comment).
+            if (cparams.flash_attn && attn_mask->ne[0] % 8 != 0) {
+                const int64_t pad_n = ((attn_mask->ne[0] + 7) / 8 * 8) - attn_mask->ne[0];
+                Kall      = ggml_pad(ctx0, Kall,      0, 0, (int)pad_n, 0);
+                Vall      = ggml_pad(ctx0, Vall,      0, 0, (int)pad_n, 0);
+                attn_mask = ggml_pad(ctx0, attn_mask, (int)pad_n, 0, 0, 0);
             }
 
             if (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) {

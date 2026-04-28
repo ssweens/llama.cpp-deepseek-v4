@@ -1,8 +1,8 @@
 #include "arg.h"
 #include "common.h"
-#include "log.h"
-#include "llama.h"
 #include "gguf.h"
+#include "llama.h"
+#include "log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,26 +11,27 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <thread>
-#include <mutex>
-#include <vector>
 #include <fstream>
-#include <unordered_map>
 #include <map>
-#include <regex>
+#include <mutex>
 #include <numeric>
+#include <regex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s \\\n"
-            "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
-            "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
-            "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
-            "       [--show-statistics] [...]\n" , argv[0]);
+        "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
+        "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
+        "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
+        "       [--show-statistics] [...]\n",
+        argv[0]);
     LOG("\n");
 }
 
@@ -45,46 +46,49 @@ struct Stats {
 
 struct tensor_statistics {
     std::string tensor;
-    Stats stats;
-    float total_sqract = 0.0f;
-    float mean_sqract  = 0.0f;
-    float max_sqract   = 0.0f;
-    float min_sqract   = 0.0f;
-    int elements       = 0;
-    float stddev       = 0.0f;
-    float active       = 0.0f;
-    float entropy      = 0.0f;
-    float zd           = 0.0f;
-    float cossim       = 0.0f;
+    Stats       stats;
+    float       total_sqract = 0.0f;
+    float       mean_sqract  = 0.0f;
+    float       max_sqract   = 0.0f;
+    float       min_sqract   = 0.0f;
+    int         elements     = 0;
+    float       stddev       = 0.0f;
+    float       active       = 0.0f;
+    float       entropy      = 0.0f;
+    float       zd           = 0.0f;
+    float       cossim       = 0.0f;
 };
 
 class IMatrixCollector {
-public:
+  public:
     IMatrixCollector() = default;
+
     void set_params(common_params params) { m_params = std::move(params); }
+
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
     void save_imatrix(int32_t n_chunk = -1) const;
     bool load_imatrix_legacy(const char * fname);
     bool load_imatrix(const char * file_name);
+
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
-private:
+  private:
     std::unordered_map<std::string, Stats> m_stats;
     common_params                          m_params;
     std::mutex                             m_mutex;
     std::vector<std::string>               m_datasets;
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
-    std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    std::vector<char>                      m_ids;  // the expert ids from ggml_mul_mat_id
 };
 
 // remove any prefix and suffixes from the name
 // CUDA0#blk.0.attn_k.weight#0 => blk.0.attn_k.weight
 static std::string filter_tensor_name(const char * name) {
-    std::string wname;
+    std::string  wname;
     const char * p = strchr(name, '#');
     if (p != NULL) {
-        p = p + 1;
+        p              = p + 1;
         const char * q = strchr(p, '#');
         if (q != NULL) {
             wname = std::string(p, q - p);
@@ -99,8 +103,8 @@ static std::string filter_tensor_name(const char * name) {
 
 static void process_tensor_name(const std::string & input, std::string & layer, std::string & tensor) {
     std::vector<std::string> name;
-    std::istringstream stream(input);
-    std::string item;
+    std::istringstream       stream(input);
+    std::string              item;
 
     while (std::getline(stream, item, '.')) {
         name.push_back(item);
@@ -128,7 +132,8 @@ static void process_tensor_name(const std::string & input, std::string & layer, 
 
 static void compute_statistics(std::vector<tensor_statistics> & tstats, const std::string & name, const Stats & e) {
     if (e.values.size() % e.counts.size() != 0) {
-        LOG_ERR("%s: activation size mismatch for tensor %s (%zu vs %zu)\n", __func__, name.c_str(), e.counts.size(), e.values.size());
+        LOG_ERR("%s: activation size mismatch for tensor %s (%zu vs %zu)\n", __func__, name.c_str(), e.counts.size(),
+                e.values.size());
         return;
     }
     if (e.counts.empty()) {
@@ -136,7 +141,7 @@ static void compute_statistics(std::vector<tensor_statistics> & tstats, const st
         return;
     }
 
-    const int n_mat = e.counts.size();
+    const int n_mat    = e.counts.size();
     const int row_size = e.values.size() / n_mat;
 
     std::vector<float> activations;
@@ -148,7 +153,7 @@ static void compute_statistics(std::vector<tensor_statistics> & tstats, const st
             continue;
         }
         for (int j = 0; j < row_size; ++j) {
-            activations.push_back(e.values[i*row_size + j] / e.counts[i]);
+            activations.push_back(e.values[i * row_size + j] / e.counts[i]);
         }
     }
 
@@ -157,17 +162,17 @@ static void compute_statistics(std::vector<tensor_statistics> & tstats, const st
         return;
     }
 
-    const float act_total     = std::accumulate(activations.begin(), activations.end(), 0.0f);
-    const float act_max       = *std::max_element(activations.begin(), activations.end());
-    const float act_min       = *std::min_element(activations.begin(), activations.end());
-    const float act_mean      = act_total / activations.size();
-    const float act_sqr_total = std::inner_product(activations.begin(), activations.end(), activations.begin(), 0.0f);
-    const float act_var       = (act_sqr_total / activations.size()) - (act_mean * act_mean);
-    const float act_dev       = std::sqrt(std::max(0.0f, act_var));
-    float threshold           = 1e-5f;
-    const int inactive_count  = std::count_if(activations.begin(), activations.end(),
+    const float act_total      = std::accumulate(activations.begin(), activations.end(), 0.0f);
+    const float act_max        = *std::max_element(activations.begin(), activations.end());
+    const float act_min        = *std::min_element(activations.begin(), activations.end());
+    const float act_mean       = act_total / activations.size();
+    const float act_sqr_total  = std::inner_product(activations.begin(), activations.end(), activations.begin(), 0.0f);
+    const float act_var        = (act_sqr_total / activations.size()) - (act_mean * act_mean);
+    const float act_dev        = std::sqrt(std::max(0.0f, act_var));
+    float       threshold      = 1e-5f;
+    const int   inactive_count = std::count_if(activations.begin(), activations.end(),
                                                [threshold](const float v) { return fabsf(v) <= threshold; });
-    const float active_ratio  = 1 - static_cast<float>(inactive_count) / activations.size();
+    const float active_ratio   = 1 - static_cast<float>(inactive_count) / activations.size();
 
     float entropy = 0;
     if (act_total > 0) {
@@ -187,38 +192,38 @@ static void compute_statistics(std::vector<tensor_statistics> & tstats, const st
         }
     }
 
-    auto & ts = tstats.emplace_back();
-    ts.tensor     = name;
-    ts.stats      = e;
+    auto & ts       = tstats.emplace_back();
+    ts.tensor       = name;
+    ts.stats        = e;
     ts.total_sqract = act_total;
     ts.mean_sqract  = act_mean;
     ts.max_sqract   = act_max;
     ts.min_sqract   = act_min;
-    ts.elements   = static_cast<int>(activations.size());
-    ts.stddev     = act_dev;
-    ts.active     = active_ratio;
-    ts.entropy    = entropy;
-    ts.zd         = static_cast<float>(z_score) / ts.elements;
+    ts.elements     = static_cast<int>(activations.size());
+    ts.stddev       = act_dev;
+    ts.active       = active_ratio;
+    ts.entropy      = entropy;
+    ts.zd           = static_cast<float>(z_score) / ts.elements;
 }
 
 static void compute_cossim(std::vector<tensor_statistics> & tstats) {
     static const std::regex pattern(R"(blk\.(\d+)\.)");
     for (auto & ts : tstats) {
         if (std::smatch match; std::regex_search(ts.tensor, match, pattern)) {
-            const int blk = std::stoi(match[1]);
+            const int   blk = std::stoi(match[1]);
             std::string tname(ts.tensor);
-            tname.replace(match.position(1), match.length(1), std::to_string(blk-1));
+            tname.replace(match.position(1), match.length(1), std::to_string(blk - 1));
             auto prev = std::find_if(tstats.begin(), tstats.end(),
-                [tname](const tensor_statistics & t) { return t.tensor == tname; });
+                                     [tname](const tensor_statistics & t) { return t.tensor == tname; });
             if (prev != tstats.end()) {
-                const float dp = std::inner_product(ts.stats.values.begin(), ts.stats.values.end(),
-                    prev->stats.values.begin(), 0.0f);
-                const float curr_mag = std::sqrt(std::inner_product(ts.stats.values.begin(), ts.stats.values.end(),
-                    ts.stats.values.begin(), 0.0f));
-                const float prev_mag = std::sqrt(std::inner_product(prev->stats.values.begin(), prev->stats.values.end(),
-                    prev->stats.values.begin(), 0.0f));
-                const float cs = dp / (curr_mag * prev_mag);
-                ts.cossim = cs;
+                const float dp       = std::inner_product(ts.stats.values.begin(), ts.stats.values.end(),
+                                                          prev->stats.values.begin(), 0.0f);
+                const float curr_mag = std::sqrt(
+                    std::inner_product(ts.stats.values.begin(), ts.stats.values.end(), ts.stats.values.begin(), 0.0f));
+                const float prev_mag = std::sqrt(std::inner_product(
+                    prev->stats.values.begin(), prev->stats.values.end(), prev->stats.values.begin(), 0.0f));
+                const float cs       = dp / (curr_mag * prev_mag);
+                ts.cossim            = cs;
             }
         } else {
             ts.cossim = 0;
@@ -236,18 +241,57 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     if (src0 == nullptr) {
         return false;
     }
-    std::string wname = filter_tensor_name(src0->name);
+
+    // ggml_mul_mat_id can be fed by a reshaped view of an underlying 2D weight (for example a grouped
+    // projection reshaped to [rows, cols_per_group, n_groups]). In that case the quantizer still sees and
+    // quantizes the original 2D tensor, so the imatrix must be accumulated onto the base tensor name and
+    // collapsed back to a single [rows] slice instead of emitting one slice per view group.
+    const ggml_tensor * src0_base = src0;
+    while (src0_base != nullptr && src0_base->op == GGML_OP_RESHAPE && src0_base->src[0] != nullptr &&
+           ggml_nelements(src0_base->src[0]) == ggml_nelements(src0_base)) {
+        src0_base = src0_base->src[0];
+    }
+    if (src0_base != nullptr && src0_base->view_src != nullptr &&
+        ggml_nelements(src0_base->view_src) == ggml_nelements(src0_base)) {
+        src0_base = src0_base->view_src;
+    }
+
+    std::string       wname_src0      = filter_tensor_name(src0->name);
+    const std::string reshaped_suffix = " (reshaped)";
+    const bool        named_reshaped_view =
+        t->op == GGML_OP_MUL_MAT_ID && wname_src0.size() > reshaped_suffix.size() &&
+        wname_src0.compare(wname_src0.size() - reshaped_suffix.size(), reshaped_suffix.size(), reshaped_suffix) == 0;
+
+    const bool collapse_mul_mat_id_view =
+        t->op == GGML_OP_MUL_MAT_ID &&
+        ((src0_base != nullptr && ggml_n_dims(src0_base) == 2 && ggml_nelements(src0_base) == ggml_nelements(src0)) ||
+         named_reshaped_view);
+
+    const struct ggml_tensor * src0_imatrix = collapse_mul_mat_id_view && src0_base != nullptr ? src0_base : src0;
+    std::string                wname        = filter_tensor_name(src0_imatrix->name);
+    if (collapse_mul_mat_id_view && wname.size() > reshaped_suffix.size() &&
+        wname.compare(wname.size() - reshaped_suffix.size(), reshaped_suffix.size(), reshaped_suffix) == 0) {
+        wname.resize(wname.size() - reshaped_suffix.size());
+    }
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;
 
     // when ask is true, the scheduler wants to know if we are interested in data from this tensor
     // if we return true, a follow-up call will be made with ask=false in which we can do the actual collection
     if (ask) {
-        if (t->op == GGML_OP_MUL_MAT_ID) return true; // collect all indirect matrix multiplications
-        if (t->op != GGML_OP_MUL_MAT) return false;
+        if (t->op == GGML_OP_MUL_MAT_ID) {
+            return true;  // collect all indirect matrix multiplications
+        }
+        if (t->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
         // why are small batches ignored (<16 tokens)?
-        if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) return false;
-        if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) return false;
+        if (src1->ne[1] < 16 || src1->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!(wname.substr(0, 4) == "blk." || (m_params.process_output && wname == "output.weight"))) {
+            return false;
+        }
         return true;
     }
 
@@ -270,9 +314,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     if (t->op == GGML_OP_MUL_MAT_ID) {
         //   ids  -> [n_experts_used, n_tokens]
         //   src1 -> [cols, n_expert_used, n_tokens]
-        const ggml_tensor * ids = t->src[2];
-        const int64_t n_as = src0->ne[2];
-        const int64_t n_ids = ids->ne[0];
+        const ggml_tensor * ids   = t->src[2];
+        const int64_t       n_as  = src0->ne[2];
+        const int64_t       n_ids = ids->ne[0];
 
         // the top-k selected expert ids are stored in the ids tensor
         // for simplicity, always copy ids to host, because it is small
@@ -291,54 +335,48 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         auto & e = m_stats[wname];
 
-        if (e.counts.size() == 1 && n_as > 1) {
-            // broadcast, when loading an old imatrix
-            e.counts.resize(n_as, e.counts[0]);
-        }
-        if (e.values.empty()) {
-            e.values.resize(src1->ne[0]*n_as, 0);
-            e.counts.resize(n_as, 0);
-        }
-        else if (e.values.size() != (size_t)src1->ne[0]*n_as) {
-            LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0]*n_as));
-            exit(1); //GGML_ABORT("fatal error");
-        }
-        else if (e.counts.size() != (size_t)n_as) {
-            LOG_ERR("%s: inconsistent expert count for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.counts.size(), (int)n_as);
-            exit(1); //GGML_ABORT("fatal error");
-        }
-        LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[2], (int)src1->type);
-        // loop over all possible experts, regardless if they are used or not in the batch
-        for (int64_t ex = 0; ex < n_as; ++ex) {
-            size_t e_start = ex*src1->ne[0];
+        if (collapse_mul_mat_id_view) {
+            if (e.values.empty()) {
+                e.values.resize(src1->ne[0], 0);
+                e.counts.resize(1, 0);
+            } else if (e.values.size() != (size_t) src1->ne[0]) {
+                LOG_ERR("%s: inconsistent collapsed size for %s (%d vs %d)\n", __func__, wname.c_str(),
+                        (int) e.values.size(), (int) src1->ne[0]);
+                exit(1);
+            } else if (e.counts.size() != 1) {
+                LOG_ERR("%s: inconsistent collapsed count size for %s (%d vs 1)\n", __func__, wname.c_str(),
+                        (int) e.counts.size());
+                exit(1);
+            }
+
+            LOG_DBGV(2, "%s[%d]: %32s, %s (collapsed view), %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(),
+                     ggml_op_name(t->op), (int) src1->ne[0], (int) src1->ne[2], (int) src1->type);
 
             for (int64_t idx = 0; idx < n_ids; ++idx) {
                 for (int64_t row = 0; row < src1->ne[2]; ++row) {
-                    const int excur = *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
-
-                    GGML_ASSERT(excur >= 0 && excur < n_as); // sanity check
-
-                    if (excur != ex) continue;
+                    const int excur = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+                    GGML_ASSERT(excur >= 0 && excur < n_as);
 
                     const int64_t i11 = idx % src1->ne[1];
                     const int64_t i12 = row;
-                    const float * x = (const float *)(data + i11*src1->nb[1] + i12*src1->nb[2]);
+                    const float * x   = (const float *) (data + i11 * src1->nb[1] + i12 * src1->nb[2]);
 
-                    e.counts[ex]++;
+                    e.counts[0]++;
 
                     for (int64_t j = 0; j < src1->ne[0]; ++j) {
-                        e.values[e_start + j] += x[j] * x[j];
-                        if (!std::isfinite((float)e.values[e_start + j])) {
-                            LOG_ERR("%f detected in %s\n", (float)e.values[e_start + j], wname.c_str());
+                        e.values[j] += x[j] * x[j];
+                        if (!std::isfinite((float) e.values[j])) {
+                            LOG_ERR("%f detected in %s\n", (float) e.values[j], wname.c_str());
                             exit(1);
                         }
                     }
                 }
             }
-            const int32_t n_chunk = e.counts[ex] / chunk_size;
+
+            const int32_t n_chunk = e.counts[0] / chunk_size;
             if (n_chunk > m_last_chunk) {
                 const int32_t chunk_step = n_chunk - m_last_chunk;
-                m_last_chunk = n_chunk;
+                m_last_chunk             = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
                     save_imatrix();
                 }
@@ -346,9 +384,69 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                     save_imatrix(m_last_chunk);
                 }
             }
+        } else {
+            if (e.counts.size() == 1 && n_as > 1) {
+                // broadcast, when loading an old imatrix
+                e.counts.resize(n_as, e.counts[0]);
+            }
+            if (e.values.empty()) {
+                e.values.resize(src1->ne[0] * n_as, 0);
+                e.counts.resize(n_as, 0);
+            } else if (e.values.size() != (size_t) src1->ne[0] * n_as) {
+                LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(),
+                        (int) (src1->ne[0] * n_as));
+                exit(1);  //GGML_ABORT("fatal error");
+            } else if (e.counts.size() != (size_t) n_as) {
+                LOG_ERR("%s: inconsistent expert count for %s (%d vs %d)\n", __func__, wname.c_str(),
+                        (int) e.counts.size(), (int) n_as);
+                exit(1);  //GGML_ABORT("fatal error");
+            }
+            LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op),
+                     (int) src1->ne[0], (int) src1->ne[2], (int) src1->type);
+            // loop over all possible experts, regardless if they are used or not in the batch
+            for (int64_t ex = 0; ex < n_as; ++ex) {
+                size_t e_start = ex * src1->ne[0];
+
+                for (int64_t idx = 0; idx < n_ids; ++idx) {
+                    for (int64_t row = 0; row < src1->ne[2]; ++row) {
+                        const int excur = *(const int32_t *) (m_ids.data() + row * ids->nb[1] + idx * ids->nb[0]);
+
+                        GGML_ASSERT(excur >= 0 && excur < n_as);  // sanity check
+
+                        if (excur != ex) {
+                            continue;
+                        }
+
+                        const int64_t i11 = idx % src1->ne[1];
+                        const int64_t i12 = row;
+                        const float * x   = (const float *) (data + i11 * src1->nb[1] + i12 * src1->nb[2]);
+
+                        e.counts[ex]++;
+
+                        for (int64_t j = 0; j < src1->ne[0]; ++j) {
+                            e.values[e_start + j] += x[j] * x[j];
+                            if (!std::isfinite((float) e.values[e_start + j])) {
+                                LOG_ERR("%f detected in %s\n", (float) e.values[e_start + j], wname.c_str());
+                                exit(1);
+                            }
+                        }
+                    }
+                }
+                const int32_t n_chunk = e.counts[ex] / chunk_size;
+                if (n_chunk > m_last_chunk) {
+                    const int32_t chunk_step = n_chunk - m_last_chunk;
+                    m_last_chunk             = n_chunk;
+                    if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
+                        save_imatrix();
+                    }
+                    if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
+                        save_imatrix(m_last_chunk);
+                    }
+                }
+            }
         }
     } else {
-        auto & e = m_stats[wname];
+        auto &        e     = m_stats[wname];
         const int64_t n_mat = src0->ne[2] * src0->ne[3];
 
         // use a single count per dense tensor
@@ -368,25 +466,26 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         if (e.values.empty()) {
             e.values.resize(src1->ne[0] * n_mat, 0);
             e.counts.resize(1, 0);
+        } else if (e.values.size() != (size_t) (src1->ne[0] * n_mat)) {
+            LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int) e.values.size(),
+                    (int) (src1->ne[0] * n_mat));
+            exit(1);  //GGML_ABORT("fatal error");
         }
-        else if (e.values.size() != (size_t)(src1->ne[0] * n_mat)) {
-            LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0] * n_mat));
-            exit(1); //GGML_ABORT("fatal error");
-        }
-        LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[1], (int)src1->ne[2], (int)src1->type);
+        LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(),
+                 ggml_op_name(t->op), (int) src1->ne[0], (int) src1->ne[1], (int) src1->ne[2], (int) src1->type);
 
         for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
             for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
                 // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
-                const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
+                const int64_t mat_id    = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
                 const int64_t mat_start = mat_id * src1->ne[0];
 
                 for (int64_t row = 0; row < src1->ne[1]; ++row) {
                     const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
                     for (int64_t j = 0; j < src1->ne[0]; ++j) {
                         e.values[mat_start + j] += x[j] * x[j];
-                        if (!std::isfinite((float)e.values[j])) {
-                            LOG_ERR("%f detected in %s\n", (float)e.values[j], wname.c_str());
+                        if (!std::isfinite((float) e.values[j])) {
+                            LOG_ERR("%f detected in %s\n", (float) e.values[j], wname.c_str());
                             exit(1);
                         }
                     }
@@ -399,7 +498,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             const int32_t n_chunk = e.counts[i] / chunk_size;
             if (n_chunk > m_last_chunk) {
                 const int32_t chunk_step = n_chunk - m_last_chunk;
-                m_last_chunk = n_chunk;
+                m_last_chunk             = n_chunk;
                 if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
                     save_imatrix();
                 }
@@ -424,10 +523,10 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
     // warn when writing imatrix entries that do not have full data
     // this can happen with MoE models where some of the experts end up not being exercised by the provided training data
 
-    int n_entries = 0;
+    int                      n_entries = 0;
     std::vector<std::string> to_store;
 
-    bool is_first = true; // for printing
+    bool is_first = true;  // for printing
     for (const auto & kv : m_stats) {
         const int n_all = kv.second.counts.size();
 
@@ -453,7 +552,8 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
         }
 
         if (n_zeros > 0) {
-            LOG_WRN("%s: entry '%40s' has partial data (%.2f%%)\n", __func__, kv.first.c_str(), 100.0f * (n_all - n_zeros) / n_all);
+            LOG_WRN("%s: entry '%40s' has partial data (%.2f%%)\n", __func__, kv.first.c_str(),
+                    100.0f * (n_all - n_zeros) / n_all);
         }
 
         n_entries++;
@@ -472,12 +572,13 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
     std::ofstream out(fname, std::ios::binary);
     out.write((const char *) &n_entries, sizeof(n_entries));
     for (const auto & name : to_store) {
-        const auto & stat = m_stats.at(name);
-        const int32_t len = name.size();
+        const auto &  stat = m_stats.at(name);
+        const int32_t len  = name.size();
         out.write((const char *) &len, sizeof(len));
         out.write(name.c_str(), len);
         // ceiling division to avoid accidental zeros
-        const int32_t ncall = (*std::max_element(stat.counts.begin(), stat.counts.end()) + (chunk_size - 1)) / chunk_size;
+        const int32_t ncall =
+            (*std::max_element(stat.counts.begin(), stat.counts.end()) + (chunk_size - 1)) / chunk_size;
         out.write((const char *) &ncall, sizeof(ncall));
         const int32_t nval = stat.values.size();
         const int32_t nmat = stat.counts.size();
@@ -504,12 +605,12 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
     // Write the input filename at the end of the file to later on specify it in quantize
     {
         const char * dataset_file = m_params.prompt_file.c_str();
-        int32_t len = m_params.prompt_file.size();
+        int32_t      len          = m_params.prompt_file.size();
         // When there is no prompt but there were other imatrix files loaded, use the last dataset
         if (m_params.prompt_file.empty() && !m_datasets.empty()) {
             const std::string & dataset_str = m_datasets[m_datasets.size() - 1];
-            dataset_file = dataset_str.c_str();
-            len = dataset_str.size();
+            dataset_file                    = dataset_str.c_str();
+            len                             = dataset_str.size();
         }
         out.write((const char *) &len, sizeof(len));
         out.write(dataset_file, len);
@@ -520,7 +621,7 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
 }
 
 void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
-    auto fname = m_params.out_file;
+    auto   fname             = m_params.out_file;
     int8_t use_legacy_format = m_params.imat_dat;
 
     if (use_legacy_format > 0) {
@@ -542,9 +643,9 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
     // this can happen with MoE models where some of the experts end up not being exercised by the provided training data
 
     std::vector<std::string> to_store;
-    size_t data_size = 0;
+    size_t                   data_size = 0;
 
-    bool is_first = true; // for printing
+    bool is_first = true;  // for printing
     for (const auto & kv : m_stats) {
         const int n_all = kv.second.counts.size();
 
@@ -561,7 +662,8 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
         }
 
         if (n_zeros > 0) {
-            LOG_WRN("%s: entry '%40s' has partial data (%.2f%%)\n", __func__, kv.first.c_str(), 100.0f * (n_all - n_zeros) / n_all);
+            LOG_WRN("%s: entry '%40s' has partial data (%.2f%%)\n", __func__, kv.first.c_str(),
+                    100.0f * (n_all - n_zeros) / n_all);
         }
 
         to_store.push_back(kv.first);
@@ -578,6 +680,7 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
         /* .no_alloc   = */ false,
     };
     struct ggml_context * ctx = ggml_init(params);
+
     struct gguf_context * ctx_gguf = gguf_init_empty();
 
     {
@@ -599,7 +702,7 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
     }
 
     for (const auto & name : to_store) {
-        const auto & stat = m_stats.at(name);
+        const auto &  stat = m_stats.at(name);
         const int32_t nval = (int32_t) stat.values.size();
         const int32_t nmat = (int32_t) stat.counts.size();
         if (nval > 0 && nmat > 0) {
@@ -655,8 +758,8 @@ bool IMatrixCollector::load_imatrix_legacy(const char * fname) {
         }
         name_as_vec[len] = 0;
         std::string name{ name_as_vec.data() };
-        auto & e = m_stats[std::move(name)];
-        int32_t ncall = 0;
+        auto &      e     = m_stats[std::move(name)];
+        int32_t     ncall = 0;
         in.read((char *) &ncall, sizeof(ncall));
         int32_t nval = 0;
         in.read((char *) &nval, sizeof(nval));
@@ -711,7 +814,7 @@ bool IMatrixCollector::load_imatrix_legacy(const char * fname) {
     }
 
     // Read the dataset path to include it when writing to GGUF
-    if (!in.fail()){
+    if (!in.fail()) {
         int32_t len = 0;
         in.read((char *) &len, sizeof(len));
         if (!in.fail()) {
@@ -729,9 +832,9 @@ bool IMatrixCollector::load_imatrix_legacy(const char * fname) {
 
 // Using GGUF as the file format, for greater extensibility
 bool IMatrixCollector::load_imatrix(const char * file_name) {
-    struct ggml_context * ctx = nullptr;
+    struct ggml_context *   ctx              = nullptr;
     struct gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ false, // the data is needed
+        /* .no_alloc = */ false,  // the data is needed
         /* .ctx      = */ &ctx,
     };
     struct gguf_context * ctx_gguf = gguf_init_from_file(file_name, meta_gguf_params);
@@ -767,7 +870,9 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string name = cur->name;
 
-        if (name.empty()) { continue; }
+        if (name.empty()) {
+            continue;
+        }
 
         if (string_remove_suffix(name, in_sum2_suffix)) {
             // in_sum2
@@ -798,7 +903,8 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
         if (e.values.empty()) {
             e.values.resize(nval, 0.0f);
         } else if ((size_t) nval != e.values.size()) {
-            LOG_ERR("%s: mismatched sums size for %s: %zu != %zu\n", __func__, name.c_str(), (size_t) nval, e.values.size());
+            LOG_ERR("%s: mismatched sums size for %s: %zu != %zu\n", __func__, name.c_str(), (size_t) nval,
+                    e.values.size());
             gguf_free(ctx_gguf);
             ggml_free(ctx);
             return false;
@@ -811,7 +917,8 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
             // broadcast, when loading an old imatrix
             e.counts.resize(ncounts, e.counts[0]);
         } else if ((size_t) ncounts != e.counts.size()) {
-            LOG_ERR("%s: mismatched counts size for %s: %zu != %zu\n", __func__, name.c_str(), (size_t) ncounts, e.counts.size());
+            LOG_ERR("%s: mismatched counts size for %s: %zu != %zu\n", __func__, name.c_str(), (size_t) ncounts,
+                    e.counts.size());
             gguf_free(ctx_gguf);
             ggml_free(ctx);
             return false;
@@ -857,14 +964,14 @@ struct results_log_softmax {
 
 static std::vector<float> softmax(const std::vector<float> & logits) {
     std::vector<float> probs(logits.size());
-    float max_logit = logits[0];
+    float              max_logit = logits[0];
     for (float v : logits) {
         max_logit = std::max(max_logit, v);
     }
     double sum_exp = 0.0;
     for (size_t i = 0; i < logits.size(); i++) {
         // Subtract the maximum logit value from the current logit value for numerical stability
-        const float logit = logits[i] - max_logit;
+        const float logit     = logits[i] - max_logit;
         const float exp_logit = expf(logit);
         sum_exp += exp_logit;
         probs[i] = exp_logit;
@@ -884,29 +991,36 @@ static results_log_softmax log_softmax(int n_vocab, const float * logits, int to
     for (int i = 0; i < n_vocab; ++i) {
         sum_exp += expf(logits[i] - max_logit);
     }
-    return {logits[tok] - max_logit - log(sum_exp), logits[tok], expf(logits[tok] - max_logit) / (float) sum_exp};
+    return { logits[tok] - max_logit - log(sum_exp), logits[tok], expf(logits[tok] - max_logit) / (float) sum_exp };
 }
 
-static void process_logits(
-    int n_vocab, const float * logits, const int * tokens, int n_token, std::vector<std::thread> & workers,
-    double & nll, double & nll2, float * logit_history, float * prob_history) {
+static void process_logits(int                        n_vocab,
+                           const float *              logits,
+                           const int *                tokens,
+                           int                        n_token,
+                           std::vector<std::thread> & workers,
+                           double &                   nll,
+                           double &                   nll2,
+                           float *                    logit_history,
+                           float *                    prob_history) {
     std::mutex mutex;
-    int counter = 0;
-    auto compute = [&mutex, &counter, &nll, &nll2, logit_history, prob_history, n_vocab, logits, tokens, n_token] () {
+    int        counter = 0;
+    auto compute = [&mutex, &counter, &nll, &nll2, logit_history, prob_history, n_vocab, logits, tokens, n_token]() {
         double local_nll  = 0;
         double local_nll2 = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
-            int i = counter++;
+            int                          i = counter++;
             if (i >= n_token) {
-                nll += local_nll; nll2 += local_nll2;
+                nll += local_nll;
+                nll2 += local_nll2;
                 break;
             }
             lock.unlock();
-            const results_log_softmax results = log_softmax(n_vocab, logits + i*n_vocab, tokens[i+1]);
-            const double v = -results.log_softmax;
+            const results_log_softmax results = log_softmax(n_vocab, logits + i * n_vocab, tokens[i + 1]);
+            const double              v       = -results.log_softmax;
             local_nll += v;
-            local_nll2 += v*v;
+            local_nll2 += v * v;
 
             logit_history[i] = results.logit;
             prob_history[i]  = results.prob;
@@ -937,19 +1051,20 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
-    LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
+    LOG_INF("%s: tokenization took %g ms\n", __func__,
+            1e-3 * std::chrono::duration_cast<std::chrono::microseconds>(tim2 - tim1).count());
 
     if (params.i_chunk > 0) {
-        if (size_t((params.i_chunk + 2)*n_ctx) >= tokens.size()) {
+        if (size_t((params.i_chunk + 2) * n_ctx) >= tokens.size()) {
             LOG_ERR("%s: there will be not enough tokens left after removing %d chunks\n", __func__, params.i_chunk);
             return false;
         }
-        LOG_INF("%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
-        tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
+        LOG_INF("%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk * n_ctx);
+        tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk * n_ctx);
     }
 
-    if (int(tokens.size()) < 2*n_ctx) {
-        LOG_ERR("%s: you need at least %d tokens for a context of %d tokens\n", __func__, 2*n_ctx, n_ctx);
+    if (int(tokens.size()) < 2 * n_ctx) {
+        LOG_ERR("%s: you need at least %d tokens for a context of %d tokens\n", __func__, 2 * n_ctx, n_ctx);
         LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n", __func__, tokens.size());
         return false;
     }
@@ -968,29 +1083,30 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const int n_batch = params.n_batch;
 
-    int count = 0;
-    double nll = 0.0;
-    double nll2 = 0.0;
+    int    count = 0;
+    double nll   = 0.0;
+    double nll2  = 0.0;
 
     const int num_batches = (n_ctx + n_batch - 1) / n_batch;
-    const int n_seq = std::max(1, n_batch / n_ctx);
+    const int n_seq       = std::max(1, n_batch / n_ctx);
 
     GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
 
-    llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
+    llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx * n_seq), 0, 1);
 
     std::vector<float> logits;
     if (params.compute_ppl && num_batches > 1) {
-        logits.reserve((size_t)n_ctx * n_vocab);
+        logits.reserve((size_t) n_ctx * n_vocab);
     }
 
-    LOG_INF("%s: computing over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
+    LOG_INF("%s: computing over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch,
+            n_seq);
 
     std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
     for (int i = 0; i < n_chunk; i += n_seq) {
-        const int start =     i * n_ctx;
+        const int start = i * n_ctx;
         const int end   = start + n_ctx;
 
         const int n_seq_batch = std::min(n_seq, n_chunk - i);
@@ -1008,7 +1124,7 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
             common_batch_clear(batch);
 
             for (int seq = 0; seq < n_seq_batch; seq++) {
-                int seq_start = batch_start + seq*n_ctx;
+                int seq_start = batch_start + seq * n_ctx;
 
                 // save original token and restore it after eval
                 const auto token_org = tokens[seq_start];
@@ -1022,7 +1138,7 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                     //       and also for the perplexity calculation.
                     // TODO: only get outputs when (params.process_output || params.compute_ppl)
                     //       (not possible when this skips FFN computation of the last layer)
-                    common_batch_add(batch, tokens[seq_start + k], j*n_batch + k, { seq }, true);
+                    common_batch_add(batch, tokens[seq_start + k], j * n_batch + k, { seq }, true);
                 }
 
                 // restore the original token in case it was set to BOS
@@ -1041,32 +1157,29 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
             }
         }
 
-
         if (i == 0) {
             llama_synchronize(ctx);
-            const auto t_end = std::chrono::high_resolution_clock::now();
+            const auto  t_end   = std::chrono::high_resolution_clock::now();
             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
             LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
-            int total_seconds = (int)(t_total * n_chunk / n_seq);
-            if (total_seconds >= 60*60) {
-                LOG("%d hours ", total_seconds / (60*60));
-                total_seconds = total_seconds % (60*60);
+            int total_seconds = (int) (t_total * n_chunk / n_seq);
+            if (total_seconds >= 60 * 60) {
+                LOG("%d hours ", total_seconds / (60 * 60));
+                total_seconds = total_seconds % (60 * 60);
             }
             LOG("%.2f minutes\n", total_seconds / 60.0);
         }
 
         if (params.compute_ppl) {
-            const int first = n_ctx/2;
+            const int first = n_ctx / 2;
             for (int seq = 0; seq < n_seq_batch; seq++) {
-                const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx);
+                const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq * n_ctx);
 
-                llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+                llama_token * tokens_data = tokens.data() + start + seq * n_ctx + first;
 
-                process_logits(n_vocab, all_logits + first*n_vocab,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, nll, nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
+                process_logits(n_vocab, all_logits + first * n_vocab, tokens_data, n_ctx - 1 - first, workers, nll,
+                               nll2, logit_history.data() + start + seq * n_ctx + first,
+                               prob_history.data() + start + seq * n_ctx + first);
 
                 count += n_ctx - first - 1;
 
@@ -1086,8 +1199,8 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
         const double ppl = exp(nll);
         nll2 -= nll * nll;
         if (nll2 > 0) {
-            nll2 = sqrt(nll2/(count-1));
-            LOG("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
+            nll2 = sqrt(nll2 / (count - 1));
+            LOG("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2 * ppl);
         } else {
             LOG("Unexpected negative standard deviation of log(prob)\n");
         }
@@ -1105,7 +1218,7 @@ static bool show_statistics(const common_params & params) {
         return false;
     }
     if (g_collector.load_imatrix(params.in_files[0].c_str())) {
-        for (const auto & [name, stats] :g_collector.get_mstats()) {
+        for (const auto & [name, stats] : g_collector.get_mstats()) {
             compute_statistics(ts, name, stats);
         }
     } else {
@@ -1128,6 +1241,7 @@ static bool show_statistics(const common_params & params) {
             return name_a < name_b || (name_a == name_b && a.total_sqract > b.total_sqract);
         }
     };
+
     std::sort(ts.begin(), ts.end(), tensor_comparer());
 
     struct weighted_stats {
@@ -1136,6 +1250,7 @@ static bool show_statistics(const common_params & params) {
         float weighted_cossim = 0.0f;
         int   total_elements  = 0;
     };
+
     std::map<int, weighted_stats> ws;
 
     LOG_INF("\nComputing statistics for %s (%d tensors)\n", params.in_files[0].c_str(), static_cast<int>(ts.size()));
@@ -1160,8 +1275,8 @@ static bool show_statistics(const common_params & params) {
 
         LOG_INF("%5s\t%-20s\t%10.2f\t%8.4f\t%11.4f\t%6.2f\t%6.2f\t%8.2f%%\t%6d\t%10.4f\t%6.2f%%\t%10.2f%%\t%8.4f\n",
                 layer.c_str(), name.c_str(), tstat.total_sqract, tstat.min_sqract, tstat.max_sqract, tstat.mean_sqract,
-                tstat.stddev, tstat.active * 100.0f, tstat.elements, tstat.entropy,
-                entropy_norm, 100.0f * tstat.zd, tstat.cossim);
+                tstat.stddev, tstat.active * 100.0f, tstat.elements, tstat.entropy, entropy_norm, 100.0f * tstat.zd,
+                tstat.cossim);
 
         const float weighted_bias   = tstat.elements * tstat.total_sqract;
         const float weighted_zd     = tstat.elements * tstat.zd;
@@ -1214,7 +1329,7 @@ int main(int argc, char ** argv) {
 
     params.out_file = "imatrix.gguf";
 
-    params.n_ctx = 512;
+    params.n_ctx  = 512;
     params.escape = false;
 
     common_init();
@@ -1239,7 +1354,7 @@ int main(int argc, char ** argv) {
 
     {
         const int32_t n_seq = std::max(1, params.n_batch / n_ctx);
-        const int32_t n_kv = n_seq * n_ctx;
+        const int32_t n_kv  = n_seq * n_ctx;
 
         params.n_parallel = n_seq;
         params.n_ctx      = n_kv;
@@ -1281,9 +1396,9 @@ int main(int argc, char ** argv) {
 
     // pass the callback to the backend scheduler
     // it will be executed for each node during the graph computation
-    params.cb_eval = ik_collect_imatrix;
+    params.cb_eval           = ik_collect_imatrix;
     params.cb_eval_user_data = NULL;
-    params.warmup = false;
+    params.warmup            = false;
 
     // init
     auto llama_init = common_init_from_params(params);
@@ -1298,8 +1413,8 @@ int main(int argc, char ** argv) {
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
     if (params.n_ctx > n_ctx_train) {
-        LOG_WRN("%s: model was trained on only %d context tokens (%d specified)\n",
-                __func__, n_ctx_train, params.n_ctx);
+        LOG_WRN("%s: model was trained on only %d context tokens (%d specified)\n", __func__, n_ctx_train,
+                params.n_ctx);
     }
 
     // print system information
