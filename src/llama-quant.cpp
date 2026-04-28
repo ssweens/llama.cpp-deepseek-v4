@@ -292,6 +292,15 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
 
+    // only float and already-quantized types can be dequantized for re-quantization;
+    // integer types (i32, i16, i8 etc.) cannot — skip them regardless of name or model
+    if (!ggml_is_quantized(tensor->type) &&
+        tensor->type != GGML_TYPE_F32  &&
+        tensor->type != GGML_TYPE_F16  &&
+        tensor->type != GGML_TYPE_BF16) {
+        return false;
+    }
+
     const std::string name = ggml_get_name(tensor);
 
     // This used to be a regex, but <regex> has an extreme cost to compile times.
@@ -305,10 +314,6 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize expert gating tensors
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
-
-    // DeepSeek-V4 hash-MoE token-id -> expert-id lookup table is i32 and
-    // must not be quantized.
-    quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
 
     // these are very small (e.g. 4x4)
     quantize &= name.find("altup")  == std::string::npos;
