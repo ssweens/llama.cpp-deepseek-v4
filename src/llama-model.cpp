@@ -2093,8 +2093,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
                 ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
-                hparams.expert_weights_scale = 1.5f;
-                hparams.expert_weights_norm  = true;
+                hparams.expert_weights_scale       = 1.5f;
+                hparams.expert_weights_norm        = true;
+                hparams.expert_weights_before_down = true; // DSv4 applies routed-expert weights after SwiGLU but before w_down
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);

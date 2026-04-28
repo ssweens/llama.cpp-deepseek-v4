@@ -106,8 +106,9 @@ struct llama_hparams {
 
     float    expert_group_scale   = 0.05f;
     float    expert_weights_scale = 0.0f;
-    bool     expert_weights_norm  = false;
-    uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
+    bool     expert_weights_norm         = false;
+    bool     expert_weights_before_down  = false; // apply routed-expert weights after SwiGLU but before w_down (e.g. DeepSeek-V4)
+    uint32_t expert_gating_func          = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
     uint32_t nextn_predict_layers = 0;

@@ -1596,7 +1596,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (gate_exps) {
                 constexpr float eps = 1e-6f;
 
-                if (arch == LLM_ARCH_DEEPSEEK4) {
+                // Optional per-model SwiGLU activation clamping.
+                // Enabled when f_swiglu_limit > 0 (set via GGUF metadata, e.g. DeepSeek-V4 uses 10.0).
+                {
                     const float limit = hparams.f_swiglu_limit;
                     if (limit > eps) {
                         cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
