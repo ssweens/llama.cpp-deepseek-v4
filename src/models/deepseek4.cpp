@@ -1518,14 +1518,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             // tiny eps to the softmax denominator.  For actual inference n_kv >= 128 (always
             // 8-aligned), so this only fires during scheduler reservation with small test
             // shapes where numerical accuracy is irrelevant.
-            if (cparams.flash_attn && full_mask->ne[0] % 8 != 0) {
-                const int64_t pad_n = ((full_mask->ne[0] + 7) / 8 * 8) - full_mask->ne[0];
-                // Kall/Vall are [head_dim, n_head_kv, n_kv, 1] before permute; pad dim 2 (n_kv).
-                Kall      = ggml_pad(ctx0, Kall,      0, 0, (int)pad_n, 0);
-                Vall      = ggml_pad(ctx0, Vall,      0, 0, (int)pad_n, 0);
-                // Mask is [n_kv, n_tokens, 1, 1]; pad dim 0.
-                full_mask = ggml_pad(ctx0, full_mask, (int)pad_n, 0, 0, 0);
-            }
+            // Note: skip FA KV-length padding for prompt sparse attention.
+            // If KV-length is not 8-aligned, FA will fall back to non-FA path.
+            // The padding was causing NaN from zero-filled mask positions being
+            // treated as "attend" by the softmax.
             full_mask = ggml_cast(ctx0, full_mask, GGML_TYPE_F16);
             cur = build_attn_mha(Qcur, Kall, Vall, nullptr, full_mask, model.layers[il].attn_sinks, nullptr, kq_scale, il);
             use_prompt_sparse_attn = true;
@@ -1726,12 +1722,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
 
             // Pad KV-length to a multiple of 8 for FA mask alignment (see prompt-path comment).
-            if (cparams.flash_attn && attn_mask->ne[0] % 8 != 0) {
-                const int64_t pad_n = ((attn_mask->ne[0] + 7) / 8 * 8) - attn_mask->ne[0];
-                Kall      = ggml_pad(ctx0, Kall,      0, 0, (int)pad_n, 0);
-                Vall      = ggml_pad(ctx0, Vall,      0, 0, (int)pad_n, 0);
-                attn_mask = ggml_pad(ctx0, attn_mask, (int)pad_n, 0, 0, 0);
-            }
+            // Note: skip FA KV-length padding for decode sparse attention.
+            // If KV-length is not 8-aligned, FA will fall back to non-FA path.
+            // (see prompt-path comment for rationale)
 
             if (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) {
                 attn_mask = ggml_cast(ctx0, attn_mask, GGML_TYPE_F16);
