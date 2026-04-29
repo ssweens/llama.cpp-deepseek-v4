@@ -1205,8 +1205,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                     }
                 }
-                float * f32_data = nullptr;
-
+                // Decide whether we need to actually run quantization, or just keep
+                // the tensor at its original type. Each branch below MUST set both
+                // new_data and new_size before falling through to the write phase
+                // (otherwise -Wmaybe-uninitialized fires and -O3 may use stale stack).
+                bool keep_original = false;
                 if (!imatrix && tm.requires_imatrix) {
                     // Fall back to keeping the tensor at its original type rather than
                     // aborting the entire quantization. This handles tensors that the
@@ -1215,25 +1218,30 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     // and keeping them at original precision is better than aborting.
                     LLAMA_LOG_WARN("\n%s: missing imatrix for %s — keeping original type %s\n",
                                    __func__, tensor->name, ggml_type_name(tensor->type));
-                    cur_new_type = tensor->type;
-                    new_data = tensor->data;
-                    new_size = tensor_size;
-                } else if (tensor->type == GGML_TYPE_F32) {
-                    f32_data = (float *) tensor->data;
+                    keep_original = true;
                 } else if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
                     // Keep the tensor in its current quantized format instead of aborting.
                     // Pass --allow-requantize to dequantize and requantize these tensors.
-                    LLAMA_LOG_INFO("keeping %s type %s (use --allow-requantize to override)\n", tensor->name, ggml_type_name(tensor->type));
+                    LLAMA_LOG_INFO("keeping %s type %s (use --allow-requantize to override)\n",
+                                   tensor->name, ggml_type_name(tensor->type));
+                    keep_original = true;
+                }
+
+                if (keep_original) {
                     cur_new_type = tensor->type;
                     new_data = tensor->data;
                     new_size = tensor_size;
-                    f32_data = nullptr;
                 } else {
-                    llama_tensor_dequantize_impl(tensor, f32_conv_buf, workers, nelements, nthread);
-                    f32_data = (float *) f32_conv_buf.data();
-                }
+                    // Dequantize source to f32 (if it is not already f32), then quantize
+                    // into work buffer. f32_data is guaranteed non-null along this path.
+                    float * f32_data;
+                    if (tensor->type == GGML_TYPE_F32) {
+                        f32_data = (float *) tensor->data;
+                    } else {
+                        llama_tensor_dequantize_impl(tensor, f32_conv_buf, workers, nelements, nthread);
+                        f32_data = (float *) f32_conv_buf.data();
+                    }
 
-                if (f32_data) {
                     LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(cur_new_type));
                     fflush(stdout);
 

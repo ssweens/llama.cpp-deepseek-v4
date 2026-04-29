@@ -6,6 +6,9 @@
 - Do not rebuild reflexively after a small edit when the immediate task is read-only diagnosis.
   - First state exactly what code changed and why a rebuild is or is not required.
   - Keep investigation steps separate from implementation validation so the user never has to ask what triggered a build.
+- Do not launch heavy local reproduction runs on huge models during a remote-pipeline incident unless the user has explicitly asked for local reproduction.
+  - First exhaust the remote logs, sentinels, serial console, and exact command traces already available.
+  - If a local run is truly needed, say exactly why it is necessary before starting it.
 
 - When validating a new model family, do not guess the chat/output format from nearby models.
   - Trace the official source of truth end-to-end first: HF README/docs, encoding or chat-template files, converter metadata injection, GGUF metadata, and llama.cpp parser selection.
@@ -78,3 +81,20 @@
 - tg128: **54 t/s**
 - 16K context summary task: 174 t/s prefill on 6569 input tokens, 10 t/s decode
 - IQ2_XXS quality: greedy non-thinking chat is coherent (`6 apples` math correct with EOS). Thinking-mode greedy decoding can loop because 2.06 bpw is too lossy for sustained long-form reasoning.
+
+## DSv4 GCP IQ2_XXS corruption (2026-04-29)
+
+### Root cause: -Wmaybe-uninitialized in our quant fallback patch
+A previous commit added two graceful-fallback branches in `llama_model_quantize_impl` (missing imatrix → keep original; already-quantized + no `--allow-requantize` → keep original). The patch left a control-flow shape where `new_data` and `new_size` were only assigned conditionally inside an `if (f32_data) { ... }` block whose predicate the compiler could not statically prove non-null. GCC 13.3.0/-O3 (the GCP toolchain) emitted `-Wmaybe-uninitialized` and produced code that, on the F32 / dequant `else` paths, sometimes used the previous loop iteration's stack values. The result: 93 tensors (full layers 21/32/42 plus partials around 20/31/41) had all-zero raw bytes on disk while the log claimed normal quantization, because `fout.write` was writing from anonymous-mmap zero-filled `work` regions instead of the freshly quantized output.
+
+### How we found it
+1. Confirmed BF16 source bytes were identical local↔GCS (rules out source corruption).
+2. Diffed tensor types between original (working) and GCP (broken) IQ2_XXS files — only meaningful regression was `attn_output_a` Q4_K→IQ2_XXS, which alone could not produce all-zero output.
+3. Dequantized BF16 vs broken IQ2_XXS in Python via `gguf.quants.dequantize`; computed RMS error per layer. Layers 21/32/42 had 100% RMS error (i.e. literally zero output).
+4. Verified raw on-disk bytes were zero, not a dequantization artifact.
+5. Searched the GCP build log for warnings/errors and found exactly the `-Wmaybe-uninitialized` for `new_data` and `new_size` at the use sites.
+
+### Lesson
+- **Treat compiler warnings in modified code as production bugs.** Especially `-Wmaybe-uninitialized` in performance-critical -O3 paths. The local GCC 15 build emitted the same warning but happened to not exhibit the UB; the GCP GCC 13 build did. Stale-stack reuse is the typical manifestation.
+- **For graceful fallbacks, restructure don't decorate.** When adding new "keep original" branches alongside existing "compute and replace" branches, restructure the surrounding code so each branch unconditionally assigns the variables consumed by downstream code. Don't add a post-hoc `if (sentinel)` guard that the compiler must prove always-true.
+- **Validate quant artifacts numerically, not just by file size and tensor count.** A 70 GiB GGUF that loads cleanly and produces tokens can still have entire layers zeroed; the only reliable check is dequantize-and-compare (or at minimum, raw-byte zero scan) per tensor.
