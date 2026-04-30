@@ -566,6 +566,7 @@ extern "C" {
         GGML_OP_DSV4_HC_EXPAND,
         GGML_OP_DSV4_FP8_KV_QUANTIZE,
         GGML_OP_DSV4_ROPE_TAIL,
+        GGML_OP_DSV4_SPARSE_ATTN,
 
 
 
@@ -2588,6 +2589,37 @@ extern "C" {
             float                 beta_fast,
             float                 beta_slow,
             bool                  inverse);
+
+    // DSv4 Unified Sparse Attention (gather-style)
+    // Computes attention with a unified KV cache that combines a contiguous window
+    // and a sparsely-gathered set of positions selected by topk_idxs.
+    //
+    // For each query token, the kernel attends to:
+    //   1. All positions in `kv_window` (contiguous, like SWA)
+    //   2. The positions in `kv_comp` selected by `topk_idxs[..., this_token]`
+    //   3. A learned per-head attention sink bias
+    //
+    // Inputs:
+    //   q          [head_dim_q, n_heads, n_tokens, batch]   F32
+    //   kv_comp    [head_dim_kv, 1, n_kv_comp, batch]       F16/BF16/F32 (MLA: K=V)
+    //   kv_window  [head_dim_kv, 1, n_window, batch]        F16/BF16/F32 (or NULL)
+    //   topk_idxs  [topk, n_tokens, batch]                  I32 (use -1 for invalid)
+    //   attn_sink  [n_heads]                                F32 (or NULL)
+    //
+    // Returns: [head_dim_kv, n_heads, n_tokens, batch] F32
+    //
+    // Note: head_dim_q may be larger than head_dim_kv (e.g. DSv4 MLA where Q has
+    // an additional rope tail). The dot product Q·K uses only the first head_dim_kv
+    // elements of Q (the nope/compressed-latent portion). The trailing rope dims of Q
+    // must be handled separately (e.g. via the rope-tail K cache).
+    GGML_API struct ggml_tensor * ggml_dsv4_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kv_comp,
+            struct ggml_tensor  * kv_window,    // may be NULL
+            struct ggml_tensor  * topk_idxs,
+            struct ggml_tensor  * attn_sink,    // may be NULL
+            float                 scale);
 
     // custom operators
 

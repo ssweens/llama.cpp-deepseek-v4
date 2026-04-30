@@ -11657,3 +11657,184 @@ void ggml_compute_forward_dsv4_fp8_kv_quantize(
     }
 }
 
+
+// ggml_compute_forward_dsv4_sparse_attn
+//
+// Reference CPU implementation of unified sparse gather-attention for DSv4.
+// Operates per-token; threads partition (token, head) pairs across n_threads.
+//
+// For each (batch, token, head):
+//   1. Iterate over kv_window positions (contiguous), accumulate softmax stats.
+//   2. Iterate over topk_idxs gathered positions in kv_comp, accumulate.
+//   3. Apply attn_sink (contributes to denominator only).
+//   4. Normalize and write output.
+//
+// Q dot product uses only the first head_dim_kv elements of Q
+// (the nope/compressed-latent portion). Trailing rope dims of Q are ignored
+// here -- they should be handled separately via a rope-tail K projection.
+//
+// Output: out[b, t, h, :] (head_dim_kv F32 values per (head, token, batch)).
+template <typename KVT>
+static void ggml_compute_forward_dsv4_sparse_attn_t(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_kv_c  = dst->src[1];
+    const ggml_tensor * src_kv_w  = dst->src[2]; // may be NULL
+    const ggml_tensor * src_idx   = dst->src[3];
+    const ggml_tensor * src_sink  = dst->src[4]; // may be NULL
+
+    GGML_ASSERT(src_q->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    const int64_t head_dim_q  = src_q->ne[0];
+    const int64_t n_heads     = src_q->ne[1];
+    const int64_t n_tokens    = src_q->ne[2];
+    const int64_t batch       = src_q->ne[3];
+
+    const int64_t head_dim_kv = src_kv_c->ne[0];
+    const int64_t n_kv_comp   = src_kv_c->ne[2];
+    const int64_t n_window    = src_kv_w ? src_kv_w->ne[2] : 0;
+
+    const int64_t topk        = src_idx->ne[0];
+
+    GGML_ASSERT(head_dim_q >= head_dim_kv);
+    GGML_ASSERT(dst->ne[0] == head_dim_kv);
+    GGML_ASSERT(dst->ne[1] == n_heads);
+    GGML_ASSERT(dst->ne[2] == n_tokens);
+    GGML_ASSERT(dst->ne[3] == batch);
+
+    // Total work units: (batch * n_tokens * n_heads). Partition across threads.
+    const int64_t total = batch * n_tokens * n_heads;
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t per_thread = (total + nth - 1) / nth;
+    const int64_t i0 = (int64_t)ith * per_thread;
+    const int64_t i1 = std::min<int64_t>(total, i0 + per_thread);
+
+    // Helpers to load a KV value (from F16 / BF16 / F32 source).
+    auto load_kv = [](const KVT * p) -> float {
+        if constexpr (std::is_same<KVT, float>::value) {
+            return *p;
+        } else if constexpr (std::is_same<KVT, ggml_fp16_t>::value) {
+            return GGML_FP16_TO_FP32(*p);
+        } else {
+            // BF16
+            return GGML_BF16_TO_FP32(*p);
+        }
+    };
+
+    // Stack-allocated work buffer. With head_dim_kv up to 1024 this fits.
+    GGML_ASSERT(head_dim_kv <= 1024);
+    float acc_o[1024];
+
+    for (int64_t idx = i0; idx < i1; ++idx) {
+        const int64_t h = idx % n_heads;
+        const int64_t t = (idx / n_heads) % n_tokens;
+        const int64_t b = (idx / n_heads) / n_tokens;
+
+        // Pointers for this (b, t, h).
+        const float * q_ptr = (const float *)((const char *)src_q->data
+            + b * src_q->nb[3]
+            + t * src_q->nb[2]
+            + h * src_q->nb[1]);
+
+        float * o_ptr = (float *)((char *)dst->data
+            + b * dst->nb[3]
+            + t * dst->nb[2]
+            + h * dst->nb[1]);
+
+        const int32_t * idx_ptr = (const int32_t *)((const char *)src_idx->data
+            + b * src_idx->nb[2]
+            + t * src_idx->nb[1]);
+
+        // KV cache pointers (KV is shared across heads for MLA).
+        const char * kv_c_base = (const char *)src_kv_c->data + b * src_kv_c->nb[3];
+        const char * kv_w_base = src_kv_w ? ((const char *)src_kv_w->data + b * src_kv_w->nb[3]) : nullptr;
+
+        // Initialize accumulators.
+        float scores_max = -INFINITY;
+        float sum_exp    = 0.0f;
+        for (int64_t d = 0; d < head_dim_kv; ++d) acc_o[d] = 0.0f;
+
+        // Phase 1: window positions (contiguous, all visible).
+        for (int64_t k = 0; k < n_window; ++k) {
+            const KVT * kv_row = (const KVT *)(kv_w_base + k * src_kv_w->nb[2]);
+            float dot = 0.0f;
+            for (int64_t d = 0; d < head_dim_kv; ++d) {
+                dot += q_ptr[d] * load_kv(kv_row + d);
+            }
+            const float s = dot * scale;
+            const float new_max = std::max(scores_max, s);
+            const float scale_prev = std::isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
+            const float w = expf(s - new_max);
+            sum_exp = sum_exp * scale_prev + w;
+            for (int64_t d = 0; d < head_dim_kv; ++d) {
+                acc_o[d] = acc_o[d] * scale_prev + w * load_kv(kv_row + d);
+            }
+            scores_max = new_max;
+        }
+
+        // Phase 2: top-k gathered positions in kv_comp.
+        for (int64_t i = 0; i < topk; ++i) {
+            const int32_t kv_pos = idx_ptr[i];
+            if (kv_pos < 0 || kv_pos >= n_kv_comp) continue;
+            const KVT * kv_row = (const KVT *)(kv_c_base + kv_pos * src_kv_c->nb[2]);
+            float dot = 0.0f;
+            for (int64_t d = 0; d < head_dim_kv; ++d) {
+                dot += q_ptr[d] * load_kv(kv_row + d);
+            }
+            const float s = dot * scale;
+            const float new_max = std::max(scores_max, s);
+            const float scale_prev = std::isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
+            const float w = expf(s - new_max);
+            sum_exp = sum_exp * scale_prev + w;
+            for (int64_t d = 0; d < head_dim_kv; ++d) {
+                acc_o[d] = acc_o[d] * scale_prev + w * load_kv(kv_row + d);
+            }
+            scores_max = new_max;
+        }
+
+        // Phase 3: attention sink (denominator only).
+        if (src_sink) {
+            const float sink_val = ((const float *)src_sink->data)[h];
+            const float new_max = std::max(scores_max, sink_val);
+            const float scale_prev = std::isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
+            sum_exp = sum_exp * scale_prev + expf(sink_val - new_max);
+            for (int64_t d = 0; d < head_dim_kv; ++d) {
+                acc_o[d] = acc_o[d] * scale_prev;
+            }
+            scores_max = new_max;
+        }
+
+        // Phase 4: normalize and write.
+        const float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+        for (int64_t d = 0; d < head_dim_kv; ++d) {
+            o_ptr[d] = acc_o[d] * inv;
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_sparse_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_kv_c = dst->src[1];
+    switch (src_kv_c->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_dsv4_sparse_attn_t<float>(params, dst);
+            break;
+        case GGML_TYPE_F16:
+            ggml_compute_forward_dsv4_sparse_attn_t<ggml_fp16_t>(params, dst);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_compute_forward_dsv4_sparse_attn_t<ggml_bf16_t>(params, dst);
+            break;
+        default:
+            GGML_ABORT("dsv4_sparse_attn: unsupported KV type %d", (int)src_kv_c->type);
+    }
+}

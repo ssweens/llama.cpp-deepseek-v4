@@ -1063,6 +1063,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_EXPAND",
     "DSV4_FP8_KV_QUANTIZE",
     "DSV4_ROPE_TAIL",
+    "DSV4_SPARSE_ATTN",
 
     "UNARY",
 
@@ -1080,7 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1178,6 +1179,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_expand(x)",
     "dsv4_fp8_kv_quantize(x)",
     "dsv4_rope_tail(x)",
+    "dsv4_sparse_attn(q,kv_comp,kv_window,idx,sink)",
 
     "unary(x)",
 
@@ -1195,7 +1197,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6369,6 +6371,56 @@ struct ggml_tensor * ggml_dsv4_rope_tail(
     result->src[0] = a;
     result->src[1] = pos;
     result->src[2] = freq_factors;
+    return result;
+}
+
+// ggml_dsv4_sparse_attn
+
+struct ggml_tensor * ggml_dsv4_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kv_comp,
+        struct ggml_tensor  * kv_window,
+        struct ggml_tensor  * topk_idxs,
+        struct ggml_tensor  * attn_sink,
+        float                 scale) {
+    GGML_ASSERT(q != NULL);
+    GGML_ASSERT(kv_comp != NULL);
+    GGML_ASSERT(topk_idxs != NULL);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(topk_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_comp->type == GGML_TYPE_F32 ||
+                kv_comp->type == GGML_TYPE_F16 ||
+                kv_comp->type == GGML_TYPE_BF16);
+    if (kv_window) {
+        GGML_ASSERT(kv_window->type == kv_comp->type);
+        GGML_ASSERT(kv_window->ne[0] == kv_comp->ne[0]); // same head_dim_kv
+    }
+    if (attn_sink) {
+        GGML_ASSERT(attn_sink->type == GGML_TYPE_F32);
+        GGML_ASSERT(attn_sink->ne[0] == q->ne[1]); // n_heads matches
+    }
+
+    // Output shape: [head_dim_kv, n_heads, n_tokens, batch]
+    // head_dim_kv = kv_comp->ne[0] (output value-dim matches KV value-dim)
+    const int64_t head_dim_kv = kv_comp->ne[0];
+    const int64_t n_heads     = q->ne[1];
+    const int64_t n_tokens    = q->ne[2];
+    const int64_t batch       = q->ne[3];
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+        head_dim_kv, n_heads, n_tokens, batch);
+
+    int32_t params[4] = { 0 };
+    memcpy(params + 0, &scale, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DSV4_SPARSE_ATTN;
+    result->src[0] = q;
+    result->src[1] = kv_comp;
+    result->src[2] = kv_window;   // may be NULL
+    result->src[3] = topk_idxs;
+    result->src[4] = attn_sink;   // may be NULL
     return result;
 }
 

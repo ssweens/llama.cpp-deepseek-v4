@@ -961,7 +961,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             case GGML_OP_DSV4_HC_EXPAND:
             case GGML_OP_DSV4_FP8_KV_QUANTIZE:
-            case GGML_OP_DSV4_ROPE_TAIL: {
+            case GGML_OP_DSV4_ROPE_TAIL:
+            case GGML_OP_DSV4_SPARSE_ATTN: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_UNARY: {
