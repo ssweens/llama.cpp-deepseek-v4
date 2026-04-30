@@ -1,5 +1,30 @@
 # DeepSeek-V4 Enablement Plan for llama.cpp
 
+## Status (2026-04-30)
+
+**End-to-end DeepSeek-V4-Flash inference is functional and validated** on the `feat/deepseek4-foundation` branch. Both BF16 and IQ2_XS produce coherent output with `-fa on` (Flash Attention enabled).
+
+Major milestones completed:
+
+- [x] Architecture / hparams / converter (FP8 dequant, partial RoPE, indexer, hybrid-ISWA cache layout)
+- [x] CUDA YaRN parity, decode KV-quant, graph-dependency cleanups
+- [x] IQ2/Q2/IQ2_XS quantization with full multi-GPU offload
+- [x] Multi-sequence support for compressed attention path
+- [x] Imatrix capture (multi-seq + single-seq regression validated)
+- [x] **`GGML_OP_DSV4_SPARSE_ATTN` custom kernel** (CPU + CUDA naive)
+- [x] **Unified sparse-gather attention path in deepseek4.cpp** (eliminated dense -inf mask incompatibility with FA tile architecture)
+- [x] BF16 long-prompt validation: structured Evidence/Interpretation/Next Step output, correct termination
+- [x] IQ2_XS short-prompt validation: 40 tok/s decode at full GPU offload, correct math
+
+Still open:
+
+- [ ] Phase 2 sparse kernel: tensor-core MMA path (current naive kernel is correctness-first; perf is fine for IQ2 full-offload)
+- [ ] HIP/ROCm port of sparse kernel
+- [ ] GCP imatrix run on H100-4x (blocked on spot capacity)
+- [ ] Final corral config + production rollout
+
+See `tasks/todo.md` for the granular state and `tasks/lessons.md` for the engineering lessons accumulated during this work, especially the Flash Attention sparse-mask incompatibility that drove the custom kernel design.
+
 ## Context
 
 Primary target model: [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
