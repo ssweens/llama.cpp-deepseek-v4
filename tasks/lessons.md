@@ -82,6 +82,24 @@
 - 16K context summary task: 174 t/s prefill on 6569 input tokens, 10 t/s decode
 - IQ2_XXS quality: greedy non-thinking chat is coherent (`6 apples` math correct with EOS). Thinking-mode greedy decoding can loop because 2.06 bpw is too lossy for sustained long-form reasoning.
 
+## DSv4 Flash Attention sparse mask incompatibility (2026-04-30)
+
+### Root cause: FA tile architecture cannot handle interspersed -inf masks
+- **Symptom:** BF16 `-fa on` produces angle-bracket spam (`<<<<<<`) immediately after prompt eval. BF16 `-fa off` produces perfect coherent structured output on the same prompt/model/GPU config.
+- **Investigation path:**
+  1. Bisected to commit `b50d0af2d` (multi-seq compressed attention) as the regression boundary for short prompts with FA on.
+  2. Discovered that commit `eb99b6dcf` (pre-b50) enabled FA for 512-dim heads for the first time — before that, FA silently fell back to CPU softmax path, masking the issue.
+  3. Attempted fix: clamp `KQ_max_new <= -1e9f → 0.0f` after warp reductions in all FA kernel variants (CUDA MMA/WMMA/TILE, SYCL/HIP tile/vec/softmax, CUDA softmax). This prevents NaN from `expf(-inf - (-inf))` when entire columns are masked.
+  4. Result: NaN prevention works for fully-masked columns, but bracket spam persists. The issue is interspersed `-inf` entries *within* FA tiles, not just fully-masked columns.
+- **Root cause:** The CUDA FA kernels (`fattn-mma-f16`, `fattn-wmma-f16`, `fattn-tile`) use tiled matrix multiplication with warp-level reductions that assume a dense causal mask (lower triangle of 0/-inf). DSv4's sparse compressed attention creates "Swiss cheese" masks where arbitrary positions within a tile are -inf. The tile-based softmax reductions handle this pattern incorrectly — partial sums and max values within a tile become corrupted when -inf values are interspersed with valid attention scores in non-contiguous patterns.
+- **Fix:** A dedicated sparse-gather attention kernel (`GGML_OP_DSV4_SPARSE_ATTN`) that gathers KV by index (matching HF's `sparse_attn_kernel` in `kernel.py`) instead of using a dense mask. See `tasks/dsv4_sparse_attn_kernel_plan.md`.
+
+### Lessons
+- **FA kernels are not general-purpose masked attention.** They are optimized for dense causal masks. Any model that needs arbitrary sparse masks (like DSv4's compressed attention with top-k selection) requires a dedicated kernel.
+- **"Just add a guard" rarely fixes a tiled-compute incompatibility.** The NaN-prevention guard handled one edge case (fully-masked columns) but the fundamental problem was the tile architecture's inability to process interspersed -inf. Always verify the fix addresses the actual tile-level data flow, not just the most visible symptom.
+- **Bisecting across FA-enable commits is critical.** The regression appeared at `b50d0af2d` but the actual enablement was `eb99b6dcf`. Without tracing the FA dispatch path, we would have blamed the multi-seq refactor instead of the FA kernel.
+- **Never run `git checkout` on uncommitted WIP files.** Multiple reckless `git checkout` commands destroyed hours of uncommitted work (BF16 cache fixes, debug instrumentation, HC dtype fixes). Always use targeted `Edit` tool or `git stash` before any destructive git operation.
+
 ## DSv4 GCP IQ2_XXS corruption (2026-04-29)
 
 ### Root cause: -Wmaybe-uninitialized in our quant fallback patch
