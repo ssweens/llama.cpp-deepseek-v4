@@ -49,7 +49,7 @@
 - [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
   - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
   - Goal: match or exceed pre-bug FA performance using MMA tensor cores
-- [ ] Phase 3: HIP/ROCm port of sparse kernel (currently CUDA-only; ROCm falls back to CPU op)
+- [x] **Phase 3: HIP/ROCm compatibility verified.** The `dsv4-sparse-attn.cu` source is automatically picked up by `ggml-hip`'s file glob and compiles cleanly under HIP via the existing CUDA→HIP translation in `ggml-cuda/vendors/hip.h`. `nv_bfloat16` is aliased to `__hip_bfloat16`, `__shfl_xor_sync(width=32)` works on both wave32 and wave64 hardware (via sub-warp semantics). HIP build target succeeds. Runtime validation on AMD GPU still pending.
 - [ ] GCP: imatrix + logits generation on h100-4x
   - **Blocked on H100-4x spot capacity** — all configured zones stocked out
   - BF16 cache ready at `gs://test-quant-jobs/bf16-cache/deepseek-ai__DeepSeek-V4-Flash/`
