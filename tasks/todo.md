@@ -36,7 +36,16 @@
 
 ## In Progress
 - [x] Long-prompt validation: BF16 `-fa on` with isolation prompt + n_predict=400 — perfect structured output
-- [x] Verify IQ2_XS works with the unified sparse path — short prompt coherent ("answer":"6"), long prompt coherent prompt-eval and proper section structure but decode loops on closing sentence (consistent with previously-documented IQ2-XXS thinking-mode quality ceiling at ~2bpw; not a regression)
+- [x] Verify IQ2_XS short prompt with the unified sparse path — coherent ("answer":"6") at 40 tok/s
+- [ ] **INVESTIGATE: IQ2_XS long prompt decode loop is suspicious, do not assume quant ceiling.**
+  - Symptom: long isolation prompt with `-fa on` and IQ2_XS produces correct prompt-eval and proper Evidence/Interpretation/Next Step section structure, then collapses into repeating "The final sentence must be a single short sentence." sentence-by-sentence.
+  - User pushback: "I don't believe this to be true" — user does not accept the quick attribution to IQ2 quant quality.
+  - Required diagnosis steps:
+    - Compare IQ2_XS `-fa off` (CPU softmax path) on the same long prompt. If it produces coherent structured output, this is a sparse-op-specific issue, not a quant ceiling.
+    - Compare with `-ngl 0` and `CUDA_VISIBLE_DEVICES=` cleared to factor out backend interactions.
+    - Compare with a non-thinking-mode prompt at the same length to factor out reasoning-quality loss.
+    - Compare with `--temp 0.7 --top-p 0.95` non-greedy sampling to factor out greedy-decode pathologies.
+    - If a real bug remains, suspected areas: (a) sparse op behavior with quantized indexer Q matmul inputs, (b) attention-sink interaction with online softmax under quantized accumulation, (c) cache-validity mask interaction with the SWA window across the chunk boundary.
 - [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
   - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
   - Goal: match or exceed pre-bug FA performance using MMA tensor cores
