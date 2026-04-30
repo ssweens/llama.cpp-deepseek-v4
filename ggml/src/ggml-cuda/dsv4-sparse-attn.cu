@@ -7,23 +7,39 @@
 // DSV4 Unified Sparse Attention (gather-style) CUDA kernel.
 //
 // One thread block per (token, head, batch). The block iterates over:
-//   1. All kv_window positions (contiguous, like SWA)
+//   1. All kv_window positions (contiguous, like SWA), with an optional
+//      causal/SWA mask added to the score.
 //   2. The topk_idxs gathered positions in kv_comp
 //   3. The per-head learned attention sink (denominator only)
 //
 // Online softmax (FlashAttention-style) is used to compute the result in
 // a single pass with O(head_dim_kv) memory.
 //
-// Threading model:
-//   - BLOCK_THREADS threads per block (default 128)
-//   - Each thread owns HEAD_DIM_KV / BLOCK_THREADS contiguous elements of
-//     the head_dim_kv axis.
-//   - Each KV position is dotted with Q via a warp-level reduction;
-//     the resulting score is broadcast through shared memory and used to
-//     update the per-thread acc_o slice.
+// Threading model (Phase 2a — warp-parallel KV chunks):
+//   - BLOCK_THREADS = 128 threads per block (default), arranged as 4 warps.
+//   - Each warp processes its OWN KV position concurrently. The block
+//     therefore advances through KV positions in chunks of N_WARPS=4 per
+//     iteration, performing a single block sync per chunk instead of one
+//     per KV position.
+//   - For the dot product within a warp: 32 threads cooperate, each
+//     accumulating HEAD_DIM_KV / WARP_SIZE elements, then warp-reducing.
+//   - For the acc_o accumulator update: each thread owns
+//     HEAD_DIM_KV / BLOCK_THREADS contiguous output elements and combines
+//     all CHUNK_KV new KV contributions in one pass per chunk.
+//
+// Memory layout (shared):
+//   q_shared[HEAD_DIM_KV]                    — query loaded once
+//   kv_chunk_shared[CHUNK_KV][HEAD_DIM_KV]   — gathered KV for current chunk
+//   scores_shared[CHUNK_KV]                  — Q·K dot products for chunk
+//   masks_shared[CHUNK_KV]                   — additive masks (-inf to skip)
 //
 // For DSv4: head_dim_kv = 512, n_heads = 16. So we launch
 // (n_tokens * n_heads * batch) blocks of 128 threads each.
+//
+// Phase 2b (TODO): replace the warp-parallel scalar dot products with
+// MMA tensor-core tiles. Process more KV positions per iteration
+// (BLOCK_KV = 32 or 64) and run all heads through a single block grid.
+// Expected additional ~2-4x speedup on Ampere/Ada/Blackwell.
 // =============================================================================
 
 #ifndef DSV4_SPARSE_ATTN_BLOCK_THREADS
@@ -62,8 +78,25 @@ static __global__ void dsv4_sparse_attn_kernel(
         const int64_t                  o_stride_b) {
     static_assert(HEAD_DIM_KV % BLOCK_THREADS == 0,
                   "HEAD_DIM_KV must be a multiple of BLOCK_THREADS");
-    constexpr int ELEMS_PER_THREAD = HEAD_DIM_KV / BLOCK_THREADS;
     constexpr int WARP_SIZE_LOCAL  = 32;
+    static_assert(BLOCK_THREADS % WARP_SIZE_LOCAL == 0,
+                  "BLOCK_THREADS must be a multiple of warp size");
+    constexpr int N_WARPS          = BLOCK_THREADS / WARP_SIZE_LOCAL;
+    // CHUNK_KV = N_WARPS: each warp processes its own KV position concurrently,
+    // so we get one block sync per chunk of N_WARPS KV positions instead of one
+    // sync per position. This is a clear win for decode (n_tokens=1, ~15% TPS
+    // improvement at full GPU offload) and a small regression for prompt eval
+    // (~7% slower) due to higher shared-memory pressure reducing SM occupancy
+    // when many blocks are in flight.
+    //
+    // Decode is the dominant inference cost so the trade-off is favorable. A
+    // future Phase 2b MMA-based kernel can recover the prompt-eval throughput
+    // (and exceed it) by processing many more KV positions per iteration via
+    // tensor cores.
+    constexpr int CHUNK_KV         = N_WARPS;
+    static_assert(CHUNK_KV >= 1 && CHUNK_KV <= N_WARPS,
+                  "CHUNK_KV must be in [1, N_WARPS] so each slot has a dedicated warp");
+    constexpr int ELEMS_PER_THREAD = HEAD_DIM_KV / BLOCK_THREADS;
 
     const int t_idx = blockIdx.x;
     const int h_idx = blockIdx.y;
@@ -71,6 +104,9 @@ static __global__ void dsv4_sparse_attn_kernel(
     const int tid   = threadIdx.x;
 
     if (t_idx >= n_tokens || h_idx >= n_heads) return;
+
+    const int warp_id = tid / WARP_SIZE_LOCAL;
+    const int lane_id = tid % WARP_SIZE_LOCAL;
 
     // Q pointer for this (b, t, h).
     const float * q_ptr =
@@ -84,23 +120,29 @@ static __global__ void dsv4_sparse_attn_kernel(
     const int32_t * idx_ptr =
         topk_idxs + b_idx * idx_stride_b + t_idx * idx_stride_t;
 
+    // Window mask row for this token (shape [n_window]).
+    const float * wmask_row = window_mask
+        ? (window_mask + (int64_t) t_idx * wmask_stride_t)
+        : nullptr;
+
     // Output pointer for this (b, t, h).
     float * o_ptr =
         out + b_idx * o_stride_b + t_idx * o_stride_t + h_idx * o_stride_h;
 
-    // Shared memory: query (head_dim_kv floats) + per-block score broadcast.
+    // Shared memory.
     __shared__ float q_shared[HEAD_DIM_KV];
-    __shared__ float score_shared;
+    __shared__ float scores_shared[CHUNK_KV];
+    __shared__ float masks_shared[CHUNK_KV];
+    __shared__ KVT   kv_chunk_shared[CHUNK_KV * HEAD_DIM_KV];
 
-    // Load Q[..head_dim_kv] into shared memory. (We ignore the trailing rope dims
-    // of Q -- the caller is responsible for rope-tail handling.)
+    // Load Q[..head_dim_kv] into shared memory (ignore trailing rope dims of Q).
     #pragma unroll
     for (int i = tid; i < HEAD_DIM_KV; i += BLOCK_THREADS) {
         q_shared[i] = q_ptr[i];
     }
     __syncthreads();
 
-    // Per-thread accumulator slice.
+    // Per-thread output accumulator slice.
     float acc_o[ELEMS_PER_THREAD];
     #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) acc_o[i] = 0.0f;
@@ -108,84 +150,131 @@ static __global__ void dsv4_sparse_attn_kernel(
     float scores_max = -INFINITY;
     float sum_exp    = 0.0f;
 
-    // Lambda: process one KV row, with an optional additive mask value.
-    // Reads kv_row pointer, computes Q dot K, performs online softmax update.
-    auto process_kv = [&](const KVT * kv_row, float mask_add) {
-        // Early-out for fully-masked positions to avoid the dot product entirely.
-        const bool masked = (mask_add == -INFINITY);
-        // Compute partial dot product: each thread accumulates ELEMS_PER_THREAD products.
-        float partial = 0.0f;
-        if (!masked) {
-            #pragma unroll
-            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-                const int d = tid * ELEMS_PER_THREAD + i;
-                partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
+    // -------------------------------------------------------------------------
+    // process_chunk(get_kv_row, n_pos): process up to CHUNK_KV positions.
+    //   get_kv_row(int slot, const KVT *& kv_row, float & mask_add) is a
+    //   functor that, for slot in [0, n_pos), returns the KV row pointer and
+    //   the additive mask. For slot >= n_pos the slot is treated as masked.
+    //   Setting mask_add to -INFINITY skips the slot entirely.
+    // -------------------------------------------------------------------------
+    auto process_chunk = [&](auto get_kv_row, int n_pos) {
+        // Step 1: gather KV chunk into shared memory and prepare masks.
+        // Each active warp gathers its own slot. Extra warps idle this step.
+        if (warp_id < CHUNK_KV) {
+            const int slot = warp_id;
+            float    m      = -INFINITY;
+            const KVT * src = nullptr;
+            if (slot < n_pos) {
+                get_kv_row(slot, src, m);
             }
-        }
-
-        // Block reduction to compute the full dot product.
-        // First: warp-level reduction.
-        #pragma unroll
-        for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
-            partial += __shfl_xor_sync(0xffffffff, partial, offset, WARP_SIZE_LOCAL);
-        }
-        // Cross-warp reduction via shared memory.
-        __shared__ float warp_sums[BLOCK_THREADS / WARP_SIZE_LOCAL];
-        const int warp_id = tid / WARP_SIZE_LOCAL;
-        const int lane_id = tid % WARP_SIZE_LOCAL;
-        if (lane_id == 0) warp_sums[warp_id] = partial;
-        __syncthreads();
-        // First warp reduces the warp_sums.
-        if (warp_id == 0) {
-            float v = (lane_id < BLOCK_THREADS / WARP_SIZE_LOCAL) ? warp_sums[lane_id] : 0.0f;
-            #pragma unroll
-            for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
-                v += __shfl_xor_sync(0xffffffff, v, offset, WARP_SIZE_LOCAL);
+            const bool valid = (slot < n_pos) && (src != nullptr) && (m != -INFINITY);
+            // Each active warp loads its own slot's KV row.
+            for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
+                kv_chunk_shared[slot * HEAD_DIM_KV + d] = valid
+                    ? src[d]
+                    : (KVT) 0;
             }
             if (lane_id == 0) {
-                score_shared = masked ? -INFINITY : (v * scale + mask_add);
+                masks_shared[slot] = valid ? m : -INFINITY;
             }
         }
         __syncthreads();
 
-        const float s = score_shared;
-        if (s == -INFINITY) {
-            return; // fully masked: no contribution
+        // Step 2: warp-parallel Q·K dot products. Each active warp handles one slot.
+        // When CHUNK_KV < N_WARPS, the extra warps idle this step.
+        if (warp_id < CHUNK_KV) {
+            const int slot = warp_id;
+            const KVT * kv_row = &kv_chunk_shared[slot * HEAD_DIM_KV];
+            float partial = 0.0f;
+            #pragma unroll
+            for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
+                partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
+            }
+            // Warp reduction.
+            #pragma unroll
+            for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
+                partial += __shfl_xor_sync(0xffffffff, partial, offset, WARP_SIZE_LOCAL);
+            }
+            if (lane_id == 0) {
+                const float m = masks_shared[slot];
+                scores_shared[slot] = (m == -INFINITY) ? -INFINITY : (partial * scale + m);
+            }
         }
-        const float new_max = fmaxf(scores_max, s);
-        const float scale_prev = isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
-        const float w = expf(s - new_max);
+        __syncthreads();
 
-        // Update accumulators.
-        sum_exp = sum_exp * scale_prev + w;
+        // Step 3: chunk-level online softmax update.
+        // First, compute the chunk max (small loop, all threads do it).
+        float chunk_max = -INFINITY;
+        #pragma unroll
+        for (int s = 0; s < CHUNK_KV; ++s) {
+            chunk_max = fmaxf(chunk_max, scores_shared[s]);
+        }
+        if (chunk_max == -INFINITY) {
+            // Whole chunk is masked or out-of-range; nothing to do.
+            return;
+        }
+        const float new_max    = fmaxf(scores_max, chunk_max);
+        const float scale_prev = isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
+
+        // Per-slot softmax weights w[s] = exp(score[s] - new_max), with
+        // -inf scores producing zero (skipped).
+        float w[CHUNK_KV];
+        float chunk_sum = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < CHUNK_KV; ++s) {
+            const float sc = scores_shared[s];
+            w[s] = (sc == -INFINITY) ? 0.0f : expf(sc - new_max);
+            chunk_sum += w[s];
+        }
+        sum_exp = sum_exp * scale_prev + chunk_sum;
+
+        // Step 4: update acc_o = acc_o * scale_prev + sum_s(w[s] * kv_chunk_shared[s][d]).
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
             const int d = tid * ELEMS_PER_THREAD + i;
-            acc_o[i] = acc_o[i] * scale_prev + w * ggml_cuda_cast<float>(kv_row[d]);
+            float v = acc_o[i] * scale_prev;
+            #pragma unroll
+            for (int s = 0; s < CHUNK_KV; ++s) {
+                if (w[s] != 0.0f) {
+                    v += w[s] * ggml_cuda_cast<float>(kv_chunk_shared[s * HEAD_DIM_KV + d]);
+                }
+            }
+            acc_o[i] = v;
         }
         scores_max = new_max;
+        __syncthreads();
     };
 
-    // Phase 1: window positions (with optional causal/SWA mask).
-    const float * wmask_row = window_mask ? (window_mask + (int64_t) t_idx * wmask_stride_t) : nullptr;
-    for (int k = 0; k < n_window; ++k) {
-        const KVT * kv_row = kv_w_base + (int64_t) k * kw_stride_p;
-        const float m = wmask_row ? wmask_row[k] : 0.0f;
-        process_kv(kv_row, m);
+    // ---- Phase 1: window positions (with optional causal/SWA mask). ----
+    for (int kv_base = 0; kv_base < n_window; kv_base += CHUNK_KV) {
+        const int n_pos = min(CHUNK_KV, n_window - kv_base);
+        process_chunk([&](int slot, const KVT *& kv_row, float & mask_add) {
+            const int k = kv_base + slot;
+            kv_row   = kv_w_base + (int64_t) k * kw_stride_p;
+            mask_add = wmask_row ? wmask_row[k] : 0.0f;
+        }, n_pos);
     }
 
-    // Phase 2: gathered topk positions in kv_comp.
-    for (int i = 0; i < topk; ++i) {
-        const int32_t kv_pos = idx_ptr[i];
-        if (kv_pos < 0 || kv_pos >= n_kv_comp) continue;
-        const KVT * kv_row = kv_c_base + (int64_t) kv_pos * kc_stride_p;
-        process_kv(kv_row, 0.0f);
+    // ---- Phase 2: gathered topk positions in kv_comp. ----
+    for (int i_base = 0; i_base < topk; i_base += CHUNK_KV) {
+        const int n_pos = min(CHUNK_KV, topk - i_base);
+        process_chunk([&](int slot, const KVT *& kv_row, float & mask_add) {
+            const int i = i_base + slot;
+            const int32_t kv_pos = idx_ptr[i];
+            if (kv_pos < 0 || kv_pos >= n_kv_comp) {
+                kv_row   = nullptr;
+                mask_add = -INFINITY; // mark this slot as masked / skipped
+            } else {
+                kv_row   = kv_c_base + (int64_t) kv_pos * kc_stride_p;
+                mask_add = 0.0f;
+            }
+        }, n_pos);
     }
 
-    // Phase 3: attention sink (denominator only).
+    // ---- Phase 3: attention sink (denominator only). ----
     if (attn_sink != nullptr) {
         const float sink_val = attn_sink[h_idx];
-        const float new_max = fmaxf(scores_max, sink_val);
+        const float new_max  = fmaxf(scores_max, sink_val);
         const float scale_prev = isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
         sum_exp = sum_exp * scale_prev + expf(sink_val - new_max);
         #pragma unroll
@@ -195,7 +284,7 @@ static __global__ void dsv4_sparse_attn_kernel(
         scores_max = new_max;
     }
 
-    // Phase 4: normalize and write output.
+    // ---- Phase 4: normalize and write output. ----
     const float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
     #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
@@ -244,7 +333,6 @@ static void launch_dsv4_sparse_attn(
     constexpr int BLOCK_THREADS = DSV4_SPARSE_ATTN_BLOCK_THREADS;
 
     // Only head_dim_kv == 512 is currently supported (DSv4 MLA compressed dim).
-    // Other sizes are reserved for future model families.
     if (head_dim_kv != 512) {
         GGML_ABORT("dsv4_sparse_attn: unsupported head_dim_kv=%d (only 512 implemented)", head_dim_kv);
     }
