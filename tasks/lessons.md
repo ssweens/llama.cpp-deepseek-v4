@@ -82,6 +82,24 @@
 - 16K context summary task: 174 t/s prefill on 6569 input tokens, 10 t/s decode
 - IQ2_XXS quality: greedy non-thinking chat is coherent (`6 apples` math correct with EOS). Thinking-mode greedy decoding can loop because 2.06 bpw is too lossy for sustained long-form reasoning.
 
+## DSv4 unified sparse-gather attention op (2026-04-30)
+
+### Final architecture (after a long debugging arc)
+- DSv4-Flash uses MLA + window+compressed attention. The previous llama.cpp port concatenated `Kcur` (window) and the compressed cache into a single `Kall` and built a dense `[n_kv, n_tokens]` mask containing both causal -infs AND interspersed -infs (for non-top-k compressed positions). This was fed to `ggml_flash_attn_ext` via `build_attn_mha`.
+- The interspersed -inf pattern is incompatible with FA's tile architecture (see preceding lesson). Pragmatic NaN guards in FA kernels did not fix the corruption — the bug is in tile-level softmax reductions over Swiss-cheese masks, not just fully-masked columns.
+- **Fix:** new `GGML_OP_DSV4_SPARSE_ATTN` op that gathers KV by index (matching HF's `sparse_attn_kernel`) instead of using a dense mask. The op handles BOTH the contiguous window AND the topk-gathered compressed positions plus the per-head learned attention sink, in one pass with FlashAttention-style online softmax. No -inf mask is ever built.
+- DSv4 attention now has exactly two paths:
+  - sparse op when compressor + indexer + n_comp > 0
+  - standard `build_attn` (window only) when not
+- Performance note: the Phase-1 naive CUDA kernel uses one block per (token, head, batch) with warp-reduction scalar dot products. It is correctness-first and slower than tensor-core FA on small/dense KV. Phase 2 will move to MMA tensor cores. The bug fix justifies the perf cost; the unified architecture eliminates ~150 lines of dense-mask scaffolding.
+
+### Lessons
+- **Custom kernel + one architectural path beat heroic kernel-level workarounds.** Once the bug class is "FA can't handle this kind of mask", do not patch FA — replace the call.
+- **Dead graph inputs cause `set_input` crashes.** When you bypass a code path that was building input tensors via `cache_mask` + `add_input`, those tensors get pruned by the scheduler (no buffer) but the input handler still tries to write to them (`buffer_is_host` assert). The right fix is to NOT build the input tensors when going down the bypass path — not to add `if (buffer == nullptr) return;` band-aids in every handler. Eliminate the upstream cause.
+- **"Fall through" cleanly to existing standard paths.** When refactoring DSv4 to remove its custom `build_attn_mha` calls, the cleanest pattern was to leave a flag (`use_prompt_sparse_attn`) at false in the non-sparse case and let the existing standard `build_attn` block at the end of the function handle it. Don't recreate window-only attention; reuse what's already there.
+- **Compressor cache writes must happen even when this step does not use sparse attention.** Future decode iterations will need newly-compressed positions in the DSv4 attn_k / index_k caches. Run cache writes unconditionally; gate only the attention computation on sparse eligibility.
+- **Pri-perf trade-off can be small enough to accept.** The all-visible decode shortcut saved maybe 10% on the first ~2K tokens of context. Eliminating it (in exchange for one unified architecture and ~150 fewer lines) was worth it. Always quantify before committing to perf-optimal multi-path.
+
 ## DSv4 Flash Attention sparse mask incompatibility (2026-04-30)
 
 ### Root cause: FA tile architecture cannot handle interspersed -inf masks
