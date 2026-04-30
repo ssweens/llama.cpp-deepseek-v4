@@ -51,13 +51,14 @@
     - `indexer_compressor_kv.weight` → IQ2_XS
     - `indexer_compressor_gate.weight` → IQ2_XS
   - These tensors steer attention (indexer top-k selection + compressor pool that gets gathered). At 2.4 bpw the noise is enough to derail topk selection on sustained generation — but is fine on single short answers (where small attention errors don't compound).
-- [x] **FIX (in progress): architecture-aware override in `llama_tensor_get_type_impl()`**
+- [x] **FIX: architecture-aware override in `llama_tensor_get_type_impl()` (commit `268fd574e`)**
   - When `arch == LLM_ARCH_DEEPSEEK4` and tensor name contains `indexer` or `compressor`,
-    force MXFP4 if the recipe would otherwise pick an aggressive (sub-4 bpw) type.
+    force `GGML_TYPE_MXFP4` if the recipe would otherwise pick an aggressive (sub-4 bpw) type.
   - MXFP4 (4 bpw structured FP with E8M0 group scale) matches the natural precision of
     the FP4 QAT-trained DSv4 weights and avoids the IQ2 noise that derails top-k.
   - User `--tensor-type` regex overrides still win (the override only kicks in when the user did not specify).
-  - Re-quantization in progress to verify the fix; once verified, commit and push the change to `src/llama-quant.cpp`.
+  - Verified via instrumented debug build: every indexer / compressor tensor across all DSv4 layers routes to MXFP4 instead of IQ2_XS.
+- [ ] **End-to-end validation pending**: re-quantize the BF16 source with the fix in place and confirm the long-prompt loop is gone. Local re-quant takes ~9 hours due to 43 layers x 3 ffn_*_exps tensors (~1 GB each); recommend running on the GCP CPU quant VM via the next `--quant` invocation, which will pick up the fix automatically.
 - [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
   - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
   - Goal: match or exceed pre-bug FA performance using MMA tensor cores
