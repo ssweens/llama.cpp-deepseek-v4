@@ -59,9 +59,10 @@
   - User `--tensor-type` regex overrides still win (the override only kicks in when the user did not specify).
   - Verified via instrumented debug build: every indexer / compressor tensor across all DSv4 layers routes to MXFP4 instead of IQ2_XS.
 - [ ] **End-to-end validation pending**: re-quantize the BF16 source with the fix in place and confirm the long-prompt loop is gone. Local re-quant takes ~9 hours due to 43 layers x 3 ffn_*_exps tensors (~1 GB each); recommend running on the GCP CPU quant VM via the next `--quant` invocation, which will pick up the fix automatically.
-- [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
-  - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
-  - Goal: match or exceed pre-bug FA performance using MMA tensor cores
+- [x] **Phase 2a sparse kernel optimization (commit `d95382d9c`)**: warp-parallel KV chunks. Each warp processes its own KV slot in parallel, with one block sync per chunk of N_WARPS positions instead of one per position. Measured on IQ2_XS full offload long-prompt: decode +11% (33.8 -> 37.6 t/s), prompt eval -7% (413 -> 384 t/s) due to higher shared-mem occupancy pressure. Decode wins in net inference throughput.
+- [ ] **Phase 2b sparse kernel optimization**: port dot products and acc_o GEMMs to MMA tensor-core tiles via `mma.cuh`. Process multiple heads through a single block grid like `fattn-mma-f16.cuh` does for dense FA. Expected to recover the prompt-eval throughput AND exceed it, plus another 2-4x decode speedup.
+  - Substantial work (~600-800 lines of CUDA template code; mirror fattn-mma-f16 structure adapted for sparse gather + MLA dimensions)
+  - Skipped for now: the FFN/MoE compute dominates end-to-end TPS at 256-expert top-8 dispatch, so attention-kernel wins are bounded. Defer until profiling identifies attention as the real bottleneck.
 - [x] **Phase 3: HIP/ROCm compatibility verified.** The `dsv4-sparse-attn.cu` source is automatically picked up by `ggml-hip`'s file glob and compiles cleanly under HIP via the existing CUDA→HIP translation in `ggml-cuda/vendors/hip.h`. `nv_bfloat16` is aliased to `__hip_bfloat16`, `__shfl_xor_sync(width=32)` works on both wave32 and wave64 hardware (via sub-warp semantics). HIP build target succeeds. Runtime validation on AMD GPU still pending.
 - [ ] GCP: imatrix + logits generation on h100-4x
   - **Blocked on H100-4x spot capacity** — all configured zones stocked out
