@@ -1255,6 +1255,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
         }
 
+        const uint32_t prompt_window_size = hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : (uint32_t) n_tokens;
         bool use_prompt_sparse_attn = false;
         // Unified sparse-gather attention path for prompt eval.
         // Active iff the layer has a compressor + indexer AND there is at least one
@@ -1370,6 +1371,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_v(ctx0, Vcur, inp_attn_kv->get_v_idxs(), il));
             }
 
+            // ----- causal window mask for prompt eval -----
+            // Without this, query token t would attend to future tokens t+1..n_tokens-1
+            // in the same prompt batch (i.e. broken causality).
+            ggml_tensor * window_mask = cache_mask(
+                "prompt_window_causal:" + std::to_string(prompt_window_size) + ":" + std::to_string((int)cparams.causal_attn),
+                [&]() {
+                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_prompt_window_mask");
+                    res->add_input(std::make_unique<dsv4_prompt_window_mask_input>(t, prompt_window_size, hparams.use_alibi, cparams.causal_attn));
+                    return t;
+                });
+
             // ----- unified sparse-gather attention -----
             ggml_tensor * sink = model.layers[il].attn_sinks;
             if (sink && sink->type != GGML_TYPE_F32) {
@@ -1380,6 +1394,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 Qcur,
                 c_attn,                 // [head_dim, 1, n_comp] (just-built compressed pool)
                 Kcur,                   // [head_dim, 1, n_tokens] (window = current prompt tokens)
+                window_mask,            // [n_tokens, n_tokens] causal+SWA mask
                 idx_sel,                // [n_idx_topk, n_tokens]
                 sink,                   // [n_heads]
                 kq_scale);
@@ -1565,11 +1580,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 if (sink && sink->type != GGML_TYPE_F32) {
                     sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
                 }
+                // SWA mask for the window phase. This handles both cache-validity
+                // (mask out unfilled slots) and within-chunk causality (for chunked decode
+                // with n_tokens > 1). Shape: [n_kv, n_tokens/n_stream, 1, n_stream] F32.
+                ggml_tensor * window_mask = inp_attn_iswa->self_kq_mask_swa;
                 cur = ggml_dsv4_sparse_attn(
                     ctx0,
                     Qcur,
                     kv_comp_cache,    // [head_dim, 1, n_comp_visible]
                     k_raw,            // [head_dim, 1, n_window]
+                    window_mask,      // [n_window, n_tokens] SWA validity + causal
                     idx_topk,         // [n_idx_topk, n_tokens]
                     sink,             // [n_heads]
                     kq_scale);

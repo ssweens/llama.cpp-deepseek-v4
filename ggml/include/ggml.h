@@ -2595,16 +2595,21 @@ extern "C" {
     // and a sparsely-gathered set of positions selected by topk_idxs.
     //
     // For each query token, the kernel attends to:
-    //   1. All positions in `kv_window` (contiguous, like SWA)
+    //   1. All positions in `kv_window` (contiguous, like SWA), optionally masked
+    //      by `window_mask` for prompt-eval causality.
     //   2. The positions in `kv_comp` selected by `topk_idxs[..., this_token]`
     //   3. A learned per-head attention sink bias
     //
     // Inputs:
-    //   q          [head_dim_q, n_heads, n_tokens, batch]   F32
-    //   kv_comp    [head_dim_kv, 1, n_kv_comp, batch]       F16/BF16/F32 (MLA: K=V)
-    //   kv_window  [head_dim_kv, 1, n_window, batch]        F16/BF16/F32 (or NULL)
-    //   topk_idxs  [topk, n_tokens, batch]                  I32 (use -1 for invalid)
-    //   attn_sink  [n_heads]                                F32 (or NULL)
+    //   q            [head_dim_q, n_heads, n_tokens, batch]   F32
+    //   kv_comp      [head_dim_kv, 1, n_kv_comp, batch]       F16/BF16/F32 (MLA: K=V)
+    //   kv_window    [head_dim_kv, 1, n_window, batch]        F16/BF16/F32 (or NULL)
+    //   window_mask  [n_window, n_tokens, 1, 1]              F32 (or NULL)  added to score
+    //                Use 0.0 for visible, -INFINITY for hidden (causal/SWA pattern).
+    //                Required for prompt eval (n_tokens > 1) to avoid future-token leakage.
+    //                May be NULL for decode (n_tokens == 1) where window is all past.
+    //   topk_idxs    [topk, n_tokens, batch]                  I32 (use -1 for invalid)
+    //   attn_sink    [n_heads]                                F32 (or NULL)
     //
     // Returns: [head_dim_kv, n_heads, n_tokens, batch] F32
     //
@@ -2617,6 +2622,7 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * kv_comp,
             struct ggml_tensor  * kv_window,    // may be NULL
+            struct ggml_tensor  * window_mask,  // may be NULL
             struct ggml_tensor  * topk_idxs,
             struct ggml_tensor  * attn_sink,    // may be NULL
             float                 scale);

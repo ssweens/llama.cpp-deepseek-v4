@@ -6381,6 +6381,7 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
         struct ggml_tensor  * q,
         struct ggml_tensor  * kv_comp,
         struct ggml_tensor  * kv_window,
+        struct ggml_tensor  * window_mask,
         struct ggml_tensor  * topk_idxs,
         struct ggml_tensor  * attn_sink,
         float                 scale) {
@@ -6395,6 +6396,12 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
     if (kv_window) {
         GGML_ASSERT(kv_window->type == kv_comp->type);
         GGML_ASSERT(kv_window->ne[0] == kv_comp->ne[0]); // same head_dim_kv
+    }
+    if (window_mask) {
+        GGML_ASSERT(window_mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(kv_window != NULL);                  // window_mask requires kv_window
+        GGML_ASSERT(window_mask->ne[0] == kv_window->ne[2]); // n_window
+        GGML_ASSERT(window_mask->ne[1] == q->ne[2]);     // n_tokens
     }
     if (attn_sink) {
         GGML_ASSERT(attn_sink->type == GGML_TYPE_F32);
@@ -6419,8 +6426,9 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
     result->src[0] = q;
     result->src[1] = kv_comp;
     result->src[2] = kv_window;   // may be NULL
-    result->src[3] = topk_idxs;
-    result->src[4] = attn_sink;   // may be NULL
+    result->src[3] = window_mask; // may be NULL
+    result->src[4] = topk_idxs;
+    result->src[5] = attn_sink;   // may be NULL
     return result;
 }
 

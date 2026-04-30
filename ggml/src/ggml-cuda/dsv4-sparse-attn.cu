@@ -32,12 +32,13 @@
 
 template <typename KVT, int HEAD_DIM_KV, int BLOCK_THREADS>
 static __global__ void dsv4_sparse_attn_kernel(
-        const float    * __restrict__ q,          // [head_dim_q, n_heads, n_tokens, batch]
-        const KVT      * __restrict__ kv_comp,    // [head_dim_kv, 1, n_kv_comp, batch]
-        const KVT      * __restrict__ kv_window,  // [head_dim_kv, 1, n_window, batch] (or NULL)
-        const int32_t  * __restrict__ topk_idxs,  // [topk, n_tokens, batch]
-        const float    * __restrict__ attn_sink,  // [n_heads] (or NULL)
-        float          * __restrict__ out,        // [head_dim_kv, n_heads, n_tokens, batch]
+        const float    * __restrict__ q,            // [head_dim_q, n_heads, n_tokens, batch]
+        const KVT      * __restrict__ kv_comp,      // [head_dim_kv, 1, n_kv_comp, batch]
+        const KVT      * __restrict__ kv_window,    // [head_dim_kv, 1, n_window, batch] (or NULL)
+        const float    * __restrict__ window_mask,  // [n_window, n_tokens, 1, 1] (or NULL)
+        const int32_t  * __restrict__ topk_idxs,    // [topk, n_tokens, batch]
+        const float    * __restrict__ attn_sink,    // [n_heads] (or NULL)
+        float          * __restrict__ out,          // [head_dim_kv, n_heads, n_tokens, batch]
         const float                    scale,
         const int                      head_dim_q,
         const int                      n_heads,
@@ -53,6 +54,7 @@ static __global__ void dsv4_sparse_attn_kernel(
         const int64_t                  kc_stride_b,
         const int64_t                  kw_stride_p,
         const int64_t                  kw_stride_b,
+        const int64_t                  wmask_stride_t,
         const int64_t                  idx_stride_t,
         const int64_t                  idx_stride_b,
         const int64_t                  o_stride_h,
@@ -106,15 +108,19 @@ static __global__ void dsv4_sparse_attn_kernel(
     float scores_max = -INFINITY;
     float sum_exp    = 0.0f;
 
-    // Lambda: process one KV row.
+    // Lambda: process one KV row, with an optional additive mask value.
     // Reads kv_row pointer, computes Q dot K, performs online softmax update.
-    auto process_kv = [&](const KVT * kv_row) {
+    auto process_kv = [&](const KVT * kv_row, float mask_add) {
+        // Early-out for fully-masked positions to avoid the dot product entirely.
+        const bool masked = (mask_add == -INFINITY);
         // Compute partial dot product: each thread accumulates ELEMS_PER_THREAD products.
         float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-            const int d = tid * ELEMS_PER_THREAD + i;
-            partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
+        if (!masked) {
+            #pragma unroll
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                const int d = tid * ELEMS_PER_THREAD + i;
+                partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
+            }
         }
 
         // Block reduction to compute the full dot product.
@@ -136,11 +142,16 @@ static __global__ void dsv4_sparse_attn_kernel(
             for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
                 v += __shfl_xor_sync(0xffffffff, v, offset, WARP_SIZE_LOCAL);
             }
-            if (lane_id == 0) score_shared = v * scale;
+            if (lane_id == 0) {
+                score_shared = masked ? -INFINITY : (v * scale + mask_add);
+            }
         }
         __syncthreads();
 
         const float s = score_shared;
+        if (s == -INFINITY) {
+            return; // fully masked: no contribution
+        }
         const float new_max = fmaxf(scores_max, s);
         const float scale_prev = isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
         const float w = expf(s - new_max);
@@ -155,10 +166,12 @@ static __global__ void dsv4_sparse_attn_kernel(
         scores_max = new_max;
     };
 
-    // Phase 1: window positions.
+    // Phase 1: window positions (with optional causal/SWA mask).
+    const float * wmask_row = window_mask ? (window_mask + (int64_t) t_idx * wmask_stride_t) : nullptr;
     for (int k = 0; k < n_window; ++k) {
         const KVT * kv_row = kv_w_base + (int64_t) k * kw_stride_p;
-        process_kv(kv_row);
+        const float m = wmask_row ? wmask_row[k] : 0.0f;
+        process_kv(kv_row, m);
     }
 
     // Phase 2: gathered topk positions in kv_comp.
@@ -166,7 +179,7 @@ static __global__ void dsv4_sparse_attn_kernel(
         const int32_t kv_pos = idx_ptr[i];
         if (kv_pos < 0 || kv_pos >= n_kv_comp) continue;
         const KVT * kv_row = kv_c_base + (int64_t) kv_pos * kc_stride_p;
-        process_kv(kv_row);
+        process_kv(kv_row, 0.0f);
     }
 
     // Phase 3: attention sink (denominator only).
@@ -200,6 +213,7 @@ static void launch_dsv4_sparse_attn(
         const float    * q,
         const KVT      * kv_comp,
         const KVT      * kv_window,
+        const float    * window_mask,
         const int32_t  * topk_idxs,
         const float    * attn_sink,
         float          * out,
@@ -219,6 +233,7 @@ static void launch_dsv4_sparse_attn(
         const int64_t    kc_stride_b,
         const int64_t    kw_stride_p,
         const int64_t    kw_stride_b,
+        const int64_t    wmask_stride_t,
         const int64_t    idx_stride_t,
         const int64_t    idx_stride_b,
         const int64_t    o_stride_h,
@@ -234,11 +249,12 @@ static void launch_dsv4_sparse_attn(
         GGML_ABORT("dsv4_sparse_attn: unsupported head_dim_kv=%d (only 512 implemented)", head_dim_kv);
     }
     dsv4_sparse_attn_kernel<KVT, 512, BLOCK_THREADS><<<grid, BLOCK_THREADS, 0, stream>>>(
-        q, kv_comp, kv_window, topk_idxs, attn_sink, out, scale,
+        q, kv_comp, kv_window, window_mask, topk_idxs, attn_sink, out, scale,
         head_dim_q, n_heads, n_tokens, n_kv_comp, n_window, topk,
         q_stride_h, q_stride_t, q_stride_b,
         kc_stride_p, kc_stride_b,
         kw_stride_p, kw_stride_b,
+        wmask_stride_t,
         idx_stride_t, idx_stride_b,
         o_stride_h, o_stride_t, o_stride_b);
 }
@@ -251,8 +267,9 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_kv_c  = dst->src[1];
     const ggml_tensor * src_kv_w  = dst->src[2]; // may be NULL
-    const ggml_tensor * src_idx   = dst->src[3];
-    const ggml_tensor * src_sink  = dst->src[4]; // may be NULL
+    const ggml_tensor * src_wmask = dst->src[3]; // may be NULL
+    const ggml_tensor * src_idx   = dst->src[4];
+    const ggml_tensor * src_sink  = dst->src[5]; // may be NULL
 
     GGML_ASSERT(src_q->type == GGML_TYPE_F32);
     GGML_ASSERT(src_idx->type == GGML_TYPE_I32);
@@ -287,6 +304,8 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
     const int64_t kw_stride_p = src_kv_w ? stride_elems(src_kv_w, 2) : 0;
     const int64_t kw_stride_b = src_kv_w ? stride_elems(src_kv_w, 3) : 0;
 
+    const int64_t wmask_stride_t = src_wmask ? stride_elems(src_wmask, 1) : 0;
+
     const int64_t idx_stride_t = stride_elems(src_idx, 1);
     const int64_t idx_stride_b = stride_elems(src_idx, 2);
 
@@ -297,6 +316,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
     cudaStream_t stream = ctx.stream();
 
     const float * q_data        = (const float *)   src_q->data;
+    const float * wmask_data    = src_wmask ? (const float *) src_wmask->data : nullptr;
     const int32_t * idx_data    = (const int32_t *) src_idx->data;
     const float * sink_data     = src_sink ? (const float *) src_sink->data : nullptr;
     float * o_data              = (float *)         dst->data;
@@ -306,11 +326,12 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const float * kc = (const float *) src_kv_c->data;
             const float * kw = src_kv_w ? (const float *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<float>(
-                q_data, kc, kw, idx_data, sink_data, o_data, scale,
+                q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
                 head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
+                wmask_stride_t,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);
@@ -319,11 +340,12 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const half * kc = (const half *) src_kv_c->data;
             const half * kw = src_kv_w ? (const half *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<half>(
-                q_data, kc, kw, idx_data, sink_data, o_data, scale,
+                q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
                 head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
+                wmask_stride_t,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);
@@ -332,11 +354,12 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const nv_bfloat16 * kc = (const nv_bfloat16 *) src_kv_c->data;
             const nv_bfloat16 * kw = src_kv_w ? (const nv_bfloat16 *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<nv_bfloat16>(
-                q_data, kc, kw, idx_data, sink_data, o_data, scale,
+                q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
                 head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
+                wmask_stride_t,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);

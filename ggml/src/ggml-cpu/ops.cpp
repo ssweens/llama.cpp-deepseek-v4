@@ -11682,8 +11682,9 @@ static void ggml_compute_forward_dsv4_sparse_attn_t(
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_kv_c  = dst->src[1];
     const ggml_tensor * src_kv_w  = dst->src[2]; // may be NULL
-    const ggml_tensor * src_idx   = dst->src[3];
-    const ggml_tensor * src_sink  = dst->src[4]; // may be NULL
+    const ggml_tensor * src_wmask = dst->src[3]; // may be NULL
+    const ggml_tensor * src_idx   = dst->src[4];
+    const ggml_tensor * src_sink  = dst->src[5]; // may be NULL
 
     GGML_ASSERT(src_q->type == GGML_TYPE_F32);
     GGML_ASSERT(src_idx->type == GGML_TYPE_I32);
@@ -11762,14 +11763,26 @@ static void ggml_compute_forward_dsv4_sparse_attn_t(
         float sum_exp    = 0.0f;
         for (int64_t d = 0; d < head_dim_kv; ++d) acc_o[d] = 0.0f;
 
-        // Phase 1: window positions (contiguous, all visible).
+        // Window-mask pointer for this token (rows are over n_window, columns over n_tokens).
+        // GGML mask layout: ne[0]=n_window (innermost), ne[1]=n_tokens.
+        const float * wmask_row = nullptr;
+        if (src_wmask) {
+            wmask_row = (const float *)((const char *)src_wmask->data + t * src_wmask->nb[1]);
+        }
+
+        // Phase 1: window positions (contiguous, optionally masked for causality).
         for (int64_t k = 0; k < n_window; ++k) {
             const KVT * kv_row = (const KVT *)(kv_w_base + k * src_kv_w->nb[2]);
             float dot = 0.0f;
             for (int64_t d = 0; d < head_dim_kv; ++d) {
                 dot += q_ptr[d] * load_kv(kv_row + d);
             }
-            const float s = dot * scale;
+            float s = dot * scale;
+            if (wmask_row) {
+                const float m = wmask_row[k];
+                if (m == -INFINITY) continue; // skip fully masked positions
+                s += m;
+            }
             const float new_max = std::max(scores_max, s);
             const float scale_prev = std::isinf(scores_max) ? 0.0f : expf(scores_max - new_max);
             const float w = expf(s - new_max);
