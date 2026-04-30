@@ -35,8 +35,8 @@
   - **Validated**: BF16 `-fa on` short prompt produces correct "6 apples" coherent reasoning (was bracket spam under the buggy dense path)
 
 ## In Progress
-- [ ] Long-prompt validation: BF16 `-fa on` with isolation prompt + n_predict=400
-- [ ] Verify IQ2_XS still works with the unified sparse path (no regression on quantized model)
+- [x] Long-prompt validation: BF16 `-fa on` with isolation prompt + n_predict=400 — perfect structured output
+- [x] Verify IQ2_XS works with the unified sparse path — short prompt coherent ("answer":"6"), long prompt coherent prompt-eval and proper section structure but decode loops on closing sentence (consistent with previously-documented IQ2-XXS thinking-mode quality ceiling at ~2bpw; not a regression)
 - [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
   - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
   - Goal: match or exceed pre-bug FA performance using MMA tensor cores
