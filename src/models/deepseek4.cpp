@@ -293,42 +293,6 @@ private:
     bool causal_attn;
 };
 
-class dsv4_prompt_comp_rank_mask_input : public llm_graph_input_i {
-public:
-    dsv4_prompt_comp_rank_mask_input(ggml_tensor * mask, int64_t n_topk, uint32_t ratio) :
-        mask(mask),
-        n_topk(n_topk),
-        ratio(ratio) {
-    }
-
-    void set_input(const llama_ubatch * ubatch) override {
-        GGML_ASSERT(mask != nullptr);
-        GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
-
-        const int64_t n_tokens = ubatch->n_tokens;
-
-        float * data = static_cast<float *>(mask->data);
-        std::fill(data, data + ggml_nelements(mask), -INFINITY);
-
-        if (ratio == 0 || !dsv4_is_contiguous_single_seq(ubatch)) {
-            return;
-        }
-
-        for (int64_t i1 = 0; i1 < n_tokens; ++i1) {
-            const int64_t valid = std::min<int64_t>(n_topk, (i1 + 1) / (int64_t) ratio);
-            const int64_t row = i1 * n_topk;
-            for (int64_t r = 0; r < valid; ++r) {
-                data[row + r] = 0.0f;
-            }
-        }
-    }
-
-private:
-    ggml_tensor * mask;
-    int64_t n_topk;
-    uint32_t ratio;
-};
-
 class dsv4_abs_comp_mask_input : public llm_graph_input_i {
 public:
     dsv4_abs_comp_mask_input(ggml_tensor * mask, int64_t n_comp, uint32_t ratio, bool use_alibi, bool causal_attn) :
@@ -394,28 +358,8 @@ static dsv4_state_layout dsv4_make_state_layout(int64_t compress_ratio, int64_t 
     return { width, rows, width * rows };
 }
 
-static ggml_tensor * dsv4_add_scalar(ggml_context * ctx, ggml_tensor * x, float val) {
-    ggml_tensor * shape = x;
-    x = ggml_cont(ctx, x);
-    x = ggml_reshape_1d(ctx, x, ggml_nelements(x));
-    x = ggml_scale_bias(ctx, x, 1.0f, val);
-    return ggml_reshape(ctx, x, shape);
-}
-
-static ggml_tensor * dsv4_mul_scalar(ggml_context * ctx, ggml_tensor * x, float val) {
-    ggml_tensor * shape = x;
-    x = ggml_cont(ctx, x);
-    x = ggml_reshape_1d(ctx, x, ggml_nelements(x));
-    x = ggml_scale(ctx, x, val);
-    return ggml_reshape(ctx, x, shape);
-}
-
 static ggml_tensor * dsv4_new_filled_2d(ggml_context * ctx, int64_t ne0, int64_t ne1, float val) {
     return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1), val);
-}
-
-static ggml_tensor * dsv4_new_filled_3d(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t ne2, float val) {
-    return ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, ne2), val);
 }
 
 static ggml_tensor * dsv4_arange_i32(ggml_context * ctx, int64_t begin, int64_t end) {
@@ -458,20 +402,6 @@ static void dsv4_store_cache_rows(ggml_context * ctx, ggml_cgraph * gf, ggml_ten
 
     ggml_tensor * rows = dsv4_arange_i32(ctx, row_start, row_start + n_rows);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, dst_cache, src, rows));
-}
-
-static ggml_tensor * dsv4_build_compressed_mask_from_topk(ggml_context * ctx, ggml_tensor * scores, ggml_tensor * topk) {
-    const int64_t n_comp = scores->ne[0];
-    const int64_t n_tokens = scores->ne[1];
-
-    ggml_tensor * scores_rows = ggml_reshape_3d(ctx, scores, 1, scores->ne[0], scores->ne[1]);
-    ggml_tensor * selected_scores = ggml_get_rows(ctx, scores_rows, topk); // [1, top_k, n_tokens]
-    ggml_tensor * valid = ggml_step(ctx, dsv4_add_scalar(ctx, selected_scores, 1.0e30f));
-    ggml_tensor * values = dsv4_mul_scalar(ctx, dsv4_add_scalar(ctx, valid, -1.0f), 1.0e9f);
-
-    ggml_tensor * mask = dsv4_new_filled_3d(ctx, 1, n_comp, n_tokens, -INFINITY);
-    mask = ggml_set_rows(ctx, mask, values, topk);
-    return ggml_reshape_2d(ctx, mask, n_comp, n_tokens);
 }
 
 static ggml_tensor * dsv4_cache_view_3d(ggml_context * ctx, ggml_tensor * cache, int64_t n_rows) {
@@ -1325,181 +1255,110 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             }
         }
 
-        const uint32_t prompt_window_size = hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : (uint32_t) n_tokens;
         bool use_prompt_sparse_attn = false;
-        if (n_tokens > 1) {
-            ggml_tensor * raw_mask = cache_mask(
-                "prompt_window:" + std::to_string(prompt_window_size) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
+        // Unified sparse-gather attention path for prompt eval.
+        // Active iff the layer has a compressor + indexer AND there is at least one
+        // compressed position to gather from. Otherwise fall through to the standard
+        // window-only `build_attn` path below.
+        const bool can_use_sparse_prompt =
+            n_tokens > 1 &&
+            c_pool != nullptr && c_pool->ne[1] > 0 &&
+            idx_pool != nullptr &&
+            model.layers[il].attn_indexer_q_b != nullptr &&
+            model.layers[il].attn_indexer_weights_proj != nullptr &&
+            hparams.n_attn_index_topk > 0;
+
+        if (can_use_sparse_prompt) {
+            const int64_t n_comp = c_pool->ne[1];
+            const int64_t idx_dim = hparams.n_embd_head_index;
+            const int64_t n_index_heads = hparams.n_head_index;
+            const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp);
+
+            // ----- compressed positions table (i*compress_ratio for i in [0, n_comp)) -----
+            ggml_tensor * comp_pos_idx = cache_mask(
+                "comp_pos_idx:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp),
                 [&]() {
-                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
+                    std::vector<int32_t> comp_rows(n_comp);
+                    for (int64_t i = 0; i < n_comp; ++i) {
+                        comp_rows[i] = int32_t(i * compress_ratio);
+                    }
+                    ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_comp);
                     ggml_set_input(t);
-                    ggml_set_name(t, "dsv4_prompt_window_mask");
-                    res->add_input(std::make_unique<dsv4_prompt_window_mask_input>(t, prompt_window_size, hparams.use_alibi, cparams.causal_attn));
+                    ggml_set_name(t, "dsv4_comp_pos_idx");
+                    res->add_input(std::make_unique<dsv4_static_i32_input>(t, comp_rows));
                     return t;
                 });
 
-            ggml_tensor * Kall = Kcur;
-            ggml_tensor * Vall = Vcur;
-            ggml_tensor * full_mask = raw_mask;
+            ggml_tensor * inp_pos_2d = ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens);
+            ggml_tensor * comp_pos = ggml_get_rows(ctx0, inp_pos_2d, comp_pos_idx);
+            comp_pos = ggml_reshape_1d(ctx0, comp_pos, n_comp);
+            cb(comp_pos, "attn_comp_pos", il);
 
-            if (c_pool != nullptr) {
-                const int64_t n_comp = c_pool->ne[1];
-                if (n_comp > 0) {
-                    ggml_tensor * comp_pos_idx = cache_mask(
-                        "comp_pos_idx:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp),
-                        [&]() {
-                            std::vector<int32_t> comp_rows(n_comp);
-                            for (int64_t i = 0; i < n_comp; ++i) {
-                                comp_rows[i] = int32_t(i * compress_ratio);
-                            }
-                            ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_comp);
-                            ggml_set_input(t);
-                            ggml_set_name(t, "dsv4_comp_pos_idx");
-                            res->add_input(std::make_unique<dsv4_static_i32_input>(t, comp_rows));
-                            return t;
-                        });
+            // ----- compressed attn pool: rope FIRST, THEN fp8 quantize, store to DSv4 attn_k cache -----
+            ggml_tensor * c_attn = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(c_pool)), n_embd_head, 1, n_comp);
+            c_attn = apply_partial_rope_with_pos(c_attn, comp_pos, rope_cfg, /*inverse=*/false);
+            c_attn = apply_fp8_qat_nope_2d(c_attn, "attn_compressor_pool_qat", il);
+            cb(c_attn, "attn_compressor_pool_roped", il);
+            store_attn_cache_rows(c_attn, 0, n_comp);
 
-                    ggml_tensor * inp_pos_2d = ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens);
-                    ggml_tensor * comp_pos = ggml_get_rows(ctx0, inp_pos_2d, comp_pos_idx);
-                    comp_pos = ggml_reshape_1d(ctx0, comp_pos, n_comp);
-                    cb(comp_pos, "attn_comp_pos", il);
+            // ----- indexer compressor pool: rope only, no fp8 quantize, store to DSv4 index_k cache -----
+            ggml_tensor * idx_comp = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_pool)), idx_dim, 1, n_comp);
+            idx_comp = apply_partial_rope_with_pos(idx_comp, comp_pos, rope_cfg, /*inverse=*/false);
+            idx_comp = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idx_comp), idx_dim, n_comp);
+            cb(idx_comp, "attn_indexer_pool_roped", il);
+            store_index_cache_rows(idx_comp, 0, n_comp);
 
-                    // Compressed attn pool: rope FIRST (only rotates rope-dim), THEN fp8 quantize (only nope-dim).
-                    // Order matters — same as the main KV path. Matches antirez/dsv4_build_compressor_prefill.
-                    ggml_tensor * c_attn = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(c_pool)), n_embd_head, 1, n_comp);
-                    c_attn = apply_partial_rope_with_pos(c_attn, comp_pos, rope_cfg, /*inverse=*/false);
-                    c_attn = apply_fp8_qat_nope_2d(c_attn, "attn_compressor_pool_qat", il);
-                    cb(c_attn, "attn_compressor_pool_roped", il);
-                    store_attn_cache_rows(c_attn, 0, n_comp);
+            // ----- indexer scores: Q (idx_q_b @ residual + rope) dot K (idx_comp), summed over heads -----
+            ggml_tensor * idx_kv_3d = ggml_reshape_3d(ctx0, idx_comp, idx_dim, 1, n_comp);
 
-                    if (!(Kcur->ne[0] == c_attn->ne[0] && Kcur->ne[1] == c_attn->ne[1] && Kcur->ne[3] == c_attn->ne[3])) {
-                        GGML_ABORT("deepseek4 Kall concat mismatch at layer %d: Kcur=[%lld,%lld,%lld,%lld] c_attn=[%lld,%lld,%lld,%lld]",
-                                il,
-                                (long long) Kcur->ne[0], (long long) Kcur->ne[1], (long long) Kcur->ne[2], (long long) Kcur->ne[3],
-                                (long long) c_attn->ne[0], (long long) c_attn->ne[1], (long long) c_attn->ne[2], (long long) c_attn->ne[3]);
-                    }
-                    Kall = ggml_concat(ctx0, Kcur, c_attn, 2);
-                    Vall = Kall;
-                    cb(Kall, "attn_k_all", il);
+            ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
+            ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_inp_fp8_qat", il);
+            ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.q_b");
+            idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
+            idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
+            idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
+            cb(idx_q, "attn_indexer_q_roped", il);
 
-                    ggml_tensor * comp_mask = nullptr;
-                    if (idx_pool != nullptr && hparams.n_attn_index_topk > 0) {
-                        const int64_t idx_dim = hparams.n_embd_head_index;
-                        const int64_t n_index_heads = hparams.n_head_index;
+            ggml_tensor * k_perm = ggml_permute(ctx0, idx_kv_3d, 0, 2, 1, 3);  // [idx_dim, n_comp, 1]
+            ggml_tensor * q_perm = ggml_permute(ctx0, idx_q,     0, 2, 1, 3);  // [idx_dim, n_tokens, n_index_heads]
+            ggml_tensor * idx_scores = ggml_mul_mat(ctx0, k_perm, q_perm);     // [n_comp, n_tokens, n_index_heads]
+            idx_scores = ggml_relu(ctx0, idx_scores);
 
-                        // Indexer compressor pool: rope only, NO fp8 quantize (matches antirez — indexer cache is BF16).
-                        ggml_tensor * idx_comp = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_pool)), idx_dim, 1, n_comp);
-                        idx_comp = apply_partial_rope_with_pos(idx_comp, comp_pos, rope_cfg, /*inverse=*/false);
-                        idx_comp = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idx_comp), idx_dim, n_comp);
-                        cb(idx_comp, "attn_indexer_pool_roped", il);
-                        store_index_cache_rows(idx_comp, 0, n_comp);
+            ggml_tensor * idx_weights_inp = ggml_cast(ctx0, attn_inp, GGML_TYPE_BF16);
+            ggml_tensor * idx_weights = mul_mat_checked(model.layers[il].attn_indexer_weights_proj, idx_weights_inp, "indexer.weights_proj");
+            idx_weights = as_f32(idx_weights);
+            const float idx_scale_f = 1.0f / sqrtf((float)idx_dim * (float)n_index_heads);
+            idx_weights = ggml_scale(ctx0, idx_weights, idx_scale_f);
+            idx_weights = ggml_reshape_3d(ctx0, idx_weights, 1, n_index_heads, n_tokens);
+            idx_weights = ggml_permute(ctx0, idx_weights, 0, 2, 1, 3);
+            cb(idx_weights, "attn_indexer_weights", il);
 
-                        // Indexer scores prefill: matches antirez/dsv4_build_indexer_scores_prefill exactly.
-                        // Single matmul over all heads via permutation, no per-head loop.
-                        // Reshape index_kv: [idx_dim, n_comp] from store -> [idx_dim, 1, n_comp]
-                        ggml_tensor * idx_kv_3d = ggml_reshape_3d(ctx0, idx_comp, idx_dim, 1, n_comp);
+            idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
+            idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
+            idx_scores = ggml_sum_rows(ctx0, idx_scores);
+            idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp, n_tokens);
+            cb(idx_scores, "attn_indexer_scores", il);
 
-                        // Q: matmul wq_b @ q_residual; reshape to [idx_dim, n_index_heads, n_tokens]; partial rope
-                        ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
-                        ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_inp_fp8_qat", il);
-                        ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.q_b");
-                        idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
-                        idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
-                        idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
-                        cb(idx_q, "attn_indexer_q_roped", il);
+            // Add a per-(comp,token) -inf mask that hides positions ahead of the current token.
+            // This is causal-only (no interspersed -inf), so it is safe even before argsort.
+            ggml_tensor * idx_valid_mask = cache_mask(
+                "prompt_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp) + ":" + std::to_string((int)cparams.causal_attn),
+                [&]() {
+                    ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_prompt_comp_valid_mask");
+                    res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp, compress_ratio, false, cparams.causal_attn));
+                    return t;
+                });
+            idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
+            idx_prior = idx_scores;
+            cb(idx_prior, "attn_indexer_prior", il);
 
-                        // Permute for single matmul:
-                        //   k = permute(idx_kv_3d, 0, 2, 1, 3) -> [idx_dim, n_comp, 1]
-                        //   q = permute(idx_q,    0, 2, 1, 3) -> [idx_dim, n_tokens, n_index_heads]
-                        ggml_tensor * k_perm = ggml_permute(ctx0, idx_kv_3d, 0, 2, 1, 3);
-                        ggml_tensor * q_perm = ggml_permute(ctx0, idx_q,     0, 2, 1, 3);
+            idx_sel = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
+            cb(idx_sel, "attn_indexer_topk", il);
 
-                        // score = k^T @ q -> [n_comp, n_tokens, n_index_heads]
-                        ggml_tensor * idx_scores = ggml_mul_mat(ctx0, k_perm, q_perm);
-                        idx_scores = ggml_relu(ctx0, idx_scores);
-
-                        // weights = wproj @ x -> [n_index_heads, n_tokens]
-                        ggml_tensor * idx_weights_inp = ggml_cast(ctx0, attn_inp, GGML_TYPE_BF16);
-                        ggml_tensor * idx_weights = mul_mat_checked(model.layers[il].attn_indexer_weights_proj, idx_weights_inp, "indexer.weights_proj");
-                        idx_weights = as_f32(idx_weights);
-                        const float idx_scale = 1.0f / sqrtf((float)idx_dim * (float)n_index_heads);
-                        idx_weights = ggml_scale(ctx0, idx_weights, idx_scale);
-                        // [n_index_heads, n_tokens] -> reshape [1, n_index_heads, n_tokens] -> permute [1, n_tokens, n_index_heads]
-                        idx_weights = ggml_reshape_3d(ctx0, idx_weights, 1, n_index_heads, n_tokens);
-                        idx_weights = ggml_permute(ctx0, idx_weights, 0, 2, 1, 3);
-                        cb(idx_weights, "attn_indexer_weights", il);
-
-                        // score *= weights (broadcasts over n_comp dim 0)
-                        idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
-                        // permute (1,2,0,3): [n_comp, n_tokens, n_heads] -> [n_heads, n_comp, n_tokens]
-                        idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
-                        // sum over n_heads (dim 0) -> [1, n_comp, n_tokens]
-                        idx_scores = ggml_sum_rows(ctx0, idx_scores);
-                        idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp, n_tokens);
-                        cb(idx_scores, "attn_indexer_scores", il);
-
-                        ggml_tensor * idx_valid_mask = cache_mask(
-                            "prompt_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp) + ":" + std::to_string((int)cparams.causal_attn),
-                            [&]() {
-                                ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp, n_tokens);
-                                ggml_set_input(t);
-                                ggml_set_name(t, "dsv4_prompt_comp_valid_mask");
-                                res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp, compress_ratio, false, cparams.causal_attn));
-                                return t;
-                            });
-
-                        idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
-                        idx_prior = idx_scores;
-                        cb(idx_prior, "attn_indexer_prior", il);
-
-                        const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp);
-                        if (n_idx_topk > 0) {
-                            idx_sel = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
-                            cb(idx_sel, "attn_indexer_topk", il);
-
-                            ggml_tensor * idx_rank_mask = cache_mask(
-                                "prompt_idx_rank:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_idx_topk),
-                                [&]() {
-                                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_idx_topk, n_tokens, 1);
-                                    ggml_set_input(t);
-                                    ggml_set_name(t, "dsv4_prompt_comp_rank_mask");
-                                    res->add_input(std::make_unique<dsv4_prompt_comp_rank_mask_input>(t, n_idx_topk, compress_ratio));
-                                    return t;
-                                });
-
-                            ggml_tensor * idx_sel_3d = ggml_reshape_3d(ctx0, ggml_cont(ctx0, idx_sel), n_idx_topk, n_tokens, 1);
-                            ggml_tensor * comp_mask_rows = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_comp, n_tokens, 1);
-                            comp_mask_rows = ggml_fill(ctx0, comp_mask_rows, -INFINITY);
-                            comp_mask_rows = ggml_set_rows(ctx0, comp_mask_rows, idx_rank_mask, idx_sel_3d);
-                            comp_mask = ggml_reshape_4d(ctx0, comp_mask_rows, n_comp, n_tokens, 1, 1);
-                            cb(comp_mask, "attn_comp_mask_indexed", il);
-                        }
-                    }
-
-                    if (comp_mask == nullptr) {
-                        comp_mask = cache_mask(
-                            "prompt_comp:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
-                            [&]() {
-                                ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp, n_tokens, 1, 1);
-                                ggml_set_input(t);
-                                ggml_set_name(t, "dsv4_prompt_comp_mask");
-                                res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp, compress_ratio, hparams.use_alibi, cparams.causal_attn));
-                                return t;
-                            });
-                    }
-
-                    if (!(raw_mask->ne[1] == comp_mask->ne[1] && raw_mask->ne[2] == comp_mask->ne[2] && raw_mask->ne[3] == comp_mask->ne[3])) {
-                        GGML_ABORT("deepseek4 prompt mask concat mismatch at layer %d: raw_mask=[%lld,%lld,%lld,%lld] comp_mask=[%lld,%lld,%lld,%lld]",
-                                il,
-                                (long long) raw_mask->ne[0], (long long) raw_mask->ne[1], (long long) raw_mask->ne[2], (long long) raw_mask->ne[3],
-                                (long long) comp_mask->ne[0], (long long) comp_mask->ne[1], (long long) comp_mask->ne[2], (long long) comp_mask->ne[3]);
-                    }
-                    full_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
-                    cb(full_mask, "attn_prompt_sparse_mask", il);
-                }
-            }
-
-            // keep the standard KV attention mask input allocated even though this prompt-time path uses a custom sparse mask
+            // ----- ensure the standard SWA mctx writes for Kcur/Vcur happen so future
+            //       decode steps can read this prompt's window from the cache. -----
             if (has_hybrid_iswa) {
                 ggml_build_forward_expand(gf, inp_attn_iswa->self_kq_mask_swa);
                 const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
@@ -1511,22 +1370,35 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_v(ctx0, Vcur, inp_attn_kv->get_v_idxs(), il));
             }
 
-            // Pad the combined KV-length to a multiple of 8 so the F16 mask row stride is
-            // 16-byte aligned -- required by the CUDA FA kernel's cp_async mask loads.
-            // ggml_pad zero-fills; the zero-padded K/V positions produce QK dot-products of
-            // zero, and the corresponding zero-padded mask positions (0.0 = "attend") add a
-            // tiny eps to the softmax denominator.  For actual inference n_kv >= 128 (always
-            // 8-aligned), so this only fires during scheduler reservation with small test
-            // shapes where numerical accuracy is irrelevant.
-            // Note: skip FA KV-length padding for prompt sparse attention.
-            // If KV-length is not 8-aligned, FA will fall back to non-FA path.
-            // The padding was causing NaN from zero-filled mask positions being
-            // treated as "attend" by the softmax.
-            full_mask = ggml_cast(ctx0, full_mask, GGML_TYPE_F16);
-            cur = build_attn_mha(Qcur, Kall, Vall, nullptr, full_mask, model.layers[il].attn_sinks, nullptr, kq_scale, il);
+            // ----- unified sparse-gather attention -----
+            ggml_tensor * sink = model.layers[il].attn_sinks;
+            if (sink && sink->type != GGML_TYPE_F32) {
+                sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
+            }
+            cur = ggml_dsv4_sparse_attn(
+                ctx0,
+                Qcur,
+                c_attn,                 // [head_dim, 1, n_comp] (just-built compressed pool)
+                Kcur,                   // [head_dim, 1, n_tokens] (window = current prompt tokens)
+                idx_sel,                // [n_idx_topk, n_tokens]
+                sink,                   // [n_heads]
+                kq_scale);
+            cb(cur, "attn_sparse_prompt", il);
             use_prompt_sparse_attn = true;
         }
 
+        // -----------------------------------------------------------------------------
+        // Decode-time compressor + indexer cache updates.
+        //
+        // These run ALWAYS when the layer has a compressor (regardless of whether the
+        // sparse-attention path is used this step) so that future decode steps can read
+        // newly-compressed positions from the DSv4 attn_k / index_k caches.
+        //
+        // We then conditionally route attention through ggml_dsv4_sparse_attn when there
+        // is at least one compressed position to gather from. Otherwise we leave
+        // use_prompt_sparse_attn=false and let the standard build_attn() path handle the
+        // window-only attention (no -inf mask, no FA bug).
+        // -----------------------------------------------------------------------------
         if (!use_prompt_sparse_attn && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             // For multi-seq decode, each token belongs to a different sequence.
             // We use seq_id from token 0; for n_seqs > 1 with equal_seqs,
@@ -1601,22 +1473,30 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
             }
 
-            const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
-            ggml_tensor * k_store = mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il);
-            ggml_build_forward_expand(gf, k_store);
+            // Sparse-attention path eligibility for decode:
+            //   - compressor and indexer must both be present
+            //   - there must be at least one compressed position to gather from
+            const bool can_use_sparse_decode =
+                n_comp_visible > 0 &&
+                compress_ratio == 4 &&
+                model.layers[il].attn_indexer_q_b != nullptr &&
+                model.layers[il].attn_indexer_weights_proj != nullptr &&
+                hparams.n_attn_index_topk > 0;
 
-            ggml_tensor * k_raw_ref = mctx_swa->get_k(ctx0, il);
-            ggml_tensor * k_raw = ggml_view_4d(ctx0, k_store,
-                    k_raw_ref->ne[0], k_raw_ref->ne[1], k_raw_ref->ne[2], k_raw_ref->ne[3],
-                    k_raw_ref->nb[1], k_raw_ref->nb[2], k_raw_ref->nb[3], k_raw_ref->view_offs);
-            k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head, 1, k_raw->ne[2]);
-            k_raw = as_f32(k_raw);
+            if (can_use_sparse_decode) {
+                // Manual SWA window write (mirrors what build_attn would do internally).
+                const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
+                ggml_tensor * k_store = mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il);
+                ggml_build_forward_expand(gf, k_store);
 
-            ggml_tensor * Kall = k_raw;
-            ggml_tensor * Vall = k_raw;
-            ggml_tensor * attn_mask = inp_attn_iswa->self_kq_mask_swa;
+                ggml_tensor * k_raw_ref = mctx_swa->get_k(ctx0, il);
+                ggml_tensor * k_raw = ggml_view_4d(ctx0, k_store,
+                        k_raw_ref->ne[0], k_raw_ref->ne[1], k_raw_ref->ne[2], k_raw_ref->ne[3],
+                        k_raw_ref->nb[1], k_raw_ref->nb[2], k_raw_ref->nb[3], k_raw_ref->view_offs);
+                k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head, 1, k_raw->ne[2]);
+                k_raw = as_f32(k_raw);
 
-            if (n_comp_visible > 0) {
+                // Build kv_comp_cache: concat any cached (older) compressed rows with the just-computed new ones.
                 ggml_tensor * kv_comp_cache = nullptr;
                 if (kv_comp_new_for_attn != nullptr && n_comp_new > 0) {
                     ggml_tensor * kv_new = ggml_reshape_3d(ctx0, ggml_cont(ctx0, kv_comp_new_for_attn), n_embd_head, 1, n_comp_new);
@@ -1630,111 +1510,75 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
                 }
                 kv_comp_cache = as_f32(kv_comp_cache);
-                Kall = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
-                Vall = Kall;
 
-                ggml_tensor * comp_mask = nullptr;
+                // ----- indexer Q-side: same prefill flow as prompt (handles n_tokens >= 1). -----
+                const int64_t idx_dim = hparams.n_embd_head_index;
+                const int64_t n_index_heads = hparams.n_head_index;
+                const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp_visible);
 
-                if (compress_ratio == 4 &&
-                    model.layers[il].attn_indexer_q_b != nullptr &&
-                    model.layers[il].attn_indexer_weights_proj != nullptr) {
-                    const int64_t idx_dim = hparams.n_embd_head_index;
-                    const int64_t n_index_heads = hparams.n_head_index;
-                    const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp_visible);
+                ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
+                index_cache = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(index_cache)), idx_dim, 1, n_comp_visible);
 
-                    if (n_tokens == 1 && n_idx_topk >= (int32_t) n_comp_visible) {
-                        comp_mask = cache_mask(
-                            "decode_comp_all_visible:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
-                            [&]() {
-                                ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
-                                ggml_set_input(t);
-                                ggml_set_name(t, "dsv4_decode_comp_mask_all_visible");
-                                res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, false, cparams.causal_attn));
-                                return t;
-                            });
-                    } else if (n_idx_topk > 0) {
-                        // Indexer scores decode: matches antirez/dsv4_build_indexer_scores_prefill semantics.
-                        // (We use the prefill flow because n_tokens may be > 1 in chunked decode.)
-                        ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
-                        index_cache = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(index_cache)), idx_dim, 1, n_comp_visible);
+                ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
+                ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_decode_inp_fp8_qat", il);
+                ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.decode.q_b");
+                idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
+                idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
+                idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
 
-                        ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
-                        ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_decode_inp_fp8_qat", il);
-                        ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.decode.q_b");
-                        idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
-                        idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
-                        idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
+                ggml_tensor * k_perm = ggml_permute(ctx0, index_cache, 0, 2, 1, 3);
+                ggml_tensor * q_perm = ggml_permute(ctx0, idx_q,       0, 2, 1, 3);
+                ggml_tensor * idx_scores = ggml_mul_mat(ctx0, k_perm, q_perm);
+                idx_scores = ggml_relu(ctx0, idx_scores);
 
-                        // Permute and matmul: k = permute(index_cache_3d, 0,2,1,3) -> [idx_dim, n_comp_visible, 1]
-                        //                     q = permute(idx_q, 0,2,1,3)         -> [idx_dim, n_tokens, n_index_heads]
-                        ggml_tensor * k_perm = ggml_permute(ctx0, index_cache, 0, 2, 1, 3);
-                        ggml_tensor * q_perm = ggml_permute(ctx0, idx_q,       0, 2, 1, 3);
-                        ggml_tensor * idx_scores = ggml_mul_mat(ctx0, k_perm, q_perm); // [n_comp_visible, n_tokens, n_index_heads]
-                        idx_scores = ggml_relu(ctx0, idx_scores);
+                ggml_tensor * idx_weights_inp = ggml_cast(ctx0, attn_inp, GGML_TYPE_BF16);
+                ggml_tensor * idx_weights = mul_mat_checked(model.layers[il].attn_indexer_weights_proj, idx_weights_inp, "indexer.decode.weights_proj");
+                idx_weights = as_f32(idx_weights);
+                const float idx_scale_f = 1.0f / sqrtf((float)idx_dim * (float)n_index_heads);
+                idx_weights = ggml_scale(ctx0, idx_weights, idx_scale_f);
+                idx_weights = ggml_reshape_3d(ctx0, idx_weights, 1, n_index_heads, n_tokens);
+                idx_weights = ggml_permute(ctx0, idx_weights, 0, 2, 1, 3);
 
-                        ggml_tensor * idx_weights_inp = ggml_cast(ctx0, attn_inp, GGML_TYPE_BF16);
-                        ggml_tensor * idx_weights = mul_mat_checked(model.layers[il].attn_indexer_weights_proj, idx_weights_inp, "indexer.decode.weights_proj");
-                        idx_weights = as_f32(idx_weights);
-                        const float idx_scale = 1.0f / sqrtf((float)idx_dim * (float)n_index_heads);
-                        idx_weights = ggml_scale(ctx0, idx_weights, idx_scale);
-                        idx_weights = ggml_reshape_3d(ctx0, idx_weights, 1, n_index_heads, n_tokens);
-                        idx_weights = ggml_permute(ctx0, idx_weights, 0, 2, 1, 3);
+                idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
+                idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
+                idx_scores = ggml_sum_rows(ctx0, idx_scores);
+                idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp_visible, n_tokens);
 
-                        idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
-                        idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3)); // [n_heads, n_comp, n_tokens]
-                        idx_scores = ggml_sum_rows(ctx0, idx_scores);
-                        idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp_visible, n_tokens);
+                // Causal-only valid mask (no interspersed -inf): hides positions ahead of
+                // the current token.
+                ggml_tensor * idx_valid_mask = cache_mask(
+                    "decode_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
+                    [&]() {
+                        ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens);
+                        ggml_set_input(t);
+                        ggml_set_name(t, "dsv4_decode_comp_valid_mask");
+                        res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, false, cparams.causal_attn));
+                        return t;
+                    });
+                idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
 
-                        ggml_tensor * idx_valid_mask = cache_mask(
-                            "decode_idx_valid:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
-                            [&]() {
-                                ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens);
-                                ggml_set_input(t);
-                                ggml_set_name(t, "dsv4_decode_comp_valid_mask");
-                                res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, false, cparams.causal_attn));
-                                return t;
-                            });
-                        idx_scores = ggml_add(ctx0, idx_scores, idx_valid_mask);
+                ggml_tensor * idx_topk = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
+                cb(idx_topk, "attn_indexer_topk", il);
 
-                        ggml_tensor * idx_topk = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
-                        comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, idx_scores, idx_topk);
-                        comp_mask = ggml_reshape_4d(ctx0, comp_mask, n_comp_visible, n_tokens, 1, 1);
-                    }
+                // ----- unified sparse-gather attention -----
+                ggml_tensor * sink = model.layers[il].attn_sinks;
+                if (sink && sink->type != GGML_TYPE_F32) {
+                    sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
                 }
-
-                if (comp_mask == nullptr) {
-                    comp_mask = cache_mask(
-                        "decode_comp:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)hparams.use_alibi) + ":" + std::to_string((int)cparams.causal_attn),
-                        [&]() {
-                            ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
-                            ggml_set_input(t);
-                            ggml_set_name(t, "dsv4_decode_comp_mask");
-                            res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, hparams.use_alibi, cparams.causal_attn));
-                            return t;
-                        });
-                }
-
-                if (comp_mask->type != attn_mask->type) {
-                    comp_mask = ggml_cast(ctx0, comp_mask, attn_mask->type);
-                }
-
-                attn_mask = ggml_concat(ctx0, attn_mask, comp_mask, 0);
+                cur = ggml_dsv4_sparse_attn(
+                    ctx0,
+                    Qcur,
+                    kv_comp_cache,    // [head_dim, 1, n_comp_visible]
+                    k_raw,            // [head_dim, 1, n_window]
+                    idx_topk,         // [n_idx_topk, n_tokens]
+                    sink,             // [n_heads]
+                    kq_scale);
+                cb(cur, "attn_sparse_decode", il);
+                use_prompt_sparse_attn = true;
             }
-
-            // Pad KV-length to a multiple of 8 for FA mask alignment (see prompt-path comment).
-            // Note: skip FA KV-length padding for decode sparse attention.
-            // If KV-length is not 8-aligned, FA will fall back to non-FA path.
-            // (see prompt-path comment for rationale)
-
-            if (cparams.flash_attn && attn_mask->type != GGML_TYPE_F16) {
-                attn_mask = ggml_cast(ctx0, attn_mask, GGML_TYPE_F16);
-            }
-            if (!cparams.flash_attn && attn_mask->type != GGML_TYPE_F32) {
-                attn_mask = ggml_cast(ctx0, attn_mask, GGML_TYPE_F32);
-            }
-
-            cur = build_attn_mha(Qcur, Kall, Vall, nullptr, attn_mask, model.layers[il].attn_sinks, nullptr, kq_scale, il);
-            use_prompt_sparse_attn = true;
+            // else: fall through to standard build_attn below (window-only attention).
+            // The dsv4 attn_k / index_k cache writes above still happened so that future
+            // decode steps have the data they need.
         }
 
         if (!use_prompt_sparse_attn) {
