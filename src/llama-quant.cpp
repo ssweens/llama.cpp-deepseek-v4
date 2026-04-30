@@ -663,6 +663,33 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         ++qs.i_ffn_up;
     }
 
+    // DeepSeek-V4: the indexer + compressor weights steer sparse-attention top-k
+    // selection. Quantizing them aggressively (IQ2_*, IQ1_*) introduces enough
+    // noise that argsort-top-k picks wrong positions and the model collapses
+    // into repetition on sustained generation. These tensors are small relative
+    // to the MoE experts so the size cost of keeping them at higher precision is
+    // negligible. MXFP4 matches the natural precision of the FP4 QAT-trained
+    // weights and is the right default. The user can still override via
+    // --tensor-type if a different target is desired.
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        const bool is_indexer    = name.find("indexer") != std::string::npos;
+        const bool is_compressor = name.find("compressor") != std::string::npos;
+        if (is_indexer || is_compressor) {
+            // Only apply when the recipe selected an aggressive (sub-4 bpw) target.
+            // Above ~4 bpw the recipe is already preserving these tensors well.
+            const bool aggressive =
+                new_type == GGML_TYPE_IQ1_S    || new_type == GGML_TYPE_IQ1_M   ||
+                new_type == GGML_TYPE_IQ2_XXS  || new_type == GGML_TYPE_IQ2_XS  ||
+                new_type == GGML_TYPE_IQ2_S    ||
+                new_type == GGML_TYPE_IQ3_XXS  || new_type == GGML_TYPE_IQ3_S   ||
+                new_type == GGML_TYPE_Q2_K     ||
+                new_type == GGML_TYPE_TQ1_0    || new_type == GGML_TYPE_TQ2_0;
+            if (aggressive) {
+                new_type = GGML_TYPE_MXFP4;
+            }
+        }
+    }
+
     return new_type;
 }
 
