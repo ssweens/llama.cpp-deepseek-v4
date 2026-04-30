@@ -32,7 +32,8 @@ The current code path in `src/models/deepseek4.cpp` (lines ~1463-1530 for prompt
 
 **Inputs:**
 - `Q` — query tensor `[head_dim, n_heads, n_tokens, batch]` (F32, same as current FA input)
-- `KV_cache` — compressed KV cache `[head_dim, 1, n_kv_total, batch]` (F16/BF16, MLA-style where K=V)
+- `KV_comp` — compressed KV cache `[head_dim, n_kv_comp, 1, batch]` (F16/BF16, MLA-style where K=V)
+- `KV_window` — recent raw KV cache `[head_dim, n_window, 1, batch]` (F16/BF16)
 - `topk_idxs` — indices of selected positions `[topk, n_tokens, batch]` (I32)
 - `attn_sink` — per-head learned attention sink `[n_heads]` (F32)
 
@@ -55,22 +56,24 @@ The current code path in `src/models/deepseek4.cpp` (lines ~1463-1530 for prompt
 
 ### 1.4 Relationship to Window Attention
 
-The sparse gather kernel replaces ONLY the compressed-cache attention path. Window/SWA attention (the recent raw tokens) continues to use the existing FA infrastructure via `build_attn`. The final output is a combination of:
-1. Window attention output (existing FA)
-2. Compressed attention output (new sparse kernel)
+The sparse gather kernel replaces ONLY the compressed-cache attention path. Window/SWA attention (the recent raw tokens) continues to use the existing FA infrastructure via `build_attn` in the current codebase.
 
-These two results must be combined. Options:
-- **Option A (Recommended):** The sparse kernel handles only compressed positions. At the graph level, we run window FA and sparse compressed FA separately, then merge with proper softmax rescaling.
-- **Option B:** The sparse kernel handles both — window indices + compressed top-k indices are concatenated into a single index tensor.
+However, the final output must combine both the window attention (contiguous recent tokens) and compressed attention (top-k gathered tokens) with a single unified softmax.
 
-We recommend **Option A** for Phase 1 (simpler, no changes to window FA), with Option B as a potential Phase 2 optimization.
+**Option A: Separate Kernels + Merge (Graph Level)**
+Run window FA and sparse FA separately, then merge.
+*Challenge:* The existing `ggml_flash_attn_ext` does not expose the required `(max, rowsum)` statistics tensor to the graph. We would have to modify the FA op definition to return it, which touches many files across multiple backends (Metal, Vulkan, Apple, etc.).
 
-**Important Note for Option A:** Merging two separate attention outputs requires tracking the softmax normalization statistics (max value and sum of exponentials) from each. The existing FA infrastructure already supports this via `dst_meta` (the `float2` containing max and rowsum per query). The sparse kernel must similarly output these statistics so the merge kernel can properly rescale and combine:
+**Option B: Unified Gather-Window Kernel (Recommended for Implementation)**
+Instead of just gathering `topk_idxs`, the new kernel `GGML_OP_DSV4_SPARSE_ATTN` handles *both* the contiguous window and the sparse indices in a single pass.
+*How it works:*
+1. Pass the current sequence length and window size via `op_params`.
+2. Kernel phase 1: Loop over contiguous KV positions `[max(0, seq_len - window_size), seq_len)`.
+3. Kernel phase 2: Loop over `topk_idxs` (ignoring any that overlap with the window to avoid double-counting).
+4. Kernel phase 3: Apply `attn_sink`.
+5. Normalize and write output.
 
-```
-merged_output = (scale_window * window_output + scale_comp * comp_output) / (scale_window * window_rowsum + scale_comp * comp_rowsum)
-where scale_x = exp(max_x - max_combined)
-```
+**Why Option B is better:** It completely bypasses `ggml_flash_attn_ext` for DSv4, isolating all DSv4-specific attention logic (like MLA scaling and sinks) inside our new kernel. It requires no changes to generic `ggml` FA APIs.
 
 ---
 
@@ -379,6 +382,40 @@ if (amd_mfma_available(cc)) {
 }
 ```
 
+### 3.4 Mapping GGML Tensors to Kernel Strides
+
+When writing the CUDA kernel, it is critical to understand how `ggml` maps multi-dimensional indices to memory offsets. GGML tensors are row-major in C conceptually, but column-major physically (`ne[0]` is contiguous).
+
+**Input Q (`[head_dim, n_heads, n_tokens, batch]`)**
+- `ne0 = head_dim` (innermost, contiguous)
+- `ne1 = n_heads`
+- `ne2 = n_tokens`
+- `ne3 = batch`
+*Strides (in bytes):* `nb0`, `nb1`, `nb2`, `nb3`.
+*Offset for token `t`, head `h`, batch `b`:*
+`(b * nb3 + t * nb2 + h * nb1) / sizeof(half)`
+
+**Input KV Cache (`[head_dim, 1, n_kv_total, batch]`)**
+DSv4 uses MLA where K and V are identical (represented as a single compressed latent vector).
+- `ne0 = head_dim`
+- `ne1 = 1` (no heads dimension, since MLA shares KV across all heads)
+- `ne2 = n_kv_total`
+- `ne3 = batch`
+*Offset for KV position `k`, batch `b`:*
+`(b * nb3 + k * nb2) / sizeof(half)`
+
+**Input topk_idxs (`[topk, n_tokens, batch]`)**
+- `ne0 = topk`
+- `ne1 = n_tokens`
+- `ne2 = batch`
+*Offset for index `i`, token `t`, batch `b`:*
+`(b * nb2 + t * nb1 + i * nb0) / sizeof(int32)`
+
+**Attention Sink (`[n_heads]`)**
+- 1D contiguous array of floats.
+- Added *once* per query position after all KV processing.
+- The HF formula `sum_exp += T.exp(attn_sink - max_score)` assumes `attn_sink` is pre-scaled or does not need the attention scale factor (which only applies to Q·K).
+
 ---
 
 ## 4. Integration Points
@@ -387,25 +424,27 @@ if (amd_mfma_available(cc)) {
 
 **File: `ggml/include/ggml.h`**
 
-Add after the existing DSv4 ops (after line ~2593):
+Add after the existing DSv4 ops:
 
 ```c
 GGML_OP_DSV4_SPARSE_ATTN,
 ```
 
-Add function declaration (after line ~2593):
+Add function declaration:
 
 ```c
-// Sparse gather-attention for DeepSeek-V4 compressed cache.
-// Q:         [head_dim, n_heads, n_tokens]   (F32)
-// kv_cache:  [head_dim, n_kv]                (F16)
-// topk_idxs: [topk, n_tokens]               (I32)
-// attn_sink: [n_heads]                       (F32)
-// Returns:   [head_dim, n_heads, n_tokens]   (F32)
+// Unified Gather-Window Attention for DeepSeek-V4.
+// Q:          [head_dim, n_heads, n_tokens] (F32)
+// kv_comp:    [head_dim, n_kv_comp]         (F16)
+// kv_window:  [head_dim, n_window]          (F16)
+// topk_idxs:  [topk, n_tokens]              (I32)
+// attn_sink:  [n_heads]                     (F32)
+// Returns:    [head_dim, n_heads, n_tokens] (F32)
 GGML_API struct ggml_tensor * ggml_dsv4_sparse_attn(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
-        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * kv_comp,
+        struct ggml_tensor  * kv_window,
         struct ggml_tensor  * topk_idxs,
         struct ggml_tensor  * attn_sink,
         float                 scale);
@@ -419,7 +458,8 @@ Add op name string, implement `ggml_dsv4_sparse_attn()`:
 struct ggml_tensor * ggml_dsv4_sparse_attn(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
-        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * kv_comp,
+        struct ggml_tensor  * kv_window,
         struct ggml_tensor  * topk_idxs,
         struct ggml_tensor  * attn_sink,
         float                 scale) {
@@ -427,15 +467,15 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(topk_idxs->type == GGML_TYPE_I32);
 
-    // Output shape matches Q: [head_dim, n_heads, n_tokens]
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
         q->ne[0], q->ne[1], q->ne[2]);
 
     result->op = GGML_OP_DSV4_SPARSE_ATTN;
     result->src[0] = q;
-    result->src[1] = kv_cache;
-    result->src[2] = topk_idxs;
-    result->src[3] = attn_sink;
+    result->src[1] = kv_comp;
+    result->src[2] = kv_window;
+    result->src[3] = topk_idxs;
+    result->src[4] = attn_sink;
 
     // Store scale in op_params
     memcpy(result->op_params, &scale, sizeof(float));
@@ -489,29 +529,28 @@ full_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
 cur = build_attn_mha(Qcur, Kall, Vall, nullptr, full_mask, sinks, nullptr, kq_scale, il);
 ```
 
-**Proposed (sparse path):**
+**Proposed (Option B Unified Kernel Path):**
 
 ```cpp
-// New: pass topk indices directly to sparse kernel
+// New: pass topk indices directly to unified sparse kernel
 ggml_tensor * idx_topk = ggml_argsort_top_k(ctx0, idx_scores, n_idx_topk);
 
-// Run window attention separately (existing FA on raw K/V only)
-ggml_tensor * window_out = build_attn_mha(Qcur, k_raw, k_raw, nullptr,
-    raw_mask, sinks, nullptr, kq_scale, il);
-
-// Run sparse compressed attention via new kernel
-ggml_tensor * comp_kv = kv_comp_cache;  // [head_dim, n_comp_visible]
-ggml_tensor * comp_out = ggml_dsv4_sparse_attn(ctx0,
-    Qcur_permuted,   // [head_dim, n_heads, n_tokens]
-    comp_kv,          // [head_dim, n_comp_visible]
-    idx_topk,         // [n_idx_topk, n_tokens]
-    sinks,            // [n_heads]
-    kq_scale);
-
-// Merge window and compressed outputs
-// (requires meta from both — see merge kernel below)
-cur = dsv4_merge_attn_outputs(ctx0, window_out, window_meta, comp_out, comp_meta);
+// Unified kernel handles window (via k_raw) AND compressed (via idx_topk)
+// We pass both the window cache and compressed cache. Wait, DSv4's
+// KV cache is conceptually split in our implementation:
+// `k_raw` = uncompressed recent window, `kv_comp_cache` = compressed context.
+// To use a unified kernel, we might need to pass both, or concatenate them
+// virtually in the kernel.
 ```
+
+*Refinement for `ggml` graph:* If `k_raw` and `kv_comp_cache` are physically separate tensors in memory, a unified kernel needs *both* as inputs. `GGML_OP_DSV4_SPARSE_ATTN` would take:
+1. `Q` (query)
+2. `KV_comp` (compressed cache)
+3. `KV_window` (recent window cache)
+4. `topk_idxs` (indices for KV_comp)
+5. `attn_sink`
+
+Then the kernel loops over `KV_window` contiguously, then loops over `topk_idxs` into `KV_comp`. This is extremely efficient and requires zero merging!
 
 ### 4.5 How topk_idxs Flows Through the Graph
 
@@ -522,25 +561,9 @@ The index tensor originates from:
 
 The `idx_topk` tensor contains column indices into the compressed KV cache. Each value in `[0, n_comp_visible)` identifies which compressed KV row to gather. This tensor is passed directly to `ggml_dsv4_sparse_attn` as `src[2]`.
 
-### 4.6 Merge Kernel for Window + Compressed Attention
+### 4.6 No Merge Kernel Required
 
-We need a small merge kernel (or reuse the existing `flash_attn_combine_results` pattern):
-
-```cpp
-// GGML_OP_DSV4_MERGE_ATTN or implemented as part of the graph
-// For each (token, head, dim):
-//   combined_max = max(window_max, comp_max)
-//   w_scale = exp(window_max - combined_max)
-//   c_scale = exp(comp_max - combined_max)
-//   output = (w_scale * window_out * window_rowsum + c_scale * comp_out * comp_rowsum)
-//          / (w_scale * window_rowsum + c_scale * comp_rowsum)
-```
-
-This is structurally identical to the `flash_attn_combine_results` kernel in `fattn-common.cuh` (line ~510) and the stream-k fixup logic. We can either:
-- Add a dedicated `GGML_OP_DSV4_MERGE_ATTN` op
-- Or expose the sparse kernel output with meta and let the caller merge in the graph
-
-**Recommendation:** Add `GGML_OP_DSV4_MERGE_ATTN` for clarity. It's a simple element-wise operation.
+Because we use the Unified Gather-Window Kernel (Option B), we do not need to merge outputs. The `GGML_OP_DSV4_SPARSE_ATTN` directly returns the final softmax-normalized output for DSv4 layers, ready to be fed to `attn_out_proj` and the MLA up-projections.
 
 ---
 
