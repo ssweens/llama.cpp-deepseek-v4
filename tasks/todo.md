@@ -37,15 +37,26 @@
 ## In Progress
 - [x] Long-prompt validation: BF16 `-fa on` with isolation prompt + n_predict=400 — perfect structured output
 - [x] Verify IQ2_XS short prompt with the unified sparse path — coherent ("answer":"6") at 40 tok/s
-- [ ] **INVESTIGATE: IQ2_XS long prompt decode loop is suspicious, do not assume quant ceiling.**
-  - Symptom: long isolation prompt with `-fa on` and IQ2_XS produces correct prompt-eval and proper Evidence/Interpretation/Next Step section structure, then collapses into repeating "The final sentence must be a single short sentence." sentence-by-sentence.
-  - User pushback: "I don't believe this to be true" — user does not accept the quick attribution to IQ2 quant quality.
-  - Required diagnosis steps:
-    - Compare IQ2_XS `-fa off` (CPU softmax path) on the same long prompt. If it produces coherent structured output, this is a sparse-op-specific issue, not a quant ceiling.
-    - Compare with `-ngl 0` and `CUDA_VISIBLE_DEVICES=` cleared to factor out backend interactions.
-    - Compare with a non-thinking-mode prompt at the same length to factor out reasoning-quality loss.
-    - Compare with `--temp 0.7 --top-p 0.95` non-greedy sampling to factor out greedy-decode pathologies.
-    - If a real bug remains, suspected areas: (a) sparse op behavior with quantized indexer Q matmul inputs, (b) attention-sink interaction with online softmax under quantized accumulation, (c) cache-validity mask interaction with the SWA window across the chunk boundary.
+- [x] **DIAGNOSED: IQ2_XS long-prompt collapse is a quant-recipe issue, NOT sparse-op or generic quant ceiling.**
+  - User pushback ("I don't believe this to be true") was correct. Proper diagnosis:
+    - IQ2_XS `-fa off`: same exact loop → not sparse-op specific
+    - IQ2_XS temp=0.7 / temp=1.0+rp: still loops or rambles → not greedy-decode
+    - IQ2_XS simple essay prompt (300-word essay, no recursion): also collapses into repetition ("printing press","printing press",...) → not prompt-recursion
+    - IQ2_S (2.6 bpw) instead of IQ2_XS (2.4 bpw): still loops on same prompt → quant level matters
+    - BF16 same prompt: perfect structured output → not the model itself
+  - Root cause via GGUF inspection: indexer + compressor weights are quantized to IQ2_XS:
+    - `indexer.attn_q_b.weight` → IQ2_XS
+    - `attn_compressor_kv.weight` → IQ2_XS
+    - `attn_compressor_gate.weight` → IQ2_XS
+    - `indexer_compressor_kv.weight` → IQ2_XS
+    - `indexer_compressor_gate.weight` → IQ2_XS
+  - These tensors steer attention (indexer top-k selection + compressor pool that gets gathered). At 2.4 bpw the noise is enough to derail topk selection on sustained generation — but is fine on single short answers (where small attention errors don't compound).
+- [ ] **FIX: Update DSv4 IQ2 quantization recipe to keep indexer + compressor weights at higher precision.**
+  - Target precision: BF16 (or Q5_K/Q6_K) for `*indexer*kv*`, `*indexer*gate*`, `*indexer*q_b*`, `*compressor*kv*`, `*compressor*gate*`
+  - Smallest ones (proj/norm/sinks/scale/base) are already F32 or BF16 — leave alone.
+  - Update `gcp-quant.sh` (or wherever the recipe lives) with `--tensor-type-file` overrides for these patterns.
+  - Re-quantize one model locally to verify the fix before committing the recipe change.
+  - GCP imatrix run already pending — use the new recipe when capacity opens up.
 - [ ] Phase 2 sparse kernel optimization: tensor-core MMA path for higher decode throughput
   - Current naive kernel: ~0.5 tok/s decode at -ngl 8 BF16 (memory-bandwidth + scalar dot products)
   - Goal: match or exceed pre-bug FA performance using MMA tensor cores
