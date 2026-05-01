@@ -2708,9 +2708,15 @@ struct dsv4_op_profiler {
                 const std::function<void()> & dispatch) {
         // CUDA Graph capture is incompatible with cudaStreamSynchronize. If we're
         // inside a graph capture region, just dispatch without timing.
+#ifdef GGML_USE_HIP
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        hipStreamIsCapturing(stream, &capture);
+        if (capture != hipStreamCaptureStatusNone) {
+#else
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &capture);
         if (capture != cudaStreamCaptureStatusNone) {
+#endif
             dispatch();
             return;
         }

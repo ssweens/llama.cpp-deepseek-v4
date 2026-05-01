@@ -571,6 +571,20 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        static const bool trace_graph_reuse = (getenv("LLAMA_GRAPH_REUSE_TRACE") != nullptr);
+        auto fail = [&](const char * why) {
+            if (trace_graph_reuse) {
+                fprintf(stderr,
+                        "graph_reuse: reject (%s) [gtype=%d n_tok=%u->%u n_seq=%u->%u n_out=%u->%u]\n",
+                        why,
+                        (int) gtype,
+                        (unsigned) ubatch.n_tokens, (unsigned) other.ubatch.n_tokens,
+                        (unsigned) ubatch.n_seqs,   (unsigned) other.ubatch.n_seqs,
+                        (unsigned) n_outputs,       (unsigned) other.n_outputs);
+            }
+            return false;
+        };
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -598,32 +612,32 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
-            return false;
+            return fail("ubatch");
         }
 
         if (n_outputs != other.n_outputs) {
-            return false;
+            return fail("n_outputs");
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
-            return false;
+            return fail("samplers");
         }
 
         if (samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
-                return false;
+                return fail("sampler-data-null");
             }
 
             // check that the outputs are the same for all samplers
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 if (ubatch.output[i]    != other.ubatch.output[i] ||
                     ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
-                    return false;
+                    return fail("sampler-output-or-seqid");
                 }
             }
         }
 
-        return
+        const bool same =
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
             arch  == other.arch  &&
@@ -631,6 +645,12 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
+
+        if (!same) {
+            return fail("graph-params");
+        }
+
+        return true;
     }
 };
 
