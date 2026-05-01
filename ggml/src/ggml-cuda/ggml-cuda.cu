@@ -2668,9 +2668,36 @@ struct dsv4_op_profiler {
         return "CUDA";
 #endif
     }
+    static const std::string & split_key() {
+        static const std::string k = []() {
+            if (const char * v = getenv("GGML_PROFILE_SPLIT_KEY"); v && v[0] != '\0') {
+                return std::string(v);
+            }
+            std::string s;
+            if (const char * dev = getenv("LLAMA_ARG_DEVICE"); dev && dev[0] != '\0') {
+                s += std::string("dev=") + dev;
+            }
+            if (const char * ts = getenv("LLAMA_ARG_TENSOR_SPLIT"); ts && ts[0] != '\0') {
+                if (!s.empty()) s += " ";
+                s += std::string("ts=") + ts;
+            }
+            if (const char * ngl = getenv("LLAMA_ARG_N_GPU_LAYERS"); ngl && ngl[0] != '\0') {
+                if (!s.empty()) s += " ";
+                s += std::string("ngl=") + ngl;
+            }
+            if (s.empty()) {
+                s = "split=unspecified (set GGML_PROFILE_SPLIT_KEY)";
+            }
+            return s;
+        }();
+        return k;
+    }
+
     struct entry { double ms = 0.0; int64_t calls = 0; };
     std::unordered_map<int, entry> by_op;
     std::unordered_map<std::string, entry> by_tag;
+    std::unordered_map<std::string, std::unordered_map<int, entry>> by_split_op;
+    std::unordered_map<std::string, std::unordered_map<std::string, entry>> by_split_tag;
 
     static dsv4_op_profiler & get() {
         static dsv4_op_profiler p;
@@ -2697,6 +2724,12 @@ struct dsv4_op_profiler {
         auto & e = by_op[(int) dst->op];
         e.ms += ms;
         e.calls += 1;
+
+        const std::string & sk = split_key();
+        auto & e_split = by_split_op[sk][(int) dst->op];
+        e_split.ms += ms;
+        e_split.calls += 1;
+
         const char * name = ggml_get_name(dst);
         if (name) {
             std::string tag;
@@ -2713,10 +2746,13 @@ struct dsv4_op_profiler {
             else if (strstr(name, "hc_"))               tag = "hc_split";
             else if (strstr(name, "attn"))              tag = "attn_other";
             else if (strstr(name, "ffn"))               tag = "ffn_other";
-            else                                        tag = "_other";
+            else                                          tag = "_other";
             auto & en = by_tag[tag];
             en.ms += ms;
             en.calls += 1;
+            auto & en_split = by_split_tag[sk][tag];
+            en_split.ms += ms;
+            en_split.calls += 1;
         }
     }
     ~dsv4_op_profiler() {
@@ -2726,6 +2762,7 @@ struct dsv4_op_profiler {
         double total = 0.0;
         for (auto & p : ops) total += p.second.ms;
         fprintf(stderr, "\n=== DSv4 op profile (%s; GGML_PROFILE_OPS) ===\n", backend_name());
+        fprintf(stderr, "profile key: %s\n", split_key().c_str());
         fprintf(stderr, "%-32s %12s %10s %8s\n", "op", "total_ms", "calls", "pct");
         for (auto & p : ops) {
             fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
@@ -2745,6 +2782,44 @@ struct dsv4_op_profiler {
             }
         }
         fprintf(stderr, "=== total measured: %.2f ms ===\n", total);
+
+        if (!by_split_op.empty()) {
+            std::vector<std::string> split_keys;
+            split_keys.reserve(by_split_op.size());
+            for (const auto & kv : by_split_op) split_keys.push_back(kv.first);
+            std::sort(split_keys.begin(), split_keys.end());
+
+            for (const auto & sk : split_keys) {
+                const auto & op_map = by_split_op[sk];
+                std::vector<std::pair<int, entry>> split_ops(op_map.begin(), op_map.end());
+                std::sort(split_ops.begin(), split_ops.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+                double split_total = 0.0;
+                for (auto & p : split_ops) split_total += p.second.ms;
+
+                fprintf(stderr, "\n--- split bucket: %s ---\n", sk.c_str());
+                fprintf(stderr, "%-32s %12s %10s %8s\n", "op", "total_ms", "calls", "pct");
+                for (auto & p : split_ops) {
+                    fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                            ggml_op_name((ggml_op) p.first), p.second.ms,
+                            (long long) p.second.calls,
+                            (split_total > 0.0) ? (100.0 * p.second.ms / split_total) : 0.0);
+                }
+
+                auto it_tag = by_split_tag.find(sk);
+                if (it_tag != by_split_tag.end() && !it_tag->second.empty()) {
+                    std::vector<std::pair<std::string, entry>> split_tags(it_tag->second.begin(), it_tag->second.end());
+                    std::sort(split_tags.begin(), split_tags.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+                    fprintf(stderr, "split tagged buckets:\n");
+                    fprintf(stderr, "%-32s %12s %10s %8s\n", "tag", "total_ms", "calls", "pct");
+                    for (auto & p : split_tags) {
+                        fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                                p.first.c_str(), p.second.ms, (long long) p.second.calls,
+                                (split_total > 0.0) ? (100.0 * p.second.ms / split_total) : 0.0);
+                    }
+                }
+                fprintf(stderr, "split total measured: %.2f ms\n", split_total);
+            }
+        }
     }
 };
 
