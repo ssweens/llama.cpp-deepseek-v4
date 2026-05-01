@@ -2649,14 +2649,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
-// Dev-only op profiler: GGML_CUDA_PROFILE_OPS=1 records per-op cumulative time
-// and prints a summary on program exit. Adds one cudaEvent pair per dispatched
-// op; serializes the stream within an op (the cudaEventSynchronize) but not
-// across ops.
+// Dev-only op profiler: GGML_PROFILE_OPS=1 (preferred) or
+// GGML_CUDA_PROFILE_OPS=1 (legacy alias) records per-op cumulative time and
+// prints a summary on program exit. Adds one timing pair per dispatched op;
+// serializes the stream within an op (the cudaStreamSynchronize) but not across ops.
 struct dsv4_op_profiler {
     static bool enabled() {
-        static const bool e = (getenv("GGML_CUDA_PROFILE_OPS") != nullptr);
+        static const bool e =
+            (getenv("GGML_PROFILE_OPS") != nullptr) ||
+            (getenv("GGML_CUDA_PROFILE_OPS") != nullptr);
         return e;
+    }
+
+    static const char * backend_name() {
+#ifdef GGML_USE_HIP
+        return "ROCm/HIP";
+#else
+        return "CUDA";
+#endif
     }
     struct entry { double ms = 0.0; int64_t calls = 0; };
     std::unordered_map<int, entry> by_op;
@@ -2715,7 +2725,7 @@ struct dsv4_op_profiler {
         std::sort(ops.begin(), ops.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
         double total = 0.0;
         for (auto & p : ops) total += p.second.ms;
-        fprintf(stderr, "\n=== DSv4 op profile (GGML_CUDA_PROFILE_OPS) ===\n");
+        fprintf(stderr, "\n=== DSv4 op profile (%s; GGML_PROFILE_OPS) ===\n", backend_name());
         fprintf(stderr, "%-32s %12s %10s %8s\n", "op", "total_ms", "calls", "pct");
         for (auto & p : ops) {
             fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
@@ -3926,7 +3936,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // Dev-only fusion counter, env-gated. Aggregates by
                 // "first-op + chain length" so the summary tells us which
                 // existing fusion patterns are actually firing.
-                static const bool log_fusion = (getenv("GGML_CUDA_LOG_FUSION") != nullptr);
+                static const bool log_fusion =
+                    (getenv("GGML_LOG_FUSION") != nullptr) ||
+                    (getenv("GGML_CUDA_LOG_FUSION") != nullptr);
                 if (log_fusion && (i - prev_i) > 1) {
                     static std::unordered_map<std::string, int64_t> fusion_counts;
                     static int64_t total_fusions = 0;
@@ -3937,7 +3949,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         std::atexit([]() {
                             std::vector<std::pair<std::string, int64_t>> v(fusion_counts.begin(), fusion_counts.end());
                             std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
-                            fprintf(stderr, "\n=== CUDA fusion summary (GGML_CUDA_LOG_FUSION) ===\n");
+#ifdef GGML_USE_HIP
+                            const char * backend = "ROCm/HIP";
+#else
+                            const char * backend = "CUDA";
+#endif
+                            fprintf(stderr, "\n=== %s fusion summary (GGML_LOG_FUSION) ===\n", backend);
                             fprintf(stderr, "%-48s %12s\n", "pattern", "count");
                             for (auto & p : v) fprintf(stderr, "%-48s %12lld\n", p.first.c_str(), (long long) p.second);
                             fprintf(stderr, "total fused subgraphs: %lld, total nodes saved: %lld\n",
