@@ -362,6 +362,15 @@ static ggml_tensor * dsv4_new_filled_2d(ggml_context * ctx, int64_t ne0, int64_t
     return ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1), val);
 }
 
+// Graph-build-time check: only emit ggml_cont when the tensor is actually
+// non-contiguous. ggml_cont always emits a GGML_OP_CONT (memory copy on every
+// backend) regardless of input layout, so a `cont(contig_tensor)` is pure waste.
+// Profiling shows CONT is ~9% of compute time on DSv4 decode — most of those
+// calls are no-op-equivalent and can be skipped.
+static inline ggml_tensor * cont_if_needed(ggml_context * ctx, ggml_tensor * t) {
+    return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+}
+
 static ggml_tensor * dsv4_arange_i32(ggml_context * ctx, int64_t begin, int64_t end) {
     return ggml_cast(ctx, ggml_arange(ctx, (float) begin, (float) end, 1.0f), GGML_TYPE_I32);
 }
@@ -379,7 +388,7 @@ static ggml_tensor * dsv4_view_state_segment(ggml_context * ctx, ggml_tensor * s
 // Writes to n_seqs consecutive cells starting at head.
 static void dsv4_store_state_segment(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * src, ggml_tensor * dst_state, int64_t state_size, uint32_t head, int64_t state_off, int64_t n_seqs = 1) {
     GGML_ASSERT(src != nullptr && dst_state != nullptr);
-    src = ggml_cont(ctx, src);
+    src = cont_if_needed(ctx, src);
     const int64_t elems_per_seq = ggml_nelements(src) / n_seqs;
 
     for (int64_t s = 0; s < n_seqs; ++s) {
@@ -397,7 +406,7 @@ static void dsv4_store_cache_rows(ggml_context * ctx, ggml_cgraph * gf, ggml_ten
         return;
     }
 
-    src = ggml_cont(ctx, src);
+    src = cont_if_needed(ctx, src);
     src = ggml_reshape_2d(ctx, src, dst_cache->ne[0], n_rows);
 
     ggml_tensor * rows = dsv4_arange_i32(ctx, row_start, row_start + n_rows);
@@ -422,7 +431,7 @@ static ggml_tensor * dsv4_shift_overlap_state(ggml_context * ctx, ggml_tensor * 
     const int64_t n_comp = x->ne[2];
 
     ggml_tensor * first = ggml_view_3d(ctx, x, n_embd, ratio, 1, x->nb[1], x->nb[2], 0);
-    ggml_tensor * pad = ggml_fill(ctx, ggml_cont(ctx, first), pad_value);
+    ggml_tensor * pad = ggml_fill(ctx, cont_if_needed(ctx, first), pad_value);
     if (n_comp == 1) {
         return pad;
     }
@@ -577,7 +586,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     };
 
     auto apply_fp8_qat_full_2d = [&](ggml_tensor * t, const char * tag, int il_cur) -> ggml_tensor * {
-        t = as_f32(ggml_cont(ctx0, t));
+        t = as_f32(cont_if_needed(ctx0, t));
         GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1);
         if (t->ne[0] % 128 != 0) {
             return t;
@@ -611,7 +620,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     };
 
     auto flatten_hc_state = [&](ggml_tensor * x_hc) -> ggml_tensor * {
-        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, as_f32(x_hc)), x_hc->ne[0] * x_hc->ne[1], x_hc->ne[2]);
+        return ggml_reshape_2d(ctx0, cont_if_needed(ctx0, as_f32(x_hc)), x_hc->ne[0] * x_hc->ne[1], x_hc->ne[2]);
     };
 
     struct hc_pre_result {
@@ -624,7 +633,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     auto hc_pre = [&](ggml_tensor * x_hc, ggml_tensor * hc_fn, ggml_tensor * hc_base, ggml_tensor * hc_scale, const char * tag, int il_cur) -> hc_pre_result {
         GGML_ASSERT(x_hc->ne[0] == n_embd && x_hc->ne[1] == n_hc);
         const int64_t hc_dim = n_embd * n_hc;
-        ggml_tensor * flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
+        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
         flat = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
         ggml_tensor * mixes = mul_mat_checked(hc_fn, flat, "hc.fn"); // [(2+n_hc)*n_hc, n_tokens]
         cb(mixes, std::string(tag).append("_mixes").c_str(), il_cur);
@@ -635,9 +644,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         ggml_tensor * post = ggml_view_2d(ctx0, split, n_hc, n_tokens, split->nb[1], n_hc * split->nb[0]);
         ggml_tensor * comb = ggml_view_2d(ctx0, split, n_hc * n_hc, n_tokens, split->nb[1], 2 * n_hc * split->nb[0]);
         if (n_tokens != 1) {
-            pre  = ggml_cont(ctx0, pre);
-            post = ggml_cont(ctx0, post);
-            comb = ggml_cont(ctx0, comb);
+            pre  = cont_if_needed(ctx0, pre);
+            post = cont_if_needed(ctx0, post);
+            comb = cont_if_needed(ctx0, comb);
         }
         comb = ggml_reshape_3d(ctx0, comb, n_hc, n_hc, n_tokens); // [src_hc, dst_hc, n_tokens]
 
@@ -671,7 +680,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         }
 
         const int64_t hc_dim = n_embd * n_hc;
-        ggml_tensor * flat = ggml_cont(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
+        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
         flat = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
         ggml_tensor * pre = mul_mat_checked(hc_fn, flat, "hc.head.fn"); // [n_hc, n_tokens]
         pre = ggml_mul(ctx0, pre, ggml_view_1d(ctx0, hc_scale, 1, 0));
@@ -743,8 +752,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         // Reshape into windows. For multi-seq: {out_dim, ratio, n_windows_per_seq * n_seqs}
         // The windows within each sequence are contiguous, so this is safe.
         const int64_t total_windows = n_windows_per_seq * local_n_seqs;
-        ggml_tensor * kv_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, ggml_cont(ctx0, kv), out_dim, n_tok_usable_per_seq * local_n_seqs) : kv;
-        ggml_tensor * gate_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, ggml_cont(ctx0, gate), out_dim, n_tok_usable_per_seq * local_n_seqs) : gate;
+        ggml_tensor * kv_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, cont_if_needed(ctx0, kv), out_dim, n_tok_usable_per_seq * local_n_seqs) : kv;
+        ggml_tensor * gate_flat = (local_n_seqs > 1) ? ggml_reshape_2d(ctx0, cont_if_needed(ctx0, gate), out_dim, n_tok_usable_per_seq * local_n_seqs) : gate;
         ggml_tensor * kv_3d = ggml_reshape_3d(ctx0, kv_flat, out_dim, ratio, total_windows);
         ggml_tensor * gate_3d = ggml_reshape_3d(ctx0, gate_flat, out_dim, ratio, total_windows);
 
@@ -782,9 +791,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     ggml_tensor * gate_a_prev_s = ggml_view_3d(ctx0, gate_a, head_dim, ratio, n_windows_per_seq - 1,
                                                                gate_a->nb[1], gate_a->nb[2], win_off * gate_a->nb[2]);
                     // Zero/neg-inf initial window
-                    ggml_tensor * kv_zero_s = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, kv_a, head_dim, ratio, 1,
+                    ggml_tensor * kv_zero_s = ggml_fill(ctx0, cont_if_needed(ctx0, ggml_view_3d(ctx0, kv_a, head_dim, ratio, 1,
                                                           kv_a->nb[1], kv_a->nb[2], win_off * kv_a->nb[2])), 0.0f);
-                    ggml_tensor * gate_ninf_s = ggml_fill(ctx0, ggml_cont(ctx0, ggml_view_3d(ctx0, gate_a, head_dim, ratio, 1,
+                    ggml_tensor * gate_ninf_s = ggml_fill(ctx0, cont_if_needed(ctx0, ggml_view_3d(ctx0, gate_a, head_dim, ratio, 1,
                                                            gate_a->nb[1], gate_a->nb[2], win_off * gate_a->nb[2])), -INFINITY);
                     kv_parts.push_back(ggml_concat(ctx0, kv_zero_s, kv_a_prev_s, 2));
                     gate_parts.push_back(ggml_concat(ctx0, gate_ninf_s, gate_a_prev_s, 2));
@@ -797,30 +806,30 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     gate_a_shift = ggml_concat(ctx0, gate_a_shift, gate_parts[s], 2);
                 }
             } else {
-                kv_a_shift = ggml_fill(ctx0, ggml_cont(ctx0, kv_a), 0.0f);
-                gate_a_shift = ggml_fill(ctx0, ggml_cont(ctx0, gate_a), -INFINITY);
+                kv_a_shift = ggml_fill(ctx0, cont_if_needed(ctx0, kv_a), 0.0f);
+                gate_a_shift = ggml_fill(ctx0, cont_if_needed(ctx0, gate_a), -INFINITY);
             }
 
             ggml_tensor * kv_ov = ggml_concat(ctx0, kv_a_shift, kv_b, 1);        // [head_dim, 2*ratio, total_windows]
             ggml_tensor * gate_ov = ggml_concat(ctx0, gate_a_shift, gate_b, 1);  // [head_dim, 2*ratio, total_windows]
 
             ggml_tensor * gate_s = ggml_permute(ctx0, gate_ov, 1, 0, 2, 3);      // [2*ratio, head_dim, total_windows]
-            ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, gate_s));
+            ggml_tensor * w = ggml_soft_max(ctx0, cont_if_needed(ctx0, gate_s));
             w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                // [head_dim, 2*ratio, total_windows]
 
             ggml_tensor * pooled = ggml_mul(ctx0, kv_ov, w);
             pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                      // [2*ratio, head_dim, total_windows]
-            pooled = ggml_cont(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
+            pooled = cont_if_needed(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
             pooled = ggml_sum_rows(ctx0, pooled);                                  // [1, head_dim, total_windows]
             pool = ggml_reshape_2d(ctx0, pooled, head_dim, total_windows);          // [head_dim, total_windows]
         } else {
             ggml_tensor * gate_s = ggml_permute(ctx0, gate_3d, 1, 0, 2, 3);       // [ratio, out_dim, total_windows]
-            ggml_tensor * w = ggml_soft_max(ctx0, ggml_cont(ctx0, gate_s));
+            ggml_tensor * w = ggml_soft_max(ctx0, cont_if_needed(ctx0, gate_s));
             w = ggml_permute(ctx0, w, 1, 0, 2, 3);                                 // [out_dim, ratio, total_windows]
 
             ggml_tensor * pooled = ggml_mul(ctx0, kv_3d, w);
             pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                       // [ratio, out_dim, total_windows]
-            pooled = ggml_cont(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
+            pooled = cont_if_needed(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
             pooled = ggml_sum_rows(ctx0, pooled);                                   // [1, out_dim, total_windows]
             pool = ggml_reshape_2d(ctx0, pooled, out_dim, total_windows);            // [out_dim, total_windows]
 
@@ -937,7 +946,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast, rope_cfg.beta_slow);
         }
         // partial rope: ggml_dsv4_rope_tail handles nope prefix + rope tail in one op
-        x = as_f32(ggml_cont(ctx0, x));
+        x = as_f32(cont_if_needed(ctx0, x));
         return ggml_dsv4_rope_tail(ctx0, x, pos, nullptr,
                 (int)rope_dim, rope_type, rope_cfg.n_ctx_orig,
                 rope_cfg.freq_base, rope_cfg.freq_scale, rope_cfg.ext_factor,
@@ -950,8 +959,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
     auto dsv4_pool_decode_state = [&](ggml_tensor * kv, ggml_tensor * score, ggml_tensor * norm, ggml_tensor * pos, int64_t head_dim, const dsv4_rope_cfg & rope_cfg) -> ggml_tensor * {
         const int64_t n_rows = kv->ne[1];
-        kv = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, kv)), n_rows, head_dim, 1);
-        score = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, score)), n_rows, head_dim, 1);
+        kv = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, ggml_transpose(ctx0, kv)), n_rows, head_dim, 1);
+        score = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, ggml_transpose(ctx0, score)), n_rows, head_dim, 1);
 
         ggml_tensor * pooled = dsv4_softmax_pool_ratio(ctx0, kv, score);
         pooled = ggml_rms_norm(ctx0, pooled, hparams.f_norm_rms_eps);
@@ -1296,16 +1305,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(comp_pos, "attn_comp_pos", il);
 
             // ----- compressed attn pool: rope FIRST, THEN fp8 quantize, store to DSv4 attn_k cache -----
-            ggml_tensor * c_attn = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(c_pool)), n_embd_head, 1, n_comp);
+            ggml_tensor * c_attn = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(c_pool)), n_embd_head, 1, n_comp);
             c_attn = apply_partial_rope_with_pos(c_attn, comp_pos, rope_cfg, /*inverse=*/false);
             c_attn = apply_fp8_qat_nope_2d(c_attn, "attn_compressor_pool_qat", il);
             cb(c_attn, "attn_compressor_pool_roped", il);
             store_attn_cache_rows(c_attn, 0, n_comp);
 
             // ----- indexer compressor pool: rope only, no fp8 quantize, store to DSv4 index_k cache -----
-            ggml_tensor * idx_comp = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_pool)), idx_dim, 1, n_comp);
+            ggml_tensor * idx_comp = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(idx_pool)), idx_dim, 1, n_comp);
             idx_comp = apply_partial_rope_with_pos(idx_comp, comp_pos, rope_cfg, /*inverse=*/false);
-            idx_comp = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idx_comp), idx_dim, n_comp);
+            idx_comp = ggml_reshape_2d(ctx0, cont_if_needed(ctx0, idx_comp), idx_dim, n_comp);
             cb(idx_comp, "attn_indexer_pool_roped", il);
             store_index_cache_rows(idx_comp, 0, n_comp);
 
@@ -1316,7 +1325,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_inp_fp8_qat", il);
             ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.q_b");
             idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
-            idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
+            idx_q = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
             idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
             cb(idx_q, "attn_indexer_q_roped", il);
 
@@ -1335,7 +1344,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(idx_weights, "attn_indexer_weights", il);
 
             idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
-            idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
+            idx_scores = cont_if_needed(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
             idx_scores = ggml_sum_rows(ctx0, idx_scores);
             idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp, n_tokens);
             cb(idx_scores, "attn_indexer_scores", il);
@@ -1482,7 +1491,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                 if (idx_dec.kv_comp != nullptr && n_comp_visible > n_comp_before) {
                     ggml_tensor * idx_comp_new = idx_dec.kv_comp;
-                    idx_comp_new = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idx_comp_new), hparams.n_embd_head_index, n_comp_visible - n_comp_before);
+                    idx_comp_new = ggml_reshape_2d(ctx0, cont_if_needed(ctx0, idx_comp_new), hparams.n_embd_head_index, n_comp_visible - n_comp_before);
 
                     dsv4_store_cache_rows(ctx0, gf, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), idx_comp_new, n_comp_before, n_comp_visible - n_comp_before);
                 }
@@ -1514,7 +1523,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 // Build kv_comp_cache: concat any cached (older) compressed rows with the just-computed new ones.
                 ggml_tensor * kv_comp_cache = nullptr;
                 if (kv_comp_new_for_attn != nullptr && n_comp_new > 0) {
-                    ggml_tensor * kv_new = ggml_reshape_3d(ctx0, ggml_cont(ctx0, kv_comp_new_for_attn), n_embd_head, 1, n_comp_new);
+                    ggml_tensor * kv_new = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, kv_comp_new_for_attn), n_embd_head, 1, n_comp_new);
                     if (n_comp_before > 0) {
                         ggml_tensor * kv_old = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_before);
                         kv_comp_cache = ggml_concat(ctx0, as_f32(kv_old), as_f32(kv_new), 2);
@@ -1532,13 +1541,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 const int32_t n_idx_topk = std::min<int32_t>((int32_t) hparams.n_attn_index_topk, (int32_t) n_comp_visible);
 
                 ggml_tensor * index_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_index_k(ctx0, il, seq_id), n_comp_visible);
-                index_cache = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(index_cache)), idx_dim, 1, n_comp_visible);
+                index_cache = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(index_cache)), idx_dim, 1, n_comp_visible);
 
                 ggml_tensor * idx_q_inp_src = hparams.deepseek4_fp8_indexer_q ? ggml_cast(ctx0, q_residual, GGML_TYPE_BF16) : q_residual;
                 ggml_tensor * idx_q_inp = apply_dense_fp8_qat(idx_q_inp_src, hparams.deepseek4_fp8_indexer_q, "attn_indexer_q_decode_inp_fp8_qat", il);
                 ggml_tensor * idx_q = mul_mat_checked(model.layers[il].attn_indexer_q_b, idx_q_inp, "indexer.decode.q_b");
                 idx_q = cast_dense_fp8_out(idx_q, hparams.deepseek4_fp8_indexer_q);
-                idx_q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
+                idx_q = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(idx_q)), idx_dim, n_index_heads, n_tokens);
                 idx_q = apply_partial_rope(idx_q, rope_cfg, /*inverse=*/false);
 
                 ggml_tensor * k_perm = ggml_permute(ctx0, index_cache, 0, 2, 1, 3);
@@ -1555,7 +1564,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 idx_weights = ggml_permute(ctx0, idx_weights, 0, 2, 1, 3);
 
                 idx_scores = ggml_mul(ctx0, idx_scores, idx_weights);
-                idx_scores = ggml_cont(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
+                idx_scores = cont_if_needed(ctx0, ggml_permute(ctx0, idx_scores, 1, 2, 0, 3));
                 idx_scores = ggml_sum_rows(ctx0, idx_scores);
                 idx_scores = ggml_reshape_2d(ctx0, idx_scores, n_comp_visible, n_tokens);
 
@@ -1637,7 +1646,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             GGML_ASSERT(model.layers[il].wq->ne[1] == o_lora_rank * n_groups);
 
             // cur: [n_embd_head, n_head, n_tokens] -> [group_dim, n_groups, n_tokens]
-            ggml_tensor * o = ggml_cont(ctx0, cur);
+            ggml_tensor * o = cont_if_needed(ctx0, cur);
             o = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_tokens);
 
             // wq is [group_dim, n_groups*o_lora_rank] reshaped to [group_dim, o_lora_rank, n_groups]
