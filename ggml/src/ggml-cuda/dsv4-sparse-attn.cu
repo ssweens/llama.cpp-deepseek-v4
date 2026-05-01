@@ -43,13 +43,7 @@
 // =============================================================================
 
 #ifndef DSV4_SPARSE_ATTN_BLOCK_THREADS
-#ifdef GGML_USE_HIP
-// ROCm/iGPU path: use 64 threads to reduce LDS/register pressure and improve
-// occupancy on gfx1151 under sustained prefill/decode.
-#define DSV4_SPARSE_ATTN_BLOCK_THREADS 64
-#else
 #define DSV4_SPARSE_ATTN_BLOCK_THREADS 128
-#endif
 #endif
 
 template <typename KVT, int HEAD_DIM_KV, int BLOCK_THREADS>
