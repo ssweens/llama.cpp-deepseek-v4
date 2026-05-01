@@ -177,6 +177,14 @@ public:
         std::memcpy(tensor->data, values.data(), values.size() * sizeof(values[0]));
     }
 
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        // The data is constant and was captured at construction. As long as the
+        // tensor still exists and its shape matches the captured values, the
+        // graph can reuse this input.
+        return tensor != nullptr && (int64_t) values.size() == tensor->ne[0];
+    }
+
 private:
     ggml_tensor * tensor;
     std::vector<int32_t> values;
@@ -206,6 +214,15 @@ public:
         window_size(window_size),
         use_alibi(use_alibi),
         causal_attn(causal_attn) {
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        // Mask shape is [n_tokens, n_tokens]. Reuse only when the new ubatch
+        // has the same n_tokens; set_input below will rewrite the per-position
+        // mask values according to the new positions.
+        if (mask == nullptr) return false;
+        const int64_t n = (int64_t) params.ubatch.n_tokens;
+        return mask->ne[0] == n && mask->ne[1] == n;
     }
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -258,6 +275,13 @@ public:
         causal_attn(causal_attn) {
     }
 
+    bool can_reuse(const llm_graph_params & params) override {
+        // Mask shape is [n_comp, n_tokens]. n_comp is captured at construction;
+        // reuse only when the new ubatch n_tokens still matches the second axis.
+        if (mask == nullptr) return false;
+        return mask->ne[0] == n_comp && mask->ne[1] == (int64_t) params.ubatch.n_tokens;
+    }
+
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(mask != nullptr);
         GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
@@ -301,6 +325,13 @@ public:
         ratio(ratio),
         use_alibi(use_alibi),
         causal_attn(causal_attn) {
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        // Mask shape is [n_comp, n_tokens] (or [n_comp, n_tokens, 1, 1]).
+        // n_comp is captured at construction; reuse only when n_tokens matches.
+        if (mask == nullptr) return false;
+        return mask->ne[0] == n_comp && mask->ne[1] == (int64_t) params.ubatch.n_tokens;
     }
 
     void set_input(const llama_ubatch * ubatch) override {
