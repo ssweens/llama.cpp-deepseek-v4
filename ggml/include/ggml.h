@@ -622,6 +622,14 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        // SWIGLU with symmetric clamp on the up-projection and one-sided clamp
+        // on the gate-projection. Used by DeepSeek-V3/V4 and Step3.5 models:
+        //   gate = clamp(gate, -INF, limit)
+        //   up   = clamp(up,   -limit, +limit)
+        //   out  = silu(gate) * up
+        // Replaces the previous manual `CLAMP+CLAMP+SILU+MUL` op chain so the
+        // existing MUL_MAT_ID + MUL_MAT_ID + GLU fusion can match again.
+        GGML_GLU_OP_SWIGLU_CLAMPED,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1356,6 +1364,19 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             float                 alpha,
+            float                 limit);
+
+    // SWIGLU with symmetric clamp on `b` (the up-projection) and one-sided
+    // clamp on `a` (the gate-projection):
+    //   a = clamp(a, -INFINITY, +limit)
+    //   b = clamp(b, -limit,    +limit)
+    //   out = silu(a) * b
+    // Used by DeepSeek-V3/V4 and Step3.5. Replaces the legacy CLAMP+CLAMP+SILU+MUL
+    // chain so the existing MUL_MAT_ID + MUL_MAT_ID + GLU fusion can match.
+    GGML_API struct ggml_tensor * ggml_swiglu_clamped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 limit);
 
     // normalize along rows

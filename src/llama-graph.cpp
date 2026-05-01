@@ -1601,22 +1601,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 {
                     const float limit = hparams.f_swiglu_limit;
                     if (limit > eps) {
-                        cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
-                        cb(cur, "ffn_moe_gate_clamped", il);
-
-                        up = ggml_clamp(ctx0, up, -limit, limit);
-                        cb(up, "ffn_moe_up_clamped", il);
-
-                        ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                        cb(gate_act, "ffn_moe_silu", il);
-
-                        cur = ggml_mul(ctx0, gate_act, up);
+                        // Single fused GLU op: clamp(gate, -INF, limit), clamp(up, -limit, +limit), silu(gate) * up
+                        // Replaces the legacy CLAMP+CLAMP+SILU+MUL chain so the existing
+                        // MUL_MAT_ID + MUL_MAT_ID + GLU fusion can match.
+                        cur = ggml_swiglu_clamped(ctx0, cur, up, limit);
                         cb(cur, "ffn_moe_swiglu_limited", il);
                         break;
                     }
                 }
 
-                // Step35: per-layer clamp for routed experts
+                // Step35: per-layer clamp for routed experts.
+                // NOTE: STEP35 has slightly different semantics - it clamps silu(gate) instead of gate before silu.
+                // This is mathematically equivalent for non-negative limits since silu is monotonic, but keep the
+                // explicit ops here until STEP35 is verified against the new fused path.
                 if (arch == LLM_ARCH_STEP35 && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     if (limit > eps) {

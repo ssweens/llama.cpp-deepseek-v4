@@ -2293,6 +2293,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // SWIGLU_CLAMPED intentionally NOT in this list yet. The fused mmvq /
+    // mmq paths read GLU params from a hardcoded default in the kernel
+    // (latent issue: SWIGLU_OAI also reads defaults but happens to match
+    // GPT-OSS defaults). For SWIGLU_CLAMPED with model-specific `limit`
+    // (e.g. DSv4 = 10.0), passing through this fast path would silently
+    // miscompute. Until the fusion args struct plumbs `glu_limit`, restrict
+    // to the unfused dispatch path which reads params from op_params.
     static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
@@ -2871,6 +2878,9 @@ static bool ggml_cuda_compute_forward_dispatch(ggml_backend_cuda_context & ctx, 
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI:
                     ggml_cuda_op_swiglu_oai(ctx, dst);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMPED:
+                    ggml_cuda_op_swiglu_clamped(ctx, dst);
                     break;
                 case GGML_GLU_OP_GEGLU_ERF:
                     ggml_cuda_op_geglu_erf(ctx, dst);
@@ -3901,6 +3911,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_INFO("nodes_fused: %d\n", nodes_fused);
                 }
 #endif
+                // Dev-only fusion counter, env-gated. Aggregates by
+                // "first-op + chain length" so the summary tells us which
+                // existing fusion patterns are actually firing.
+                static const bool log_fusion = (getenv("GGML_CUDA_LOG_FUSION") != nullptr);
+                if (log_fusion && (i - prev_i) > 1) {
+                    static std::unordered_map<std::string, int64_t> fusion_counts;
+                    static int64_t total_fusions = 0;
+                    static int64_t total_nodes_saved = 0;
+                    static bool registered_atexit = false;
+                    if (!registered_atexit) {
+                        registered_atexit = true;
+                        std::atexit([]() {
+                            std::vector<std::pair<std::string, int64_t>> v(fusion_counts.begin(), fusion_counts.end());
+                            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+                            fprintf(stderr, "\n=== CUDA fusion summary (GGML_CUDA_LOG_FUSION) ===\n");
+                            fprintf(stderr, "%-48s %12s\n", "pattern", "count");
+                            for (auto & p : v) fprintf(stderr, "%-48s %12lld\n", p.first.c_str(), (long long) p.second);
+                            fprintf(stderr, "total fused subgraphs: %lld, total nodes saved: %lld\n",
+                                    (long long) total_fusions, (long long) total_nodes_saved);
+                        });
+                    }
+                    std::string key;
+                    key += ggml_op_name(cgraph->nodes[prev_i]->op);
+                    for (int k = prev_i + 1; k <= i - 1; ++k) {
+                        key += "+";
+                        key += ggml_op_name(cgraph->nodes[k]->op);
+                    }
+                    fusion_counts[key]++;
+                    total_fusions++;
+                    total_nodes_saved += (i - prev_i - 1);
+                }
                 prev_i = i;
 
                 if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
@@ -4986,6 +5027,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:
                 case GGML_GLU_OP_SWIGLU_OAI:
+                case GGML_GLU_OP_SWIGLU_CLAMPED:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                     return ggml_is_contiguous_1(op->src[0]);
