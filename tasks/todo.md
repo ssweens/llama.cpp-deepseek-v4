@@ -67,10 +67,10 @@
 - [x] **HC_SPLIT_SINKHORN warp-parallel rewrite (commit `ab28d37c2`)**: original 1-thread-per-row kernel rewritten as 1 warp per row for the n_hc=4 DSv4 case. All sinkhorn row/col reductions via `__shfl_xor_sync`; no shared memory, no `__syncthreads`. Op time 96.85 ms (6.79%) → 26.38 ms (1.98%) (-73%). Long-prompt decode 49.5 → 56.4 t/s (+14%).
 - [x] **`GGML_GLU_OP_SWIGLU_CLAMPED` (commit `289fcb280`)**: new GLU variant for DSv4/Step3.5 swiglu clamping. Eliminates a 4-op (CLAMP+CLAMP+SILU+MUL) chain in `build_moe_ffn`. Decode 56.4 -> 57.1 t/s.
 - [x] **GLU op_params plumbed through fusion args (commit `9fa843249`)**: enables `MUL_MAT_ID + MUL_MAT_ID + GLU` fusion to fire for SWIGLU_CLAMPED (DSv4), and fixes a latent default-params bug for SWIGLU_OAI in the mmvq/mmf fused fast paths. Fusion summary now shows 86 MoE-FFN fusions per profile run (previously 0). Decode 57.1 -> 57.8 t/s. Net since original baseline: 33.8 -> 57.8 t/s = +71% decode.
+- [x] **`DSV4_FP8_KV_QUANTIZE` hardware conversion (commit `80c0d0a07`)**: replaced 127-iteration `expf()` linear search with `__nv_fp8_e4m3(float)` hardware FP8 conversion. Decode +8% across all prompt sizes (much bigger than the 1-2% the 2.6% profile share suggested - the inner loop was way more expensive than measured).
 - [ ] **Future smaller perf candidates**:
   1. HC_EXPAND (1.65%) + HC_WEIGHTED_SUM (1.55%): launch-overhead bound; only meaningful via fusion.
   2. `CPY` (7.05%) and `SET_ROWS` (3.89%): KV cache writes; some elidable via in-place views.
-  3. `DSV4_FP8_KV_QUANTIZE` (2.56%): custom FP8 quantize kernel; could be vectorized.
 
 **Cumulative DSv4 perf delta (438-token long prompt, IQ2_XS full GPU offload):**
 
