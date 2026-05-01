@@ -66,7 +66,11 @@
   1. `CONT` ops (8.9%): eliminate redundant `ggml_cont` calls in deepseek4.cpp where reshape/permute paths could chain without materializing.
   2. HC ops (9% combined: split-sinkhorn 6.2%, expand 1.4%, weighted-sum 1.4%): existing custom kernels with simple loops; could fuse and tile better.
   3. Op fusion: many small `ADD`/`MUL`/`CLAMP`/`GLU`/`UNARY` ops totaling ~10% — candidates for fusion via the existing ggml graph optimizer.
-- [x] **Phase 3: HIP/ROCm runtime validated on AMD Strix Halo (gfx1151)**. Built llama-completion against the HIP-only target. Ran IQ2_XS short prompt with `-ngl 8 -fa on` against a single AMD GPU (no CUDA visible). Produced correct coherent output ("3 apples ... give 2 ... 1 apple ... buy 5 more ...") at 8.57 tok/s decode, 20.68 tok/s prompt eval. Confirms `__shfl_xor_sync(width=32)` and `nv_bfloat16` paths work correctly on RDNA3 wave32 hardware via the existing CUDA→HIP translation. CDNA wave64 still untested (no hardware); should work via sub-warp semantics but worth validating when/if a CDNA system is available.
+- [x] **Phase 3: HIP/ROCm runtime validated on AMD Strix Halo (gfx1151)**. Built llama-completion against the HIP-only target. Two test configurations:
+  - `-ngl 8 -fa on`, IQ2_XS short prompt: coherent output at 8.57 tok/s decode (35/44 layers on CPU).
+  - `-ngl 99 -fa on` with `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`, IQ2_XS short prompt: coherent output at **13.30 tok/s decode, 32 tok/s prompt eval**. All 44 layers on the iGPU via unified memory. 79 GB model in shared RAM.
+  - Without UMA, the load silently stalls at 99% GPU memory pool because the iGPU treats the configured GPU pool as a separate region by default.
+  - Confirms `__shfl_xor_sync(width=32)` and `nv_bfloat16` paths work correctly on RDNA3 wave32 hardware via the existing CUDA→HIP translation. CDNA wave64 still untested (no hardware); should work via sub-warp semantics but worth validating when/if a CDNA system is available.
 - [ ] GCP: imatrix + logits generation on h100-4x
   - **Blocked on H100-4x spot capacity** — all configured zones stocked out
   - BF16 cache ready at `gs://test-quant-jobs/bf16-cache/deepseek-ai__DeepSeek-V4-Flash/`
