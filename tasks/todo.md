@@ -63,11 +63,25 @@
 - [x] **Phase 2b sparse kernel MMA optimization — not worth doing.** Per-op profiling on IQ2_XS full GPU offload shows `DSV4_SPARSE_ATTN` is only 2.48% of total compute time. The bottleneck is dense `MUL_MAT` (28%, cuBLAS) and MoE `MUL_MAT_ID` (12%, 256-expert top-8 dispatch). MMA tensor cores on sparse-attn would gain at most 2-3% TPS for 8-16 hours of CUDA template engineering. Closed.
 - [x] **Per-op profiler committed for future bottleneck discovery.** `GGML_CUDA_PROFILE_OPS=1` env var enables a `cudaStreamSynchronize`+chrono timing wrapper around `ggml_cuda_compute_forward`. Disables CUDA graphs (incompatible with mid-graph sync). Prints op-enum and DSv4-tensor-name-bucketed summaries on context destruction. Useful as a development tool when investigating perf regressions or new bottlenecks.
 - [x] **CONT reduction (commit `7013be05c`)**: 34 cont sites use a graph-build-time `cont_if_needed()` helper that skips materialization for already-contiguous inputs. CONT op share dropped from 8.89% to 1.02%; total measured compute -8%.
-- [x] **Graph reuse / `can_reuse()` (commit `3fd0394f7`)**: implemented `can_reuse()` for all four DSv4 `llm_graph_input_i` subclasses. Graph reuse rate went from 0 to 197/200 (98.5%); long-prompt decode jumped from 38.6 t/s to **49.5 t/s** (+28% from this single commit; +46% vs original baseline).
-- [ ] **Future perf-optimization candidates** (next, in priority order, but each is a smaller fraction now that graph reuse is fixed):
-  1. HC ops (9% combined: split-sinkhorn 6.79%, expand 1.53%, weighted-sum 1.45%): existing custom kernels with simple loops; could fuse and tile better.
-  2. Op fusion: many small `ADD`/`MUL`/`CLAMP`/`GLU`/`UNARY` ops totaling ~10% — candidates for fusion via the existing ggml graph optimizer.
-  3. `CPY` (6.9%) and `SET_ROWS` (3.9%) reductions: check whether some KV cache writes can be elided via in-place views.
+- [x] **Graph reuse / `can_reuse()` (commit `3fd0394f7`)**: implemented `can_reuse()` for all four DSv4 `llm_graph_input_i` subclasses. Graph reuse rate 0 → 197/200 (98.5%); long-prompt decode 38.6 → 49.5 t/s (+28%).
+- [x] **HC_SPLIT_SINKHORN warp-parallel rewrite (commit `ab28d37c2`)**: original 1-thread-per-row kernel rewritten as 1 warp per row for the n_hc=4 DSv4 case. All sinkhorn row/col reductions via `__shfl_xor_sync`; no shared memory, no `__syncthreads`. Op time 96.85 ms (6.79%) → 26.38 ms (1.98%) (-73%). Long-prompt decode 49.5 → 56.4 t/s (+14%).
+- [ ] **Future perf-optimization candidates** (each a small slice now that the big wins are landed):
+  1. HC_EXPAND (1.65%) + HC_WEIGHTED_SUM (1.55%): launch-overhead bound, kernels are already trivial. Only meaningful improvement would be op fusion.
+  2. Op fusion of small ADD/MUL/CLAMP/GLU/UNARY ops (~10% combined): partially handled by the existing ggml graph fusion infrastructure but DSv4-specific patterns may not be matched.
+  3. `CPY` (7.05%) and `SET_ROWS` (3.89%): KV cache writes; some elidable via in-place views.
+  4. `DSV4_FP8_KV_QUANTIZE` (2.56%): custom FP8 quantize kernel; could be vectorized.
+
+**Cumulative DSv4 perf delta (438-token long prompt, IQ2_XS full GPU offload):**
+
+  | variant                                    | prefill   | decode    |
+  | ------------------------------------------ | --------- | --------- |
+  | original baseline                          | 413 t/s   | 33.8 t/s  |
+  | + Phase 2a sparse-attn (warp-parallel)     | 384 t/s   | 37.6 t/s  |
+  | + CONT reduction                           | 402.8 t/s | 38.6 t/s  |
+  | + graph reuse (can_reuse)                  | 410.7 t/s | 49.5 t/s  |
+  | + HC_SPLIT_SINKHORN warp-parallel          | 413.2 t/s | **56.4 t/s**  |
+
+  Net delta: prefill ~equal, **decode +66.7%**.
 - [x] **Phase 3: HIP/ROCm runtime validated on AMD Strix Halo (gfx1151)**. Built llama-completion against the HIP-only target with `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` for full offload on the iGPU. Long-prompt (438-token isolation prompt) numbers, IQ2_XS, full offload (-ngl 99 -fa on):
   - **HIP / Strix Halo iGPU**: 77 tok/s prefill, 12 tok/s decode
   - **CUDA / 2x 5090 + 3090**: 413 tok/s prefill, 38 tok/s decode
