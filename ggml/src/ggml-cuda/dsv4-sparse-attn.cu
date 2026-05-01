@@ -82,18 +82,16 @@ static __global__ void dsv4_sparse_attn_kernel(
     static_assert(BLOCK_THREADS % WARP_SIZE_LOCAL == 0,
                   "BLOCK_THREADS must be a multiple of warp size");
     constexpr int N_WARPS          = BLOCK_THREADS / WARP_SIZE_LOCAL;
-    // CHUNK_KV = N_WARPS: each warp processes its own KV position concurrently,
-    // so we get one block sync per chunk of N_WARPS KV positions instead of one
-    // sync per position. This is a clear win for decode (n_tokens=1, ~15% TPS
-    // improvement at full GPU offload) and a small regression for prompt eval
-    // (~7% slower) due to higher shared-memory pressure reducing SM occupancy
-    // when many blocks are in flight.
+    // CHUNK_KV controls per-chunk KV fan-in.
     //
-    // Decode is the dominant inference cost so the trade-off is favorable. A
-    // future Phase 2b MMA-based kernel can recover the prompt-eval throughput
-    // (and exceed it) by processing many more KV positions per iteration via
-    // tensor cores.
+    // CUDA path: keep phase-2a decode-oriented CHUNK_KV=N_WARPS.
+    // HIP path: reduce fan-in to lower LDS/register pressure and improve
+    // occupancy on gfx1151 iGPU workloads.
+#ifdef GGML_USE_HIP
+    constexpr int CHUNK_KV         = 2;
+#else
     constexpr int CHUNK_KV         = N_WARPS;
+#endif
     static_assert(CHUNK_KV >= 1 && CHUNK_KV <= N_WARPS,
                   "CHUNK_KV must be in [1, N_WARPS] so each slot has a dedicated warp");
     constexpr int ELEMS_PER_THREAD = HEAD_DIM_KV / BLOCK_THREADS;

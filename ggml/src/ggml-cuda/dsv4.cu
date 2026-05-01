@@ -219,6 +219,76 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn_n4(
     }
 }
 
+#ifdef GGML_USE_HIP
+// HIP-specific variant: two rows per block (2 warps) for n_hc=4.
+// Improves occupancy / launch efficiency on gfx1151 while keeping the same
+// math and numerics as the 1-warp-per-row kernel.
+static __global__ void kernel_dsv4_hc_split_sinkhorn_n4x2(
+        const float * __restrict__ mixes,
+        const float * __restrict__ scale,
+        const float * __restrict__ base,
+        float       * __restrict__ dst,
+        int64_t n_rows,
+        int64_t nb01,
+        int64_t nb1,
+        int     sinkhorn_iters,
+        float   epsv) {
+    constexpr int n_hc = 4;
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+    const int64_t row = (int64_t) blockIdx.x * 2 + warp_id;
+    if (row >= n_rows || lane >= 24) return;
+
+    const float * mix = (const float *)((const char *) mixes + row * nb01);
+    float       * out = (float       *)((      char *) dst   + row * nb1);
+
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    float val = 0.0f;
+    if (lane < 16) {
+        const int off = 2 * n_hc + lane;
+        val = mix[off] * comb_scale + base[off];
+    } else if (lane < 20) {
+        const int off = lane - 16;
+        const float z = mix[off] * pre_scale + base[off];
+        val = 1.0f / (1.0f + expf(-z)) + epsv;
+    } else {
+        const int off = n_hc + (lane - 20);
+        const float z = mix[off] * post_scale + base[off];
+        val = 2.0f / (1.0f + expf(-z));
+    }
+
+    if (lane < 16) {
+        const int dst_hc = lane / 4;
+        const int src_hc = lane % 4;
+        float row_max = val;
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, 1, 4));
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, 2, 4));
+        float ev = expf(val - row_max);
+        float row_sum = warp_row_sum_4(ev, dst_hc);
+        val = ev / row_sum + epsv;
+        float col_sum = warp_col_sum_4(val, src_hc);
+        val = val / (col_sum + epsv);
+        for (int it = 1; it < sinkhorn_iters; ++it) {
+            float rs = warp_row_sum_4(val, dst_hc);
+            val = val / (rs + epsv);
+            float cs = warp_col_sum_4(val, src_hc);
+            val = val / (cs + epsv);
+        }
+    }
+
+    if (lane < 16) {
+        out[2 * n_hc + lane] = val;
+    } else if (lane < 20) {
+        out[lane - 16] = val;
+    } else {
+        out[n_hc + (lane - 20)] = val;
+    }
+}
+#endif
+
 void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * mixes = dst->src[0];
     const struct ggml_tensor * scale = dst->src[1];
@@ -241,12 +311,21 @@ void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, struct
     float       * dst_d   = (float       *) dst->data;
 
     if (n_hc == 4) {
+#ifdef GGML_USE_HIP
+        const unsigned int nblocks = (unsigned int) ((n_rows + 1) / 2);
+        kernel_dsv4_hc_split_sinkhorn_n4x2<<<nblocks, 64, 0, ctx.stream()>>>(
+            mixes_d, scale_d, base_d, dst_d,
+            n_rows,
+            (int64_t) mixes->nb[1], (int64_t) dst->nb[1],
+            sinkhorn_iters, epsv);
+#else
         // Warp-parallel fast path: one warp per row.
         kernel_dsv4_hc_split_sinkhorn_n4<<<(unsigned int) n_rows, 32, 0, ctx.stream()>>>(
             mixes_d, scale_d, base_d, dst_d,
             n_rows,
             (int64_t) mixes->nb[1], (int64_t) dst->nb[1],
             sinkhorn_iters, epsv);
+#endif
         return;
     }
 
