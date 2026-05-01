@@ -51,6 +51,8 @@ static __global__ void mul_mat_vec_f(
     bool use_bias = false;
     bool use_gate_bias = false;
     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
+    float       glu_alpha = 1.702f;
+    float       glu_limit = 7.0f;
     const T * gate_x = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
@@ -59,7 +61,9 @@ static __global__ void mul_mat_vec_f(
         use_gate = fusion.gate != nullptr;
         use_bias = fusion.x_bias != nullptr;
         use_gate_bias = fusion.gate_bias != nullptr;
-        glu_op = fusion.glu_op;
+        glu_op    = fusion.glu_op;
+        glu_alpha = fusion.glu_alpha;
+        glu_limit = fusion.glu_limit;
 
         if (use_gate) {
             gate_x = static_cast<const T *>(fusion.gate);
@@ -357,7 +361,15 @@ static __global__ void mul_mat_vec_f(
                     value *= ggml_cuda_op_gelu_single(gate_value);
                     break;
                 case GGML_GLU_OP_SWIGLU_OAI: {
-                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value, glu_alpha, glu_limit);
+                    break;
+                }
+                case GGML_GLU_OP_SWIGLU_CLAMPED: {
+                    // gate = clamp(gate_value, -INF, +limit), up = clamp(value, -limit, +limit), out = silu(gate) * up
+                    const float l = glu_limit;
+                    float gate = fminf(gate_value, l);
+                    float up   = fmaxf(fminf(value, l), -l);
+                    value = (gate / (1.0f + expf(-gate))) * up;
                     break;
                 }
                 default:
@@ -369,7 +381,7 @@ static __global__ void mul_mat_vec_f(
     dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, glu_alpha, glu_limit, gate_x, x_bias, gate_bias, sumf_gate);
     }
 }
 
@@ -667,7 +679,9 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
-        fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_op    = fusion->glu_op;
+        fusion_local.glu_alpha = fusion->glu_alpha;
+        fusion_local.glu_limit = fusion->glu_limit;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

@@ -1468,10 +1468,17 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    // GLU op_params, populated when glu_op needs them.
+    //   SWIGLU_OAI:     glu_alpha = alpha (default 1.702f), glu_limit = limit (default 7.0f)
+    //   SWIGLU_CLAMPED: glu_limit = limit (clamp range), glu_alpha unused
+    float glu_alpha = 1.702f;
+    float glu_limit = 7.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    float glu_alpha = 1.702f;
+    float glu_limit = 7.0f;
 };

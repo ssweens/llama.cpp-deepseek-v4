@@ -572,7 +572,15 @@ static __global__ void mul_mat_vec_q(
                             result *= ggml_cuda_op_gelu_single(gate_value);
                             break;
                         case GGML_GLU_OP_SWIGLU_OAI: {
-                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                            result = ggml_cuda_op_swiglu_oai_single(gate_value, result, fusion.glu_alpha, fusion.glu_limit);
+                            break;
+                        }
+                        case GGML_GLU_OP_SWIGLU_CLAMPED: {
+                            // gate = clamp(gate_value, -INF, +limit), up = clamp(result, -limit, +limit), out = silu(gate) * up
+                            const float limit = fusion.glu_limit;
+                            float gate = fminf(gate_value, limit);
+                            float up   = fmaxf(fminf(result, limit), -limit);
+                            result = (gate / (1.0f + expf(-gate))) * up;
                             break;
                         }
                         default:
@@ -1074,7 +1082,9 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
-        fusion_local.glu_op = fusion->glu_op;
+        fusion_local.glu_op    = fusion->glu_op;
+        fusion_local.glu_alpha = fusion->glu_alpha;
+        fusion_local.glu_limit = fusion->glu_limit;
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

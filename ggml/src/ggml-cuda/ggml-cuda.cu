@@ -2229,6 +2229,24 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+// Populate glu_alpha / glu_limit on a fusion-args struct from the GLU op's
+// op_params. Different GLU variants use different params slots, so this
+// keeps the fused kernels honest about non-default values.
+static inline void ggml_cuda_fill_fusion_glu_params(ggml_cuda_mm_fusion_args_host & f, const ggml_tensor * glu) {
+    f.glu_op = ggml_get_glu_op(glu);
+    switch (f.glu_op) {
+        case GGML_GLU_OP_SWIGLU_OAI:
+            f.glu_alpha = ggml_get_op_params_f32(glu, 2);
+            f.glu_limit = ggml_get_op_params_f32(glu, 3);
+            break;
+        case GGML_GLU_OP_SWIGLU_CLAMPED:
+            f.glu_limit = ggml_get_op_params_f32(glu, 2);
+            break;
+        default:
+            break;
+    }
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2293,14 +2311,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    // SWIGLU_CLAMPED intentionally NOT in this list yet. The fused mmvq /
-    // mmq paths read GLU params from a hardcoded default in the kernel
-    // (latent issue: SWIGLU_OAI also reads defaults but happens to match
-    // GPT-OSS defaults). For SWIGLU_CLAMPED with model-specific `limit`
-    // (e.g. DSv4 = 10.0), passing through this fast path would silently
-    // miscompute. Until the fusion args struct plumbs `glu_limit`, restrict
-    // to the unfused dispatch path which reads params from op_params.
-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = {
+        GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMPED };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -4137,7 +4149,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate      = gate_n->src[0];
                                 fusion_data.x_bias    = up_bias_tensor;
                                 fusion_data.gate_bias = gate_bias_tensor;
-                                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                                ggml_cuda_fill_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4150,7 +4162,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                 fusion_data.gate      = gate_n->src[0];
                                 fusion_data.x_bias    = up_bias_tensor;
                                 fusion_data.gate_bias = gate_bias_tensor;
-                                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                                ggml_cuda_fill_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4174,7 +4186,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
-                                fusion_data.glu_op = ggml_get_glu_op(glu);
+                                ggml_cuda_fill_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
@@ -4185,7 +4197,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                                 ggml_cuda_mm_fusion_args_host fusion_data{};
                                 fusion_data.gate   = gate->src[0];
-                                fusion_data.glu_op = ggml_get_glu_op(glu);
+                                ggml_cuda_fill_fusion_glu_params(fusion_data, glu);
 
                                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                                 fused_mul_mat_vec = true;
