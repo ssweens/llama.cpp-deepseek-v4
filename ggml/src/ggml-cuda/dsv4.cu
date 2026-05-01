@@ -111,6 +111,114 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Warp-parallel HC_SPLIT_SINKHORN for the common n_hc=4 case.
+//
+// Layout (per warp, one row):
+//   lanes  0..15 : 4x4 coupling matrix c, lane = src_hc + dst_hc*4
+//   lanes 16..19 : pre[lane-16]
+//   lanes 20..23 : post[lane-20]
+//   lanes 24..31 : idle
+//
+// Each warp processes one row entirely in registers. Sinkhorn row/col
+// normalisations use __shfl_xor_sync with width=4 (row reduce: lanes within a
+// row of 4 share the same dst_hc) and a 2-step strided reduce (col reduce:
+// lanes within a col of 4 share the same src_hc, separated by 4 lane indices).
+//
+// Replaces the original 1-thread-per-row kernel that was wasting warp/SM slots
+// on this small (24-element) per-row computation.
+// ----------------------------------------------------------------------------
+static __device__ __forceinline__ float warp_row_sum_4(float v, int dst_hc) {
+    GGML_UNUSED(dst_hc);
+    // Reduce over lanes that share the same dst_hc (i.e. within a row of 4).
+    v += __shfl_xor_sync(0xffffffff, v, 1, 4);
+    v += __shfl_xor_sync(0xffffffff, v, 2, 4);
+    return v;
+}
+
+static __device__ __forceinline__ float warp_col_sum_4(float v, int src_hc) {
+    GGML_UNUSED(src_hc);
+    // Reduce over lanes that share the same src_hc, separated by stride 4.
+    // Use the full 32-lane width but xor with 4 / 8 to add the corresponding
+    // lane from the next two rows (lanes 0..15 are the 4x4 matrix region).
+    v += __shfl_xor_sync(0xffffffff, v, 4, 16);
+    v += __shfl_xor_sync(0xffffffff, v, 8, 16);
+    return v;
+}
+
+static __global__ void kernel_dsv4_hc_split_sinkhorn_n4(
+        const float * __restrict__ mixes,
+        const float * __restrict__ scale,
+        const float * __restrict__ base,
+        float       * __restrict__ dst,
+        int64_t n_rows,
+        int64_t nb01,
+        int64_t nb1,
+        int     sinkhorn_iters,
+        float   epsv) {
+    constexpr int n_hc = 4;
+    const int64_t row = blockIdx.x;
+    if (row >= n_rows) return;
+    const int lane = threadIdx.x; // warp size = 32
+    if (lane >= 24) return;       // lanes 24..31 idle
+
+    const float * mix = (const float *)((const char *) mixes + row * nb01);
+    float       * out = (float       *)((      char *) dst   + row * nb1);
+
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    float val = 0.0f;
+    if (lane < 16) {
+        // 4x4 matrix element. Mixes layout: matrix starts at offset 2*n_hc.
+        const int off = 2 * n_hc + lane;
+        val = mix[off] * comb_scale + base[off];
+    } else if (lane < 20) {
+        // pre: sigmoid(mix*pre_scale + base) + epsv
+        const int off = lane - 16;
+        const float z = mix[off] * pre_scale + base[off];
+        val = 1.0f / (1.0f + expf(-z)) + epsv;
+    } else {
+        // post: 2*sigmoid(mix*post_scale + base)
+        const int off = n_hc + (lane - 20);
+        const float z = mix[off] * post_scale + base[off];
+        val = 2.0f / (1.0f + expf(-z));
+    }
+
+    // ------ Initial softmax along rows for the 4x4 matrix ------
+    if (lane < 16) {
+        const int dst_hc = lane / 4;
+        const int src_hc = lane % 4;
+        // row max (reduce across lanes with same dst_hc, width=4 within group of 4)
+        float row_max = val;
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, 1, 4));
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, 2, 4));
+        float ev = expf(val - row_max);
+        float row_sum = warp_row_sum_4(ev, dst_hc);
+        val = ev / row_sum + epsv;
+        // initial column normalise
+        float col_sum = warp_col_sum_4(val, src_hc);
+        val = val / (col_sum + epsv);
+        // remaining sinkhorn iterations
+        for (int it = 1; it < sinkhorn_iters; ++it) {
+            float rs = warp_row_sum_4(val, dst_hc);
+            val = val / (rs + epsv);
+            float cs = warp_col_sum_4(val, src_hc);
+            val = val / (cs + epsv);
+        }
+    }
+
+    // Write back: matrix at offset 2*n_hc, pre at 0, post at n_hc.
+    if (lane < 16) {
+        out[2 * n_hc + lane] = val;
+    } else if (lane < 20) {
+        out[lane - 16] = val;
+    } else {
+        out[n_hc + (lane - 20)] = val;
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * mixes = dst->src[0];
     const struct ggml_tensor * scale = dst->src[1];
@@ -132,6 +240,17 @@ void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, struct
     const float * base_d  = (const float *) base->data;
     float       * dst_d   = (float       *) dst->data;
 
+    if (n_hc == 4) {
+        // Warp-parallel fast path: one warp per row.
+        kernel_dsv4_hc_split_sinkhorn_n4<<<(unsigned int) n_rows, 32, 0, ctx.stream()>>>(
+            mixes_d, scale_d, base_d, dst_d,
+            n_rows,
+            (int64_t) mixes->nb[1], (int64_t) dst->nb[1],
+            sinkhorn_iters, epsv);
+        return;
+    }
+
+    // Generic fallback: 1 thread per row.
     const int nth = std::min(256, (int)n_rows);
     const int nblocks = ((int)n_rows + nth - 1) / nth;
 
