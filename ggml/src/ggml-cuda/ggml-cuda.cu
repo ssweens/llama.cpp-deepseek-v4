@@ -83,6 +83,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <chrono>
+#include <unordered_map>
+#include <functional>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2627,7 +2630,109 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// Dev-only op profiler: GGML_CUDA_PROFILE_OPS=1 records per-op cumulative time
+// and prints a summary on program exit. Adds one cudaEvent pair per dispatched
+// op; serializes the stream within an op (the cudaEventSynchronize) but not
+// across ops.
+struct dsv4_op_profiler {
+    static bool enabled() {
+        static const bool e = (getenv("GGML_CUDA_PROFILE_OPS") != nullptr);
+        return e;
+    }
+    struct entry { double ms = 0.0; int64_t calls = 0; };
+    std::unordered_map<int, entry> by_op;
+    std::unordered_map<std::string, entry> by_tag;
+
+    static dsv4_op_profiler & get() {
+        static dsv4_op_profiler p;
+        return p;
+    }
+
+    void record(cudaStream_t stream, struct ggml_tensor * dst,
+                const std::function<void()> & dispatch) {
+        // CUDA Graph capture is incompatible with cudaStreamSynchronize. If we're
+        // inside a graph capture region, just dispatch without timing.
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &capture);
+        if (capture != cudaStreamCaptureStatusNone) {
+            dispatch();
+            return;
+        }
+        // Sync the stream first so we don't measure leftover work from other ops.
+        cudaStreamSynchronize(stream);
+        const auto t0 = std::chrono::steady_clock::now();
+        dispatch();
+        cudaStreamSynchronize(stream);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        auto & e = by_op[(int) dst->op];
+        e.ms += ms;
+        e.calls += 1;
+        const char * name = ggml_get_name(dst);
+        if (name) {
+            std::string tag;
+            if      (strstr(name, "attn_sparse"))       tag = "attn_sparse";
+            else if (strstr(name, "attn_indexer"))      tag = "attn_indexer";
+            else if (strstr(name, "attn_compressor"))   tag = "attn_compressor";
+            else if (strstr(name, "compressor"))        tag = "compressor_other";
+            else if (strstr(name, "indexer"))           tag = "indexer_other";
+            else if (strstr(name, "ffn_down_exps"))     tag = "moe.ffn_down";
+            else if (strstr(name, "ffn_gate_exps"))     tag = "moe.ffn_gate";
+            else if (strstr(name, "ffn_up_exps"))       tag = "moe.ffn_up";
+            else if (strstr(name, "ffn_gate_inp"))      tag = "moe.router";
+            else if (strstr(name, "_shexp"))            tag = "shared_expert";
+            else if (strstr(name, "hc_"))               tag = "hc_split";
+            else if (strstr(name, "attn"))              tag = "attn_other";
+            else if (strstr(name, "ffn"))               tag = "ffn_other";
+            else                                        tag = "_other";
+            auto & en = by_tag[tag];
+            en.ms += ms;
+            en.calls += 1;
+        }
+    }
+    ~dsv4_op_profiler() {
+        if (!enabled() || by_op.empty()) return;
+        std::vector<std::pair<int, entry>> ops(by_op.begin(), by_op.end());
+        std::sort(ops.begin(), ops.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+        double total = 0.0;
+        for (auto & p : ops) total += p.second.ms;
+        fprintf(stderr, "\n=== DSv4 op profile (GGML_CUDA_PROFILE_OPS) ===\n");
+        fprintf(stderr, "%-32s %12s %10s %8s\n", "op", "total_ms", "calls", "pct");
+        for (auto & p : ops) {
+            fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                    ggml_op_name((ggml_op) p.first), p.second.ms,
+                    (long long) p.second.calls,
+                    (total > 0.0) ? (100.0 * p.second.ms / total) : 0.0);
+        }
+        if (!by_tag.empty()) {
+            std::vector<std::pair<std::string, entry>> tags(by_tag.begin(), by_tag.end());
+            std::sort(tags.begin(), tags.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+            fprintf(stderr, "\nDSv4 tagged buckets (by tensor name substring):\n");
+            fprintf(stderr, "%-32s %12s %10s %8s\n", "tag", "total_ms", "calls", "pct");
+            for (auto & p : tags) {
+                fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                        p.first.c_str(), p.second.ms, (long long) p.second.calls,
+                        (total > 0.0) ? (100.0 * p.second.ms / total) : 0.0);
+            }
+        }
+        fprintf(stderr, "=== total measured: %.2f ms ===\n", total);
+    }
+};
+
+static bool ggml_cuda_compute_forward_dispatch(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (dsv4_op_profiler::enabled()) {
+        bool ok = false;
+        dsv4_op_profiler::get().record(ctx.stream(), dst, [&]() {
+            ok = ggml_cuda_compute_forward_dispatch(ctx, dst);
+        });
+        return ok;
+    }
+    return ggml_cuda_compute_forward_dispatch(ctx, dst);
+}
+
+static bool ggml_cuda_compute_forward_dispatch(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4247,6 +4352,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
+    // Profiler is incompatible with CUDA graph capture (cudaStreamSynchronize
+    // is not allowed during capture). Disable graphs when profiling is enabled.
+    if (dsv4_op_profiler::enabled()) {
+        // Skip the rest of the graph-enable logic; use_cuda_graph stays false.
+    } else {
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -4277,6 +4387,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    } // close: if (dsv4_op_profiler::enabled()) ... else ...
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
