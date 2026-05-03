@@ -423,6 +423,38 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
 
+    // DeepSeek-V4 protection: its non-expert tensors (MLA attention, shared expert,
+    // router, hyper-connections, indexer, compressor) are a tiny fraction of total
+    // params but control coherence. When using sub-4bpw recipes, protect them
+    // at Q6_K while letting the massive routed-expert FFN tensors get crushed.
+    //
+    // Routed expert tensors are identified by "_exps" suffix (e.g. ffn_gate_exps,
+    // ffn_down_exps, ffn_up_exps). Everything else — including shared expert
+    // (_shexp), router (gate_inp), MLA attention, hyper-connections (hc_),
+    // indexer, and compressor tensors — gets protected.
+    const bool is_dsv4 = arch == LLM_ARCH_DEEPSEEK4;
+    const bool is_sub4bpw_quant =
+        ftype == LLAMA_FTYPE_MOSTLY_TQ1_0   || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0   ||
+        ftype == LLAMA_FTYPE_MOSTLY_Q2_K    || ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S  ||
+        ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   ||
+        ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS  ||
+        ftype == LLAMA_FTYPE_MOSTLY_IQ2_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
+        ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS  ||
+        ftype == LLAMA_FTYPE_MOSTLY_IQ3_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ3_M   ||
+        ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S  || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M  ||
+        ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L;
+
+    if (is_dsv4 && is_sub4bpw_quant &&
+        category != tensor_category::OUTPUT && category != tensor_category::TOKEN_EMBD) {
+        const bool is_routed_expert = name.find("_exps") != std::string::npos;
+        if (!is_routed_expert) {
+            // Non-expert DeepSeek-V4 tensor: protect at Q6_K
+            // (output and token_embd are handled separately above/below)
+            return GGML_TYPE_Q6_K;
+        }
+        // Routed expert tensors fall through to get the requested quant type
+    }
+
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
     };
