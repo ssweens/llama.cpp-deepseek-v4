@@ -5272,6 +5272,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     // The CUDA kernel launches one block per (output_row, super_block);
                     // a row with elements not aligned to QK_K cannot be addressed cleanly.
                     case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
                     case GGML_TYPE_Q6_K:
                         return op->src[0]->ne[0] % QK_K == 0;
                     default:
