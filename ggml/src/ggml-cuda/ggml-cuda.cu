@@ -5268,6 +5268,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                         return true;
+                    // K-quants: only types where row size is divisible by QK_K (256).
+                    // The CUDA kernel launches one block per (output_row, super_block);
+                    // a row with elements not aligned to QK_K cannot be addressed cleanly.
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q6_K:
+                        return op->src[0]->ne[0] % QK_K == 0;
                     default:
                         return false;
                 }

@@ -2,6 +2,112 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+// ----------------------------------------------------------------------------
+// K-quant GET_ROWS support
+//
+// The 2-elements-per-call dequantize kernels in dequantize.cuh do not work for
+// K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) because their super-block layout
+// stores per-sub-block scales/mins that must be read in chunks aligned to a
+// full 256-element super-block. Without K-quant GET_ROWS, every token-embedding
+// lookup on a K-quant token_embd weight forces a CPU fallback in the scheduler,
+// inserting a backend split per forward pass. For DSv4 (token_embd is Q2_K in
+// Q2_K_S builds, Q6_K in IQ-quant builds via the non-expert protect commit),
+// this fired on every forward pass.
+//
+// Strategy: for each (output_row, super_block_within_row) we launch one CUDA
+// block whose threads dequantize that super-block directly into the output,
+// using the same per-block dequant logic as dequantize_block_qX_K in convert.cu.
+// Grid: (ne00 / QK_K, ne10, ne11*ne12). Block: 64 threads (matches the existing
+// convert kernels' assumption).
+// ----------------------------------------------------------------------------
+
+// Helper: resolve source super-block pointer for an output (i10, sb) using
+// the index in src1 and the per-axis strides of the destination.
+static __device__ __forceinline__ const char * kquant_src_super_block_ptr(
+        const void * __restrict__ src0,
+        const int32_t * __restrict__ src1,
+        size_t sb_size_bytes,
+        int i10, int i11, int i12,
+        size_t s10, size_t s11, size_t s12,
+        size_t nb01, size_t nb02, size_t nb03,
+        int sb) {
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    return (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03 + sb*sb_size_bytes;
+}
+
+template<typename dst_t>
+static __global__ void k_get_rows_q2_K(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t /*ne00*/,
+        const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int sb  = blockIdx.x;        // super-block index within the row
+    const int i10 = blockIdx.y;        // which output row
+    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+        const int i11 = z / ne12;
+        const int i12 = z % ne12;
+
+        const block_q2_K * sx = (const block_q2_K *) kquant_src_super_block_ptr(
+            src0, src1, sizeof(block_q2_K),
+            i10, i11, i12, s10, s11, s12, nb01, nb02, nb03, sb);
+
+        const int64_t tid = threadIdx.x;
+        const int64_t n   = tid/32;
+        const int64_t l   = tid - 32*n;
+        const int64_t is  = 8*n + l/16;
+
+        const uint8_t q = sx->qs[32*n + l];
+        dst_t * y = dst + i10*s1 + i11*s2 + i12*s3 + sb*QK_K + 128*n;
+
+        const float dall = __low2half(sx->dm);
+        const float dmin = __high2half(sx->dm);
+        y[l+ 0] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (sx->scales[is+0] >> 4));
+        y[l+32] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (sx->scales[is+2] >> 4));
+        y[l+64] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (sx->scales[is+4] >> 4));
+        y[l+96] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (sx->scales[is+6] >> 4));
+    }
+}
+
+template<typename dst_t>
+static __global__ void k_get_rows_q6_K(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t /*ne00*/,
+        const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int sb  = blockIdx.x;
+    const int i10 = blockIdx.y;
+    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+        const int i11 = z / ne12;
+        const int i12 = z % ne12;
+
+        const block_q6_K * sx = (const block_q6_K *) kquant_src_super_block_ptr(
+            src0, src1, sizeof(block_q6_K),
+            i10, i11, i12, s10, s11, s12, nb01, nb02, nb03, sb);
+
+        const int64_t tid = threadIdx.x;
+        const int64_t ip  = tid/32;
+        const int64_t il  = tid - 32*ip;
+        const int64_t is  = 8*ip + il/16;
+
+        dst_t * y = dst + i10*s1 + i11*s2 + i12*s3 + sb*QK_K + 128*ip + il;
+
+        const float d = sx->d;
+
+        const uint8_t * ql = sx->ql + 64*ip + il;
+        const uint8_t   qh = sx->qh[32*ip + il];
+        const int8_t  * sc = sx->scales + is;
+
+        y[ 0] = ggml_cuda_cast<dst_t>(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+        y[32] = ggml_cuda_cast<dst_t>(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+        y[64] = ggml_cuda_cast<dst_t>(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+        y[96] = ggml_cuda_cast<dst_t>(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -155,6 +261,37 @@ static void get_rows_cuda_float(
         s10, s11, s12/*, s13*/);
 }
 
+template<typename kernel_t, typename dst_t>
+static void get_rows_cuda_kquant(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        kernel_t kernel,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int super_blocks_per_row = ne00 / QK_K;
+    // 64 threads per block matches the existing dequantize_block_qX_K kernels.
+    const dim3 block_dims(64, 1, 1);
+    const dim3 block_nums((unsigned) super_blocks_per_row,
+                          (unsigned) std::min<int64_t>(ne10, UINT16_MAX),
+                          (unsigned) std::min<int64_t>(ne11*ne12, UINT16_MAX));
+
+    const size_t s1  = nb1  / sizeof(dst_t);
+    const size_t s2  = nb2  / sizeof(dst_t);
+    const size_t s3  = nb3  / sizeof(dst_t);
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    kernel<<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d,
+        ne00, ne11, ne12,
+        s1, s2, s3,
+        nb01, nb02, nb03,
+        s10, s11, s12);
+}
+
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
@@ -203,8 +340,18 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q2_K:
+            get_rows_cuda_kquant(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3,
+                k_get_rows_q2_K<dst_t>, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            get_rows_cuda_kquant(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3,
+                k_get_rows_q6_K<dst_t>, stream);
+            break;
         default:
-            // TODO: k-quants
+            // TODO: remaining K-quants (Q3_K, Q4_K, Q5_K) and IQ-quants.
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;
     }
