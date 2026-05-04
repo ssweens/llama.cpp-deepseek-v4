@@ -3344,16 +3344,56 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+        // The mul_mat_id slow path (per-expert loop with cudaStreamSynchronize)
+        // is incompatible with CUDA graph capture. We need to disable graphs
+        // only when the dispatcher would actually take that path; the previous
+        // check disabled graphs whenever MMVQ wouldn't be used, but missed the
+        // fact that MMQ and MMF are also stream-sync-free fast paths.
+        //
+        // Mirror the dispatch logic in ggml_cuda_mul_mat_id():
+        //   * MMVQ:  ne2 <= MMVQ_MAX_BATCH_SIZE && ne2 <= mmvq_mmid_max && quantized
+        //   * MMVF:  ne2 <= MMVQ_MAX_BATCH_SIZE && !quantized && AMD
+        //   * MMQ:   ggml_cuda_should_use_mmq(...)
+        //   * MMF:   ggml_cuda_should_use_mmf(..., /*mul_mat_id=*/true)
+        //   * else:  slow path -- graphs must be disabled.
+        // For high-expert-count MoE (DSv4 256 experts, Mixtral-class >=64),
+        // the MMQ path keeps prefill graph-eligible -- a ~10x prefill win.
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-                // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+            const ggml_tensor * mmid_src0 = node->src[0];
+            const ggml_tensor * mmid_src1 = node->src[1];
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(mmid_src0->type, cc);
+            const int64_t ne2 = node->ne[2];
+            const int64_t ne12 = mmid_src1->ne[2];
+            const int64_t n_experts = mmid_src0->ne[2];
+            const bool quant = ggml_is_quantized(mmid_src0->type);
+            const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+            bool fast_path = false;
+            // MMVQ
+            if (ne2 <= MMVQ_MAX_BATCH_SIZE && quant && ne2 <= mmvq_mmid_max) {
+                fast_path = true;
+            }
+            // MMVF (AMD only, non-quant)
+            else if (ne2 <= MMVQ_MAX_BATCH_SIZE && !quant && GGML_CUDA_CC_IS_AMD(cc)) {
+                fast_path = true;
+            }
+            // MMQ
+            else if (ggml_cuda_should_use_mmq(mmid_src0->type, cc, ne12, n_experts)) {
+                fast_path = true;
+            }
+            // MMF
+            else if (ggml_cuda_should_use_mmf(mmid_src0->type, cc, warp_size,
+                                              mmid_src0->ne, mmid_src0->nb,
+                                              mmid_src1->ne[2], /*mul_mat_id=*/true)) {
+                fast_path = true;
+            }
+            if (!fast_path) {
                 use_cuda_graph = false;
 #ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs (mul_mat_id slow path: "
+                               "type=%s ne2=%lld ne12=%lld n_experts=%lld)\n",
+                               __func__, ggml_type_name(mmid_src0->type),
+                               (long long) ne2, (long long) ne12, (long long) n_experts);
 #endif
             }
         }

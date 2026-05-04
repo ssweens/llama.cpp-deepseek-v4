@@ -318,6 +318,18 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #endif //GGML_CUDA_FORCE_MMQ
 
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        // High expert counts: prefer MMQ regardless of ne11. The cuBLAS-based
+        //   MUL_MAT_ID slow path issues cudaStreamSynchronize, which disables
+        //   CUDA graphs for the whole graph (see [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+        //   in ggml-cuda.cu). For MoE models like DSv4 (256 routed experts) and
+        //   Mixtral-class (>=64 experts), prefill ubatches >= MMVQ_MMID_MAX
+        //   would otherwise force every kernel launch through cudaLaunchKernel
+        //   instead of graph replay -- a ~10x prefill regression.
+        // This rule mirrors the established AMD MFMA / RDNA3 paths below which
+        //   already do `n_experts >= 64 -> return true` for the same reason.
+        if (n_experts >= 64) {
+            return true;
+        }
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
 
