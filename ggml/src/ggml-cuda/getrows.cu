@@ -51,15 +51,15 @@ template<typename dst_t>
 static __global__ void k_get_rows_q2_K(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t /*ne00*/,
-        const int64_t ne11, const int64_t ne12,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
     const int sb  = blockIdx.x;        // super-block index within the row
-    const int i10 = blockIdx.y;        // which output row
-    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
-        const int i11 = z / ne12;
-        const int i12 = z % ne12;
+    for (int64_t i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y) { // which output row
+        for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
 
         const block_q2_K * sx = (const block_q2_K *) kquant_src_super_block_ptr(
             src0, src1, sizeof(block_q2_K),
@@ -80,21 +80,22 @@ static __global__ void k_get_rows_q2_K(
         y[l+64] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (sx->scales[is+4] >> 4));
         y[l+96] = ggml_cuda_cast<dst_t>(dall * (sx->scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (sx->scales[is+6] >> 4));
     }
+    }
 }
 
 template<typename dst_t>
 static __global__ void k_get_rows_q3_K(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t /*ne00*/,
-        const int64_t ne11, const int64_t ne12,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
     const int sb  = blockIdx.x;
-    const int i10 = blockIdx.y;
-    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
-        const int i11 = z / ne12;
-        const int i12 = z % ne12;
+    for (int64_t i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y) {
+        for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
 
         const block_q3_K * sx = (const block_q3_K *) kquant_src_super_block_ptr(
             src0, src1, sizeof(block_q3_K),
@@ -125,21 +126,22 @@ static __global__ void k_get_rows_q3_K(
             y[l] = ggml_cuda_cast<dst_t>(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
         }
     }
+    }
 }
 
 template<typename dst_t>
 static __global__ void k_get_rows_q4_K(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t /*ne00*/,
-        const int64_t ne11, const int64_t ne12,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
     const int sb  = blockIdx.x;
-    const int i10 = blockIdx.y;
-    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
-        const int i11 = z / ne12;
-        const int i12 = z % ne12;
+    for (int64_t i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y) {
+        for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
 
         const block_q4_K * sx = (const block_q4_K *) kquant_src_super_block_ptr(
             src0, src1, sizeof(block_q4_K),
@@ -168,21 +170,22 @@ static __global__ void k_get_rows_q4_K(
             y[l +32] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);
         }
     }
+    }
 }
 
 template<typename dst_t>
 static __global__ void k_get_rows_q5_K(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t /*ne00*/,
-        const int64_t ne11, const int64_t ne12,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
     const int sb  = blockIdx.x;
-    const int i10 = blockIdx.y;
-    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
-        const int i11 = z / ne12;
-        const int i12 = z % ne12;
+    for (int64_t i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y) {
+        for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
 
         const block_q5_K * sx = (const block_q5_K *) kquant_src_super_block_ptr(
             src0, src1, sizeof(block_q5_K),
@@ -212,21 +215,22 @@ static __global__ void k_get_rows_q5_K(
         y[32] = ggml_cuda_cast<dst_t>(d2 * ((ql[0] >>  4) + (qh[0] & (hm << 1) ? 16 : 0)) - m2);
         y[33] = ggml_cuda_cast<dst_t>(d2 * ((ql[1] >>  4) + (qh[1] & (hm << 1) ? 16 : 0)) - m2);
     }
+    }
 }
 
 template<typename dst_t>
 static __global__ void k_get_rows_q6_K(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t /*ne00*/,
-        const int64_t ne11, const int64_t ne12,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12) {
     const int sb  = blockIdx.x;
-    const int i10 = blockIdx.y;
-    for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
-        const int i11 = z / ne12;
-        const int i12 = z % ne12;
+    for (int64_t i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y) {
+        for (int64_t z = blockIdx.z; z < ne11*ne12; z += gridDim.z) {
+            const int i11 = z / ne12;
+            const int i12 = z % ne12;
 
         const block_q6_K * sx = (const block_q6_K *) kquant_src_super_block_ptr(
             src0, src1, sizeof(block_q6_K),
@@ -249,6 +253,7 @@ static __global__ void k_get_rows_q6_K(
         y[32] = ggml_cuda_cast<dst_t>(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
         y[64] = ggml_cuda_cast<dst_t>(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
         y[96] = ggml_cuda_cast<dst_t>(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
     }
 }
 
@@ -430,7 +435,7 @@ static void get_rows_cuda_kquant(
 
     kernel<<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
-        ne00, ne11, ne12,
+        ne00, ne10, ne11, ne12,
         s1, s2, s3,
         nb01, nb02, nb03,
         s10, s11, s12);

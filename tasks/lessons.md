@@ -179,3 +179,19 @@ Net outcome: 30 minutes of polling, one tiny commit (+2.9% decode) that I had al
 - **Reject `pi --print` for long-running parallel tasks.** No streamed output means no course-correction window. Use streaming output, structured intermediate commits, or a wrapper that emits status to a known file.
 - **Cap subagent duration aggressively.** A focused kernel-tune or code-audit task should produce a commit within ~10 minutes or report "no win, here's the analysis" within ~15. If the agent is silently iterating past 20 min, kill and restart with tighter scope.
 - **Time a subagent against the cost of doing it yourself.** For DSv4, the audit's hoist was a 5-line change I had already spotted; spawning a subagent for it cost more than just writing it. Reserve subagents for tasks that genuinely need parallel exploration time, not for things you'd commit in 5 minutes solo.
+
+## Benchmark harnesses must fail fast on container startup errors (May 4 2026)
+
+### What happened
+During the independent audit, I launched `dsv4_bench_run.sh` on the default `PORT=9999` without first checking whether that host port was already bound. Docker failed immediately:
+
+```
+failed to bind host port 0.0.0.0:9999/tcp: address already in use
+```
+
+But my polling loop only watched for model/server log patterns (`Timings`, `GGML_ASSERT`, `LOAD ERROR`) and kept sleeping with an empty container status. The user had to point out "bad port".
+
+### Lesson
+- **Before long bench runs, choose or verify an unused port explicitly.** Do not assume `9999` is free; pass a high port via `PORT=...` or inspect listeners first.
+- **Poll loops must treat Docker startup failures as terminal.** Include `docker: Error`, `failed to bind host port`, and empty container status after startup as failure conditions, not as "still loading".
+- **Bench scripts should fail fast after `docker run -d`.** A detached container start can fail before any model log exists; check the `docker run` exit status/log output immediately and surface it.

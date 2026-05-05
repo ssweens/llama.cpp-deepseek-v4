@@ -7384,6 +7384,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
+    // K-quant GET_ROWS has a dedicated CUDA/HIP kernel with gridDim.y capped to
+    // UINT16_MAX. Keep one large-row case to ensure kernels loop over selected
+    // rows beyond the y-grid cap instead of silently leaving the tail unwritten.
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q2_K, 256, 80000, 70000, 2, 1, false));
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (ggml_type type : all_types) {
