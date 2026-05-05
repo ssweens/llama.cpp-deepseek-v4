@@ -99,3 +99,40 @@
 - [ ] Add/update corral config entry for DSV4-Flash IQ2_S
 - [ ] Update documentation (README, TEST_COVERAGE, etc.)
 - [ ] Final commit + push of any remaining changes
+
+## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
+
+### Goal
+Find any meaningful remaining speed improvement or unnecessary blooper bug in the six-commit DSv4 perf branch, without trusting prior agent conclusions.
+
+### Plan
+- [x] Audit branch diff against `origin/main`, file by file.
+- [x] Verify K-quant `GET_ROWS` kernels against GGUF K-quant block layouts / existing dequant code.
+- [x] Verify CUDA/HIP backend support checks are safe and cannot route unsupported shapes to the new kernels.
+- [x] Verify CUDA graph/MMQ compatibility change is logically correct and not over-enabling graph capture.
+- [x] Verify DSv4 grouped-output ID hoist preserves shape/lifetime semantics.
+- [x] Verify RDNA3.5 MMVQ split cannot affect non-RDNA3.5 targets.
+- [x] Search for adjacent missing fast paths that could be meaningful (GET_ROWS_BACK, CPY/SET_ROWS, DUP/CONT, backend split transfers, small constants).
+- [x] Run targeted build/test/bench only if the audit finds a plausible change or needs verification.
+- [x] Record findings and any recommended follow-up.
+
+### Findings
+- Found one real latent correctness bug in the broad K-quant `GET_ROWS` path: K kernels capped `gridDim.y` to `UINT16_MAX` for `ne10`, but used `const int i10 = blockIdx.y` with no grid-stride loop. Any K-quant `GET_ROWS` selecting more than 65,535 rows could leave the tail unwritten. DSv4 inference does not hit this, but backend-op tests already include 70,000-row GET_ROWS cases for F32/Q4_0, so the K-quant implementation should be equally safe.
+- Fixed by passing `ne10` into the K kernels and looping `for (i10 = blockIdx.y; i10 < ne10; i10 += gridDim.y)`.
+- Added targeted regression coverage: `GET_ROWS(type=q2_K,n=256,m=80000,r=70000,be1=2,be2=1,v=0)`.
+- Verified K-quant dequant formulas match the existing `convert.cu` `dequantize_block_q{2,3,4,5,6}_K` kernels; the new fix does not alter dequant math.
+- Graph/MMQ change mirrors `ggml_cuda_mul_mat_id()` dispatch and does not appear to over-enable graph capture into the stream-synchronizing slow path.
+- DSv4 grouped-output ID hoist is shape/lifetime-safe: depends only on graph-build constants `n_o_groups` and `n_tokens`, and is reused inside the same ggml context.
+- RDNA3.5 MMVQ split is scoped by compile-time and runtime architecture table IDs; non-RDNA3.5 targets stay on previous tables.
+- Adjacent fast-path audit: `CPY`/`SET_ROWS` already cover current q8_0 KV-cache path; K-quant CPY/SET_ROWS would mainly matter for unusual K-quant KV cache configs and is not an obvious current DSv4 trifecta win. IQ-quant `GET_ROWS` remains unsupported, but DSv4 protected token embeddings are Q2_K/Q6_K in the tested recipes, so no immediate high-confidence gain there.
+
+### Verification
+- Build: `cmake --build . --target llama-server` in `llamatrifecta_deepseekv4:latest` passed for CUDA+HIP `getrows.cu`.
+- Targeted backend test CUDA0: `GET_ROWS(type=q2_K,n=256,m=80000,r=70000,be1=2,be2=1,v=0)` passed.
+- Targeted backend test ROCm0: same test passed.
+- Full GET_ROWS backend subset on CUDA0 passed: 68/68 supported tests.
+- DSv4 sanity bench on `PORT=10099`: 512-token prompt, trifecta, Q2_K_S => 169.0 t/s prefill, 21.5 t/s decode. Decode non-regressed; prefill within known run noise for this bench harness.
+
+### Recommendation
+- Commit the K-quant `GET_ROWS` large-row correctness fix and regression test.
+- Do not chase more quick perf patches in this branch. No additional obvious, low-risk, high-impact speed bug was found in this audit; remaining wins likely require larger architectural work or a separate profiler-led effort.

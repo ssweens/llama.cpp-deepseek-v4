@@ -1113,6 +1113,21 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     ggml_tensor * hc_state = make_hc_state(inpL);
     cb(hc_state, "hc_state_init", -1);
 
+    // Grouped-output identity ids: identical across all layers (depend only on
+    // n_o_groups and n_tokens). Build once before the loop so the scheduler
+    // sees a single tensor instead of one per layer (43 layers × 3 ops = 129
+    // redundant graph nodes), reducing graph splits and scheduler bookkeeping.
+    ggml_tensor * grouped_out_ids = nullptr;
+    {
+        const int64_t n_groups = hparams.n_o_groups;
+        if (n_groups > 0) {
+            ggml_tensor * ids = ggml_arange(ctx0, 0.0f, (float) n_groups, 1.0f);
+            ids = ggml_cast(ctx0, ids, GGML_TYPE_I32);
+            grouped_out_ids = ggml_repeat_4d(ctx0, ids, n_groups, n_tokens, 1, 1);
+            cb(grouped_out_ids, "grouped_out_ids", -1);
+        }
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         hc_pre_result attn_mix = hc_pre(hc_state, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_base, model.layers[il].hc_attn_scale, "attn_hc_pre", il);
 
@@ -1683,12 +1698,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             // wq is [group_dim, n_groups*o_lora_rank] reshaped to [group_dim, o_lora_rank, n_groups]
             ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, model.layers[il].wq, group_dim, o_lora_rank, n_groups);
 
-            // Per-group identity ids: [n_groups, n_tokens]
-            ggml_tensor * ids = ggml_arange(ctx0, 0.0f, (float)n_groups, 1.0f);
-            ids = ggml_cast(ctx0, ids, GGML_TYPE_I32);
-            ids = ggml_repeat_4d(ctx0, ids, n_groups, n_tokens, 1, 1);
+            // Per-group identity ids: [n_groups, n_tokens] — built once before
+            // the layer loop and reused across all layers.
+            GGML_ASSERT(grouped_out_ids != nullptr);
+            GGML_ASSERT(grouped_out_ids->ne[0] == n_groups);
+            GGML_ASSERT(grouped_out_ids->ne[1] == n_tokens);
 
-            cur = ggml_mul_mat_id(ctx0, wo_a_g, o, ids); // [o_lora_rank, n_groups, n_tokens]
+            cur = ggml_mul_mat_id(ctx0, wo_a_g, o, grouped_out_ids); // [o_lora_rank, n_groups, n_tokens]
             cur = ggml_reshape_2d(ctx0, cur, o_lora_rank * n_groups, n_tokens);
         }
         cur = as_f32(cur);

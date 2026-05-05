@@ -156,3 +156,42 @@ A previous commit added two graceful-fallback branches in `llama_model_quantize_
 - **Treat compiler warnings in modified code as production bugs.** Especially `-Wmaybe-uninitialized` in performance-critical -O3 paths. The local GCC 15 build emitted the same warning but happened to not exhibit the UB; the GCP GCC 13 build did. Stale-stack reuse is the typical manifestation.
 - **For graceful fallbacks, restructure don't decorate.** When adding new "keep original" branches alongside existing "compute and replace" branches, restructure the surrounding code so each branch unconditionally assigns the variables consumed by downstream code. Don't add a post-hoc `if (sentinel)` guard that the compiler must prove always-true.
 - **Validate quant artifacts numerically, not just by file size and tensor count.** A 70 GiB GGUF that loads cleanly and produces tokens can still have entire layers zeroed; the only reliable check is dequantize-and-compare (or at minimum, raw-byte zero scan) per tensor.
+
+## Parallel subagents must not share build artifacts or the source tree (May 4 2026)
+
+### What happened
+Spawned two `pi --print` subagents in parallel on the same `perf/dsv4-graph-orchestration` branch:
+  - one for HIP MUL_MAT_ID kernel tuning (`ggml/src/ggml-cuda/mmvq.cu`)
+  - one for deepseek4.cpp graph audit (`src/models/deepseek4.cpp`)
+
+Both received briefs requiring `flock /tmp/dsv4_perf_lock` around build/bench to serialize GPU+volume access. They followed that and didn't crash. But both shared:
+  - the same `/src` bind mount (their uncommitted diffs both lived in the working tree at the same time)
+  - the same `dsv4_trifecta_build` Docker volume (incremental builds picked up combined source state)
+
+When subagent A built and benched, the binary it tested included subagent B's uncommitted diff if B had edited first. Their A/B measurements were polluted. The audit's "confirm" run dropped from 168 t/s to 54 t/s purely because the HIP subagent's mmvq.cu diff was simultaneously applied during the rebuild.
+
+Also: `pi --print` is silent until completion. After 30 minutes both subagents had spent most of their time re-benching the same code rather than committing partial wins, and I had no visibility to course-correct.
+
+Net outcome: 30 minutes of polling, one tiny commit (+2.9% decode) that I had already identified earlier and was about to do myself. Bad ROI. The kernel subagent's work was discarded entirely (no measured impact, polluted measurements).
+
+### Lesson
+- **Never run two parallel subagents on the same branch with shared bind-mounted source.** Each parallel agent must either work in its own git worktree or commit before benchmarking so the build artifact is reproducible. `flock` on a build/bench critical section is necessary but not sufficient.
+- **Reject `pi --print` for long-running parallel tasks.** No streamed output means no course-correction window. Use streaming output, structured intermediate commits, or a wrapper that emits status to a known file.
+- **Cap subagent duration aggressively.** A focused kernel-tune or code-audit task should produce a commit within ~10 minutes or report "no win, here's the analysis" within ~15. If the agent is silently iterating past 20 min, kill and restart with tighter scope.
+- **Time a subagent against the cost of doing it yourself.** For DSv4, the audit's hoist was a 5-line change I had already spotted; spawning a subagent for it cost more than just writing it. Reserve subagents for tasks that genuinely need parallel exploration time, not for things you'd commit in 5 minutes solo.
+
+## Benchmark harnesses must fail fast on container startup errors (May 4 2026)
+
+### What happened
+During the independent audit, I launched `dsv4_bench_run.sh` on the default `PORT=9999` without first checking whether that host port was already bound. Docker failed immediately:
+
+```
+failed to bind host port 0.0.0.0:9999/tcp: address already in use
+```
+
+But my polling loop only watched for model/server log patterns (`Timings`, `GGML_ASSERT`, `LOAD ERROR`) and kept sleeping with an empty container status. The user had to point out "bad port".
+
+### Lesson
+- **Before long bench runs, choose or verify an unused port explicitly.** Do not assume `9999` is free; pass a high port via `PORT=...` or inspect listeners first.
+- **Poll loops must treat Docker startup failures as terminal.** Include `docker: Error`, `failed to bind host port`, and empty container status after startup as failure conditions, not as "still loading".
+- **Bench scripts should fail fast after `docker run -d`.** A detached container start can fail before any model log exists; check the `docker run` exit status/log output immediately and surface it.
