@@ -1469,7 +1469,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         // use_prompt_sparse_attn=false and let the standard build_attn() path handle the
         // window-only attention (no -inf mask, no FA bug).
         // -----------------------------------------------------------------------------
-        if (!use_prompt_sparse_attn && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
+        if (!use_prompt_sparse_attn && !is_prefill && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             // For multi-seq decode, each token belongs to a different sequence.
             // We use seq_id from token 0; for n_seqs > 1 with equal_seqs,
             // all tokens within a sub-batch share the same seq_id.
