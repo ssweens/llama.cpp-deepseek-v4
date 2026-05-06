@@ -1658,8 +1658,9 @@ static common_chat_params common_chat_params_init_gigachat_v3(
     return data;
 }
 
-static common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_template &    tmpl,
-                                                                 const autoparser::generation_params & inputs) {
+static common_chat_params common_chat_params_init_deepseek_dsml(const common_chat_template &    tmpl,
+                                                                const autoparser::generation_params & inputs,
+                                                                const std::string & tool_calls_block_name) {
     common_chat_params data;
 
     data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
@@ -1681,8 +1682,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string FC_START     = "<" + DSML + "function_calls>";
-    const std::string FC_END       = "</" + DSML + "function_calls>";
+    const std::string FC_START     = "<" + DSML + tool_calls_block_name + ">";
+    const std::string FC_END       = "</" + DSML + tool_calls_block_name + ">";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
@@ -1823,6 +1824,16 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     }
 
     return data;
+}
+
+static common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_template &    tmpl,
+                                                                 const autoparser::generation_params & inputs) {
+    return common_chat_params_init_deepseek_dsml(tmpl, inputs, "function_calls");
+}
+
+static common_chat_params common_chat_params_init_deepseek_v4(const common_chat_template &    tmpl,
+                                                              const autoparser::generation_params & inputs) {
+    return common_chat_params_init_deepseek_dsml(tmpl, inputs, "tool_calls");
 }
 
 namespace workaround {
@@ -2093,13 +2104,20 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_gigachat_v3(tmpl, params);
     }
 
-    // DeepSeek V3.2 format detection: template defines dsml_token and uses it for tool calls.
-    // The template source contains the token as a variable assignment, not as a literal in markup.
-    if (src.find("dsml_token") != std::string::npos &&
-        src.find("function_calls") != std::string::npos &&
-        src.find("DSML") != std::string::npos) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2\n");
-        return common_chat_params_init_deepseek_v3_2(tmpl, params);
+    // DeepSeek DSML format detection: V3.2 uses function_calls; V4 uses tool_calls.
+    // The template source contains the DSML token as a variable assignment, not necessarily as literal markup.
+    if (src.find("DSML") != std::string::npos) {
+        if (src.find("dsml_token") != std::string::npos &&
+            src.find("function_calls") != std::string::npos) {
+            LOG_DBG("Using specialized template: DeepSeek V3.2\n");
+            return common_chat_params_init_deepseek_v3_2(tmpl, params);
+        }
+        if (src.find("tool_calls") != std::string::npos &&
+            src.find("invoke name=") != std::string::npos &&
+            src.find("parameter name=") != std::string::npos) {
+            LOG_DBG("Using specialized template: DeepSeek V4\n");
+            return common_chat_params_init_deepseek_v4(tmpl, params);
+        }
     }
 
     // Gemma4 format detection
