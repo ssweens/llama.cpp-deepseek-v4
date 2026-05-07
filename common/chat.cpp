@@ -1684,10 +1684,16 @@ static common_chat_params common_chat_params_init_deepseek_dsml(const common_cha
     const std::string THINK_END    = "</think>";
     const std::string FC_START     = "<" + DSML + tool_calls_block_name + ">";
     const std::string FC_END       = "</" + DSML + tool_calls_block_name + ">";
+    const std::string FC_START_FB  = "<" + tool_calls_block_name + ">";
+    const std::string FC_END_FB    = "</" + tool_calls_block_name + ">";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
+    const std::string INVOKE_START_FB = "<invoke";
+    const std::string INVOKE_END_FB   = "</invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
     const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string PARAM_START_FB  = "<parameter";
+    const std::string PARAM_END_FB    = "</parameter>";
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.prefix(inputs.generation_prompt, THINK_START);
@@ -1737,15 +1743,15 @@ static common_chat_params common_chat_params_init_deepseek_dsml(const common_cha
 
                 auto arg = p.tool_arg(
                     p.tool_arg_open(
-                        p.literal(PARAM_START + " name=\"") +
+                        p.choice({p.literal(PARAM_START + " name=\""), p.literal(PARAM_START_FB + " name=\"")}) +
                         p.tool_arg_name(p.literal(param_name)) +
                         p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
                     (is_string
-                         ? p.tool_arg_string_value(p.until(PARAM_END))
+                         ? p.tool_arg_string_value(p.until_one_of({PARAM_END, PARAM_END_FB}))
                          : p.tool_arg_json_value(p.schema(p.json(),
                                                           "tool-" + name + "-arg-" + param_name + "-schema",
                                                           param_schema, false))) +
-                    p.tool_arg_close(p.literal(PARAM_END)));
+                    p.tool_arg_close(p.choice({p.literal(PARAM_END), p.literal(PARAM_END_FB)})));
 
                 auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
                 if (is_required) {
@@ -1773,10 +1779,10 @@ static common_chat_params common_chat_params_init_deepseek_dsml(const common_cha
 
             common_peg_parser invoke_body = args_seq;
             auto func_parser = p.tool(
-                p.tool_open(p.literal(INVOKE_START + " name=\"") +
+                p.tool_open(p.choice({p.literal(INVOKE_START + " name=\""), p.literal(INVOKE_START_FB + " name=\"")}) +
                             p.tool_name(p.literal(name)) + p.literal("\">\n")) +
                 invoke_body + p.space() +
-                p.tool_close(p.literal(INVOKE_END)));
+                p.tool_close(p.choice({p.literal(INVOKE_END), p.literal(INVOKE_END_FB)})));
 
             tool_choice |= p.rule("tool-" + name, func_parser);
         });
@@ -1784,20 +1790,22 @@ static common_chat_params common_chat_params_init_deepseek_dsml(const common_cha
         auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
 
         common_peg_parser tool_calls = p.eps();
+        auto fc_start = p.choice({p.literal(FC_START), p.literal(FC_START_FB)});
+        auto fc_end   = p.choice({p.literal(FC_END), p.literal(FC_END_FB)});
         if (inputs.parallel_tool_calls) {
             tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice +
-                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
+                fc_start + p.space() + tool_choice +
+                p.zero_or_more(p.space() + tool_choice) + p.space() + fc_end);
         } else {
             tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
+                fc_start + p.space() + tool_choice + p.space() + fc_end);
         }
 
         if (!require_tools) {
             tool_calls = p.optional(tool_calls);
         }
 
-        auto content_before_tools = p.content(p.until(FC_START));
+        auto content_before_tools = p.content(p.until_one_of({FC_START, FC_START_FB}));
         return generation_prompt + reasoning + content_before_tools + tool_calls + end;
     });
 
@@ -1820,6 +1828,7 @@ static common_chat_params common_chat_params_init_deepseek_dsml(const common_cha
 
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START_FB },
         };
     }
 
