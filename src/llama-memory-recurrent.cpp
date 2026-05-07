@@ -8,10 +8,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+static bool recurrent_debug_seq_rm_enabled() {
+    const char * value = std::getenv("LLAMA_DEBUG_DSV4_SEQ_RM");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 //
 // llama_memory_recurrent
@@ -143,6 +149,11 @@ void llama_memory_recurrent::clear(bool data) {
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     //printf("[DEBUG] calling llama_memory_recurrent::seq_rm` with `seq_id=%d, p0=%d, p1=%d`\n", seq_id, p0, p1);
     uint32_t new_head = size;
+    const bool debug_seq_rm = recurrent_debug_seq_rm_enabled();
+    const llama_pos pos_min_before = debug_seq_rm ? seq_pos_min(seq_id) : -1;
+    const llama_pos pos_max_before = debug_seq_rm ? seq_pos_max(seq_id) : -1;
+    const int32_t tail_before = (debug_seq_rm && seq_id >= 0 && seq_id < (int64_t) size) ? cells[seq_id].tail : -1;
+    const llama_pos tail_pos_before = (tail_before >= 0) ? cells[tail_before].pos : -1;
 
     if (p0 < 0) {
         p0 = 0;
@@ -206,6 +217,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != size && new_head < head) {
         head = new_head;
+    }
+
+    if (debug_seq_rm) {
+        const int32_t tail_after = (seq_id >= 0 && seq_id < (int64_t) size) ? cells[seq_id].tail : -1;
+        const llama_pos tail_pos_after = (tail_after >= 0) ? cells[tail_after].pos : -1;
+        LLAMA_LOG_WARN("%s: seq=%d p0=%d p1=%d before[min=%d max=%d tail=%d tail_pos=%d] after[min=%d max=%d tail=%d tail_pos=%d] used=%u head=%u\n",
+                __func__, seq_id, p0, p1,
+                pos_min_before, pos_max_before, tail_before, tail_pos_before,
+                seq_pos_min(seq_id), seq_pos_max(seq_id), tail_after, tail_pos_after,
+                used, head);
     }
 
     return true;

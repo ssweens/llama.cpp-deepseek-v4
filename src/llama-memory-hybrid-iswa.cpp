@@ -8,6 +8,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -29,6 +30,11 @@ struct dsv4_row_range {
         return end - begin;
     }
 };
+
+static bool dsv4_debug_seq_rm_enabled() {
+    const char * value = std::getenv("LLAMA_DEBUG_DSV4_SEQ_RM");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 static dsv4_row_range dsv4_make_row_range(uint32_t n_comp, uint32_t ratio, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(ratio > 0);
@@ -360,15 +366,44 @@ void llama_memory_hybrid_iswa::clear(bool data) {
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const bool debug_seq_rm = dsv4_debug_seq_rm_enabled();
+    const llama_pos attn_pos_min_before = debug_seq_rm ? mem_attn->seq_pos_min(seq_id) : -1;
+    const llama_pos attn_pos_max_before = debug_seq_rm ? mem_attn->seq_pos_max(seq_id) : -1;
+    const llama_pos recr_pos_min_before = debug_seq_rm ? mem_recr->seq_pos_min(seq_id) : -1;
+    const llama_pos recr_pos_max_before = debug_seq_rm ? mem_recr->seq_pos_max(seq_id) : -1;
+
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+        if (debug_seq_rm) {
+            LLAMA_LOG_WARN("%s: recurrent seq_rm failed: seq=%d p0=%d p1=%d before attn=[%d,%d] recurrent=[%d,%d]\n",
+                    __func__, seq_id, p0, p1,
+                    attn_pos_min_before, attn_pos_max_before,
+                    recr_pos_min_before, recr_pos_max_before);
+        }
         return false;
     }
     if (!mem_attn->seq_rm(seq_id, p0, p1)) {
+        if (debug_seq_rm) {
+            LLAMA_LOG_WARN("%s: attention seq_rm failed after recurrent mutation: seq=%d p0=%d p1=%d before attn=[%d,%d] recurrent=[%d,%d]\n",
+                    __func__, seq_id, p0, p1,
+                    attn_pos_min_before, attn_pos_max_before,
+                    recr_pos_min_before, recr_pos_max_before);
+        }
         return false;
     }
     dsv4_seq_rm(seq_id, p0, p1);
+
+    if (debug_seq_rm) {
+        LLAMA_LOG_WARN("%s: seq=%d p0=%d p1=%d attn [%d,%d] -> [%d,%d], recurrent [%d,%d] -> [%d,%d], hybrid [%d,%d]\n",
+                __func__, seq_id, p0, p1,
+                attn_pos_min_before, attn_pos_max_before,
+                mem_attn->seq_pos_min(seq_id), mem_attn->seq_pos_max(seq_id),
+                recr_pos_min_before, recr_pos_max_before,
+                mem_recr->seq_pos_min(seq_id), mem_recr->seq_pos_max(seq_id),
+                seq_pos_min(seq_id), seq_pos_max(seq_id));
+    }
+
     return true;
 }
 
@@ -440,9 +475,24 @@ void llama_memory_hybrid_iswa::dsv4_seq_rm(llama_seq_id seq_id, llama_pos p0, ll
         return;
     }
 
+    const bool debug_seq_rm = dsv4_debug_seq_rm_enabled();
+    int debug_printed = 0;
+
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < dsv4_n_seq_max);
         for (int32_t il = 0; il < (int32_t) dsv4_cache_layers.size(); ++il) {
+            if (debug_seq_rm) {
+                const uint32_t ratio = hparams.deepseek4_compress_ratios[il];
+                if (ratio > 0) {
+                    const auto & layer = dsv4_cache_layers[il];
+                    const auto range = dsv4_make_row_range(layer.n_comp, ratio, p0, p1);
+                    if (range.size() > 0 && debug_printed < 8) {
+                        LLAMA_LOG_WARN("%s: seq=%d layer=%d ratio=%u rows=[%u,%u) p0=%d p1=%d\n",
+                                __func__, seq_id, il, ratio, range.begin, range.end, p0, p1);
+                        ++debug_printed;
+                    }
+                }
+            }
             dsv4_clear_rows(seq_id, il, p0, p1);
         }
         return;

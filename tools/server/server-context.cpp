@@ -9,6 +9,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
+#include "src/llama-model.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -18,9 +19,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
-#include <memory>
 #include <filesystem>
+#include <memory>
+#include <numeric>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -59,6 +62,32 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
     }
 
     return cur;
+}
+
+static int server_dsv4_cache_alignment(llama_context * ctx, bool has_mtmd) {
+    if (has_mtmd) {
+        return 0;
+    }
+
+    const llama_model * model = llama_get_model(ctx);
+    if (model == nullptr || model->arch != LLM_ARCH_DEEPSEEK4) {
+        return 0;
+    }
+
+    int alignment = 1;
+    for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+        const uint32_t ratio = model->hparams.deepseek4_compress_ratios[il];
+        if (ratio > 1) {
+            alignment = std::lcm(alignment, (int) ratio);
+        }
+    }
+
+    return alignment > 1 ? alignment : 0;
+}
+
+static bool server_env_truthy(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -2294,6 +2323,25 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        const int dsv4_cache_alignment = server_dsv4_cache_alignment(ctx, slot.prompt.tokens.has_mtmd);
+
+                        const auto clamp_dsv4_n_past = [&](int n_past_in, const char * reason) -> int {
+                            if (dsv4_cache_alignment <= 1 || n_past_in <= 0) {
+                                return n_past_in;
+                            }
+
+                            const llama_pos pos_next_in = slot.prompt.tokens.pos_next(n_past_in);
+                            const llama_pos pos_aligned = pos_next_in - (pos_next_in % dsv4_cache_alignment);
+                            if (pos_aligned == pos_next_in) {
+                                return n_past_in;
+                            }
+
+                            const int n_past_out = (int) slot.prompt.tokens.size_up_to_pos(pos_aligned);
+                            SLT_WRN(slot, "clamping cached prefix for DeepSeek4 compressed KV (%s): n_past %d -> %d, pos %d -> %d, alignment = %d\n",
+                                    reason, n_past_in, n_past_out, pos_next_in, pos_aligned, dsv4_cache_alignment);
+                            return n_past_out;
+                        };
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -2419,6 +2467,8 @@ private:
                                 n_past = 0;
                             }
 
+                            n_past = clamp_dsv4_n_past(n_past, "prefix reuse");
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // the largest pos_min required for a checkpoint to be useful
@@ -2485,11 +2535,30 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+
+                                            if (!(cur.pos_min < pos_min_thold || cur.pos_min == 0)) {
+                                                return false;
+                                            }
+
+                                            if (dsv4_cache_alignment > 1 && cur.n_tokens > 0) {
+                                                const llama_pos checkpoint_pos_next = slot.prompt.tokens.pos_next((int) cur.n_tokens);
+                                                if (checkpoint_pos_next % dsv4_cache_alignment != 0) {
+                                                    LOG_WRN("slot %12.*s: id %2d | task %d | Skipping unaligned DeepSeek4 checkpoint at n_tokens=%" PRId64 ", pos_next=%d, alignment=%d\n", 12,
+                                                        func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.n_tokens, checkpoint_pos_next, dsv4_cache_alignment);
+                                                    return false;
+                                                }
+                                            }
+
+                                            return true;
                                         }
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+
+                                    if (!do_reset && server_env_truthy("LLAMA_DEBUG_SKIP_CHECKPOINT_RESTORE")) {
+                                        SLT_WRN(slot, "%s\n", "skipping checkpoint restore due to LLAMA_DEBUG_SKIP_CHECKPOINT_RESTORE=1");
+                                        do_reset = true;
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -2503,6 +2572,8 @@ private:
                                         } else {
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            n_past = clamp_dsv4_n_past(n_past, "checkpoint restore");
+                                            pos_next = slot.prompt.tokens.pos_next(n_past);
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                         }
                                     }
@@ -2534,6 +2605,7 @@ private:
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
+                            n_past = clamp_dsv4_n_past(n_past, "force prompt replay");
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -2598,6 +2670,7 @@ private:
                             (n_swa > 0));
 
                     bool has_mtmd = false;
+                    const int dsv4_cache_alignment = server_dsv4_cache_alignment(ctx, slot.prompt.tokens.has_mtmd);
 
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
@@ -2649,21 +2722,41 @@ private:
                         slot.n_prompt_tokens_processed++;
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
+                        // create checkpoints in the tail of the prompt:
                         //  - 4 + n_ubatch
+                        //  - SWA-spaced offsets down to 4 + n_swa
                         //  - 4
+                        // The SWA-spaced checkpoints are useful for hybrid/recurrent models that cannot partially
+                        // erase the tail cache state. They avoid falling back to an ubatch-old checkpoint when only
+                        // a sliding-window tail plus the previous generation needs to be replayed.
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
+
+                            auto should_checkpoint_tail = [&](int offset) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
+                                int n_break = slot.task->n_tokens() - n_last;
+                                if (dsv4_cache_alignment > 1 && n_break > 0) {
+                                    n_break -= n_break % dsv4_cache_alignment;
+                                }
+                                return slot.prompt.n_tokens() == n_break;
+                            };
+
+                            if (should_checkpoint_tail(4 + n_ubatch)) {
+                                should_break = true;
+                            } else if (n_swa > 0 && n_swa < n_ubatch) {
+                                for (int offset = 4 + ((n_ubatch / n_swa) * n_swa); offset > 4; offset -= n_swa) {
+                                    if (should_checkpoint_tail(offset)) {
+                                        should_break = true;
+                                        break;
+                                    }
                                 }
                             }
+
+                            if (!should_break && should_checkpoint_tail(4)) {
+                                should_break = true;
+                            }
+
                             if (should_break) {
                                 break;
                             }
