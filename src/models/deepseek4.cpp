@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../llama-impl.h"
 #include "../llama-kv-cache.h"
 #include "../llama-memory-hybrid-iswa.h"
 
@@ -6,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -13,6 +15,11 @@
 #include <vector>
 
 namespace {
+static bool dsv4_debug_paths_enabled() {
+    const char * value = std::getenv("LLAMA_DEBUG_DSV4_PATHS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 static inline float dsv4_e4m3_to_float(uint8_t x) {
     const uint8_t sign = (x >> 7) & 0x1u;
     const uint8_t exp  = (x >> 3) & 0xFu;
@@ -1324,7 +1331,43 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             model.layers[il].attn_indexer_weights_proj != nullptr &&
             hparams.n_attn_index_topk > 0;
 
+        ggml_tensor * prompt_comp_pos = nullptr;
+        ggml_tensor * prompt_c_attn = nullptr;
+        const int64_t n_comp_prompt = (!can_use_sparse_prompt && c_pool != nullptr) ? c_pool->ne[1] : 0;
+        if (n_comp_prompt > 0) {
+            ggml_tensor * comp_pos_idx = cache_mask(
+                "comp_pos_idx:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_prompt),
+                [&]() {
+                    std::vector<int32_t> comp_rows(n_comp_prompt);
+                    for (int64_t i = 0; i < n_comp_prompt; ++i) {
+                        comp_rows[i] = int32_t(i * compress_ratio);
+                    }
+                    ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_comp_prompt);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_comp_pos_idx");
+                    res->add_input(std::make_unique<dsv4_static_i32_input>(t, comp_rows));
+                    return t;
+                });
+
+            ggml_tensor * inp_pos_2d = ggml_reshape_2d(ctx0, inp_pos, 1, n_tokens);
+            prompt_comp_pos = ggml_get_rows(ctx0, inp_pos_2d, comp_pos_idx);
+            prompt_comp_pos = ggml_reshape_1d(ctx0, prompt_comp_pos, n_comp_prompt);
+            cb(prompt_comp_pos, "attn_comp_pos", il);
+
+            prompt_c_attn = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, as_f32(c_pool)), n_embd_head, 1, n_comp_prompt);
+            prompt_c_attn = apply_partial_rope_with_pos(prompt_c_attn, prompt_comp_pos, rope_cfg, /*inverse=*/false);
+            prompt_c_attn = apply_fp8_qat_nope_2d(prompt_c_attn, "attn_compressor_pool_qat", il);
+            cb(prompt_c_attn, "attn_compressor_pool_roped", il);
+            store_attn_cache_rows(prompt_c_attn, 0, n_comp_prompt);
+        }
+
         if (can_use_sparse_prompt) {
+            if (dsv4_debug_paths_enabled()) {
+                const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
+                const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
+                LLAMA_LOG_WARN("deepseek4/path: layer=%d path=prompt-sparse n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
+                        il, (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
+            }
             const int64_t n_comp = c_pool->ne[1];
             const int64_t idx_dim = hparams.n_embd_head_index;
             const int64_t n_index_heads = hparams.n_head_index;
@@ -1455,6 +1498,55 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 kq_scale);
             cb(cur, "attn_sparse_prompt", il);
             use_prompt_sparse_attn = true;
+        } else if (prompt_c_attn != nullptr) {
+            if (dsv4_debug_paths_enabled()) {
+                const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
+                const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
+                LLAMA_LOG_WARN("deepseek4/path: layer=%d path=prompt-compressed n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
+                        il, (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
+            }
+
+            if (has_hybrid_iswa) {
+                ggml_build_forward_expand(gf, inp_attn_iswa->self_kq_mask_swa);
+                const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
+                ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il));
+                ggml_build_forward_expand(gf, mctx_swa->cpy_v(ctx0, Vcur, inp_attn_iswa->get_v_idxs_swa(), il));
+            } else {
+                ggml_build_forward_expand(gf, inp_attn_kv->get_kq_mask());
+                ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_k(ctx0, Kcur, inp_attn_kv->get_k_idxs(), il));
+                ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_v(ctx0, Vcur, inp_attn_kv->get_v_idxs(), il));
+            }
+
+            ggml_tensor * raw_mask = cache_mask(
+                "prompt_window_causal:" + std::to_string(prompt_window_size) + ":" + std::to_string((int)cparams.causal_attn),
+                [&]() {
+                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_prompt_window_mask");
+                    res->add_input(std::make_unique<dsv4_prompt_window_mask_input>(t, prompt_window_size, hparams.use_alibi, cparams.causal_attn));
+                    return t;
+                });
+            ggml_tensor * comp_mask = cache_mask(
+                "prompt_comp_causal:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_prompt) + ":" + std::to_string((int)cparams.causal_attn),
+                [&]() {
+                    ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_prompt, n_tokens, 1, 1);
+                    ggml_set_input(t);
+                    ggml_set_name(t, "dsv4_prompt_comp_mask");
+                    res->add_input(std::make_unique<dsv4_prompt_comp_mask_input>(t, n_comp_prompt, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                    return t;
+                });
+            ggml_tensor * attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+            ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
+            ggml_tensor * k_all = ggml_concat(ctx0, Kcur, prompt_c_attn, 2);
+
+            ggml_tensor * sink = model.layers[il].attn_sinks;
+            if (sink && sink->type != GGML_TYPE_F32) {
+                sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
+            }
+
+            cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il);
+            cb(cur, "attn_compressed_prompt", il);
+            use_prompt_sparse_attn = true;
         }
 
         // -----------------------------------------------------------------------------
@@ -1470,6 +1562,12 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         // window-only attention (no -inf mask, no FA bug).
         // -----------------------------------------------------------------------------
         if (!use_prompt_sparse_attn && !(is_prefill && n_tokens > 1) && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
+            if (dsv4_debug_paths_enabled()) {
+                const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
+                const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
+                LLAMA_LOG_WARN("deepseek4/path: layer=%d path=decode-replay n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
+                        il, (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
+            }
             // For multi-seq decode, each token belongs to a different sequence.
             // We use seq_id from token 0; for n_seqs > 1 with equal_seqs,
             // all tokens within a sub-batch share the same seq_id.
@@ -1649,6 +1747,58 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     sink,             // [n_heads]
                     kq_scale);
                 cb(cur, "attn_sparse_decode", il);
+                use_prompt_sparse_attn = true;
+            } else if (n_comp_visible > 0) {
+                if (dsv4_debug_paths_enabled()) {
+                    LLAMA_LOG_WARN("deepseek4/path: layer=%d path=decode-compressed n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
+                            il, (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
+                }
+
+                const auto * mctx_swa = inp_attn_iswa->mctx->get_swa();
+                ggml_tensor * k_store = mctx_swa->cpy_k(ctx0, Kcur, inp_attn_iswa->get_k_idxs_swa(), il);
+                ggml_build_forward_expand(gf, k_store);
+
+                ggml_tensor * k_raw_ref = mctx_swa->get_k(ctx0, il);
+                ggml_tensor * k_raw = ggml_view_4d(ctx0, k_store,
+                        k_raw_ref->ne[0], k_raw_ref->ne[1], k_raw_ref->ne[2], k_raw_ref->ne[3],
+                        k_raw_ref->nb[1], k_raw_ref->nb[2], k_raw_ref->nb[3], k_raw_ref->view_offs);
+                k_raw = ggml_reshape_3d(ctx0, k_raw, n_embd_head, 1, k_raw->ne[2]);
+                k_raw = as_f32(k_raw);
+
+                ggml_tensor * kv_comp_cache = nullptr;
+                if (kv_comp_new_for_attn != nullptr && n_comp_new > 0) {
+                    ggml_tensor * kv_new = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, kv_comp_new_for_attn), n_embd_head, 1, n_comp_new);
+                    if (n_comp_before > 0) {
+                        ggml_tensor * kv_old = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_before);
+                        kv_comp_cache = ggml_concat(ctx0, as_f32(kv_old), as_f32(kv_new), 2);
+                    } else {
+                        kv_comp_cache = kv_new;
+                    }
+                } else {
+                    kv_comp_cache = dsv4_cache_view_3d(ctx0, mctx_dsv4->get_dsv4_attn_k(ctx0, il, seq_id), n_comp_visible);
+                }
+                kv_comp_cache = as_f32(kv_comp_cache);
+
+                ggml_tensor * comp_mask = cache_mask(
+                    "decode_comp_causal:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_visible) + ":" + std::to_string((int)cparams.causal_attn),
+                    [&]() {
+                        ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_comp_visible, n_tokens, 1, 1);
+                        ggml_set_input(t);
+                        ggml_set_name(t, "dsv4_decode_comp_mask");
+                        res->add_input(std::make_unique<dsv4_abs_comp_mask_input>(t, n_comp_visible, compress_ratio, hparams.use_alibi, cparams.causal_attn));
+                        return t;
+                    });
+                ggml_tensor * attn_mask = ggml_concat(ctx0, inp_attn_iswa->self_kq_mask_swa, comp_mask, 0);
+                ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
+                ggml_tensor * k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
+
+                ggml_tensor * sink = model.layers[il].attn_sinks;
+                if (sink && sink->type != GGML_TYPE_F32) {
+                    sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
+                }
+
+                cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il);
+                cb(cur, "attn_compressed_decode", il);
                 use_prompt_sparse_attn = true;
             }
             // else: fall through to standard build_attn below (window-only attention).
