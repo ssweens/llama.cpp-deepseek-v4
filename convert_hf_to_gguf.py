@@ -9416,7 +9416,9 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_index_head_count(hparams["index_n_heads"])
         self.gguf_writer.add_index_head_dim(hparams["index_head_dim"])
         self.gguf_writer.add_index_topk(hparams["index_topk"])
-        self.gguf_writer.add_compress_ratios(hparams["compress_ratios"][:self.block_count])
+        self.gguf_writer.add_compress_ratios(hparams["compress_ratios"])
+        if (nextn_predict_layers := hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(nextn_predict_layers)
         self.gguf_writer.add_compress_rope_theta(hparams["compress_rope_theta"])
         self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.dense_fp8", (hparams.get("quantization_config") or {}).get("quant_method") == "fp8")
         self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_qkv",

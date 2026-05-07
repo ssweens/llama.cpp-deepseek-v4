@@ -2074,7 +2074,16 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
                     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
                 }
-                ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.deepseek4_compress_ratios, hparams.n_layer);
+                {
+                    std::vector<uint32_t> compress_ratios;
+                    ml.get_arr("deepseek4.attention.compress_ratios", compress_ratios);
+                    if (compress_ratios.size() < hparams.n_layer) {
+                        throw std::runtime_error(format("DeepSeek4 compress ratio count mismatch: got %zu, expected at least %u",
+                                compress_ratios.size(), hparams.n_layer));
+                    }
+                    std::fill(hparams.deepseek4_compress_ratios.begin(), hparams.deepseek4_compress_ratios.end(), 0);
+                    std::copy_n(compress_ratios.begin(), hparams.n_layer, hparams.deepseek4_compress_ratios.begin());
+                }
 
                 hparams.deepseek4_state_size = 0;
                 for (uint32_t il = 0; il < hparams.n_layer; ++il) {
