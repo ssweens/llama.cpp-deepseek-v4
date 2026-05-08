@@ -71,6 +71,7 @@ static __global__ void dsv4_sparse_attn_kernel(
         const int64_t                  kw_stride_p,
         const int64_t                  kw_stride_b,
         const int64_t                  wmask_stride_t,
+        const int64_t                  wmask_stride_b,
         const int64_t                  idx_stride_t,
         const int64_t                  idx_stride_b,
         const int64_t                  o_stride_h,
@@ -119,9 +120,11 @@ static __global__ void dsv4_sparse_attn_kernel(
         topk_idxs + b_idx * idx_stride_b + t_idx * idx_stride_t;
 
     // Window mask row for this token (shape [n_window]).
-    const float * wmask_row = window_mask
-        ? (window_mask + (int64_t) t_idx * wmask_stride_t)
-        : nullptr;
+    const float * wmask_row = nullptr;
+    if (window_mask) {
+        const int64_t b_mask = wmask_stride_b == 0 ? 0 : b_idx;
+        wmask_row = window_mask + b_mask * wmask_stride_b + (int64_t) t_idx * wmask_stride_t;
+    }
 
     // Output pointer for this (b, t, h).
     float * o_ptr =
@@ -321,6 +324,7 @@ static void launch_dsv4_sparse_attn(
         const int64_t    kw_stride_p,
         const int64_t    kw_stride_b,
         const int64_t    wmask_stride_t,
+        const int64_t    wmask_stride_b,
         const int64_t    idx_stride_t,
         const int64_t    idx_stride_b,
         const int64_t    o_stride_h,
@@ -340,7 +344,7 @@ static void launch_dsv4_sparse_attn(
         q_stride_h, q_stride_t, q_stride_b,
         kc_stride_p, kc_stride_b,
         kw_stride_p, kw_stride_b,
-        wmask_stride_t,
+        wmask_stride_t, wmask_stride_b,
         idx_stride_t, idx_stride_b,
         o_stride_h, o_stride_t, o_stride_b);
 }
@@ -391,6 +395,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
     const int64_t kw_stride_b = src_kv_w ? stride_elems(src_kv_w, 3) : 0;
 
     const int64_t wmask_stride_t = src_wmask ? stride_elems(src_wmask, 1) : 0;
+    const int64_t wmask_stride_b = src_wmask ? (src_wmask->ne[3] == 1 ? 0 : stride_elems(src_wmask, 3)) : 0;
 
     const int64_t idx_stride_t = stride_elems(src_idx, 1);
     const int64_t idx_stride_b = stride_elems(src_idx, 2);
@@ -417,7 +422,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
-                wmask_stride_t,
+                wmask_stride_t, wmask_stride_b,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);
@@ -431,7 +436,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
-                wmask_stride_t,
+                wmask_stride_t, wmask_stride_b,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);
@@ -445,7 +450,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
-                wmask_stride_t,
+                wmask_stride_t, wmask_stride_b,
                 idx_stride_t, idx_stride_b,
                 o_stride_h, o_stride_t, o_stride_b,
                 stream);

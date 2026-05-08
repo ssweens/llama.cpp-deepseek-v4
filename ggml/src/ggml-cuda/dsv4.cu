@@ -509,7 +509,11 @@ static __device__ __forceinline__ float dsv4_e4m3fn_dequant(float x) {
             : (1.0f + (float)mant * 0.125f) * exp2f((float)(exp - 7));
     };
     const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = fminf(fabsf(x), 448.0f);
+    float ax = fabsf(x);
+    if (!(ax == ax)) {
+        ax = 448.0f;
+    }
+    ax = fminf(ax, 448.0f);
     int best = 0;
     float best_diff = ax;
     for (int i = 1; i < 127; ++i) {

@@ -6410,9 +6410,12 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
     }
     if (window_mask) {
         GGML_ASSERT(window_mask->type == GGML_TYPE_F32);
-        GGML_ASSERT(kv_window != NULL);                  // window_mask requires kv_window
-        GGML_ASSERT(window_mask->ne[0] == kv_window->ne[2]); // n_window
-        GGML_ASSERT(window_mask->ne[1] == q->ne[2]);     // n_tokens
+        GGML_ASSERT(kv_window != NULL);                       // window_mask requires kv_window
+        GGML_ASSERT(window_mask->ne[0] == kv_window->ne[2]);  // n_window
+        GGML_ASSERT(window_mask->ne[1] == q->ne[2]);          // n_tokens
+        GGML_ASSERT(window_mask->ne[2] == 1);                 // scalar per (window, token, stream)
+        GGML_ASSERT(window_mask->ne[3] == 1 ||
+                    window_mask->ne[3] == q->ne[3]);          // broadcast or per-stream mask
     }
     if (attn_sink) {
         GGML_ASSERT(attn_sink->type == GGML_TYPE_F32);

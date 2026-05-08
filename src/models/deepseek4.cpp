@@ -114,7 +114,9 @@ static void dsv4_fp8_qat_blockwise_n(struct ggml_tensor * dst, const struct ggml
             const float scale = dsv4_round_pow2_scale(amax / fp8_max);
 
             for (int64_t j = 0; j < block_size; ++j) {
-                const float q = std::clamp(src_row[col + j] / scale, fp8_min, fp8_max);
+                // Match CUDA DSv4 clamp semantics (fmin/fmax): NaNs are sanitized
+                // before E4M3 conversion instead of propagating through std::clamp.
+                const float q = std::fmin(std::fmax(src_row[col + j] / scale, fp8_min), fp8_max);
                 out_row[col + j] = dsv4_e4m3_to_float(dsv4_float_to_e4m3(q)) * scale;
             }
         }
@@ -165,7 +167,7 @@ static void dsv4_fp4_qat_blockwise(struct ggml_tensor * dst, const struct ggml_t
             const float scale = dsv4_round_pow2_scale(amax / fp4_max);
 
             for (int64_t j = 0; j < block_size; ++j) {
-                const float q = std::clamp(src_row[col + j] / scale, -fp4_max, fp4_max);
+                const float q = std::fmin(std::fmax(src_row[col + j] / scale, -fp4_max), fp4_max);
                 out_row[col + j] = q * scale;
             }
         }
@@ -617,7 +619,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         t = as_f32(t);
         if (n_rot <= 0 || n_rot >= t->ne[0]) { return t; }
         const int64_t nope_dim = t->ne[0] - n_rot;
-        if (nope_dim % 64 != 0) { return t; }
+        if (nope_dim % 64 != 0) {
+            GGML_ABORT("DeepSeek4 FP8 KV QAT requires non-RoPE dim divisible by 64, got ne0=%lld n_rot=%lld nope=%lld",
+                    (long long) t->ne[0], (long long) n_rot, (long long) nope_dim);
+        }
         t = ggml_dsv4_fp8_kv_quantize(ctx0, t, (int)n_rot);
         cb(t, tag, il_cur);
         return t;
@@ -627,7 +632,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         t = as_f32(cont_if_needed(ctx0, t));
         GGML_ASSERT(t->ne[2] == 1 && t->ne[3] == 1);
         if (t->ne[0] % 128 != 0) {
-            return t;
+            GGML_ABORT("DeepSeek4 dense FP8 QAT requires innermost dim divisible by 128, got ne0=%lld", (long long) t->ne[0]);
         }
         t = ggml_map_custom1(ctx0, t, dsv4_fp8_qat_blockwise_128, GGML_N_TASKS_MAX, nullptr);
         t = ggml_cast(ctx0, t, GGML_TYPE_BF16);
@@ -1919,21 +1924,31 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * shexp_inp_src = ggml_cast(ctx0, ffn_act_inp, GGML_TYPE_BF16);
             ggml_tensor * shexp_inp = apply_dense_fp8_qat(shexp_inp_src, true, "ffn_shexp_inp_fp8_qat", il);
 
-            ggml_tensor * shexp_up = mul_mat_checked(model.layers[il].ffn_up_shexp, shexp_inp, "ffn.shexp.w3");
+            ggml_tensor * shexp_up = build_lora_mm(model.layers[il].ffn_up_shexp, shexp_inp);
             shexp_up = cast_dense_fp8_out(shexp_up, true);
             cb(shexp_up, "ffn_shexp_up", il);
 
-            ggml_tensor * shexp_gate = mul_mat_checked(model.layers[il].ffn_gate_shexp, shexp_inp, "ffn.shexp.w1");
+            ggml_tensor * shexp_gate = build_lora_mm(model.layers[il].ffn_gate_shexp, shexp_inp);
             shexp_gate = cast_dense_fp8_out(shexp_gate, true);
             cb(shexp_gate, "ffn_shexp_gate", il);
 
-            ggml_tensor * shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
-            cb(shexp_mid, "ffn_shexp_swiglu", il);
+            ggml_tensor * shexp_mid = nullptr;
+            {
+                const float limit = hparams.f_swiglu_limit;
+                constexpr float eps = 1e-6f;
+                if (limit > eps) {
+                    shexp_mid = ggml_swiglu_clamped(ctx0, shexp_gate, shexp_up, limit);
+                    cb(shexp_mid, "ffn_shexp_swiglu_limited", il);
+                } else {
+                    shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
+                    cb(shexp_mid, "ffn_shexp_swiglu", il);
+                }
+            }
 
             ggml_tensor * shexp_mid_src = ggml_cast(ctx0, shexp_mid, GGML_TYPE_BF16);
             ggml_tensor * shexp_mid_fp8 = apply_dense_fp8_qat(shexp_mid_src, true, "ffn_shexp_mid_fp8_qat", il);
 
-            shexp_out = mul_mat_checked(model.layers[il].ffn_down_shexp, shexp_mid_fp8, "ffn.shexp.w2");
+            shexp_out = build_lora_mm(model.layers[il].ffn_down_shexp, shexp_mid_fp8);
             shexp_out = cast_dense_fp8_out(shexp_out, true);
         } else {
             shexp_out = build_ffn(ffn_act_inp,

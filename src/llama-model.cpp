@@ -2050,29 +2050,39 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 const bool has_fp8_wq_a = ml.get_key("deepseek4.fp8.wq_a", hparams.deepseek4_fp8_wq_a, false);
                 const bool has_fp8_wq_b = ml.get_key("deepseek4.fp8.wq_b", hparams.deepseek4_fp8_wq_b, false);
                 const bool has_fp8_wkv = ml.get_key("deepseek4.fp8.wkv", hparams.deepseek4_fp8_wkv, false);
-                ml.get_key("deepseek4.fp8.attn_out", hparams.deepseek4_fp8_attn_out, false);
-                ml.get_key("deepseek4.fp8.indexer_q", hparams.deepseek4_fp8_indexer_q, false);
-                ml.get_key("deepseek4.fp8.shared_expert", hparams.deepseek4_fp8_shared_expert, false);
-                if (hparams.deepseek4_fp8_attn_qkv && !(has_fp8_wq_a || has_fp8_wq_b || has_fp8_wkv)) {
+                const bool has_fp8_attn_out = ml.get_key("deepseek4.fp8.attn_out", hparams.deepseek4_fp8_attn_out, false);
+                const bool has_fp8_indexer_q = ml.get_key("deepseek4.fp8.indexer_q", hparams.deepseek4_fp8_indexer_q, false);
+                const bool has_fp8_shared_expert = ml.get_key("deepseek4.fp8.shared_expert", hparams.deepseek4_fp8_shared_expert, false);
+
+                // Expand umbrella qkv bit when concrete qkv flags are all false.
+                if (hparams.deepseek4_fp8_attn_qkv && !(hparams.deepseek4_fp8_wq_a || hparams.deepseek4_fp8_wq_b || hparams.deepseek4_fp8_wkv)) {
                     hparams.deepseek4_fp8_wq_a = true;
                     hparams.deepseek4_fp8_wq_b = true;
                     hparams.deepseek4_fp8_wkv = true;
                 }
-                const bool has_any_deepseek4_fp8_value =
-                    hparams.deepseek4_fp8_attn_qkv ||
-                    hparams.deepseek4_fp8_wq_a ||
-                    hparams.deepseek4_fp8_wq_b ||
-                    hparams.deepseek4_fp8_wkv ||
-                    hparams.deepseek4_fp8_attn_out ||
-                    hparams.deepseek4_fp8_indexer_q ||
-                    hparams.deepseek4_fp8_shared_expert;
-                if (hparams.deepseek4_dense_fp8 && !has_any_deepseek4_fp8_value) {
-                    hparams.deepseek4_fp8_wq_a = true;
-                    hparams.deepseek4_fp8_wq_b = true;
-                    hparams.deepseek4_fp8_wkv = true;
-                    hparams.deepseek4_fp8_attn_out = true;
-                    hparams.deepseek4_fp8_indexer_q = true;
-                    hparams.deepseek4_fp8_shared_expert = true;
+
+                // Dense-fp8 metadata means dense paths are fp8 by default. Respect explicit
+                // per-path keys, but enable missing per-path flags by default.
+                if (hparams.deepseek4_dense_fp8) {
+                    if (!has_fp8_wq_a) {
+                        hparams.deepseek4_fp8_wq_a = true;
+                    }
+                    if (!has_fp8_wq_b) {
+                        hparams.deepseek4_fp8_wq_b = true;
+                    }
+                    if (!has_fp8_wkv) {
+                        hparams.deepseek4_fp8_wkv = true;
+                    }
+                    if (!has_fp8_attn_out) {
+                        hparams.deepseek4_fp8_attn_out = true;
+                    }
+                    if (!has_fp8_indexer_q) {
+                        hparams.deepseek4_fp8_indexer_q = true;
+                    }
+                    if (!has_fp8_shared_expert) {
+                        hparams.deepseek4_fp8_shared_expert = true;
+                    }
+
                 }
                 ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.deepseek4_sliding_window, false);
                 hparams.n_swa = hparams.deepseek4_sliding_window;

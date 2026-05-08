@@ -11673,7 +11673,11 @@ void ggml_compute_forward_dsv4_hc_expand(
 
 static float ggml_dsv4_e4m3fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = std::min(std::fabs(x), 448.0f);
+    float ax = std::fabs(x);
+    if (std::isnan(ax)) {
+        ax = 448.0f;
+    }
+    ax = std::min(ax, 448.0f);
 
     int best = 0;
     float best_diff = ax;
@@ -11740,8 +11744,9 @@ void ggml_compute_forward_dsv4_fp8_kv_quantize(
             const float scale = std::ldexp(1.0f, int(std::ceil(std::log2(amax / 448.0f))));
             for (int64_t i = 0; i < 64; ++i) {
                 const float v = *(const float *) (src_base + (off + i)*src0->nb[0]);
+                const float q = std::fmin(std::fmax(v / scale, -448.0f), 448.0f);
                 *(float *) (dst_base + (off + i)*dst->nb[0]) =
-                    ggml_dsv4_e4m3fn_dequant(std::clamp(v / scale, -448.0f, 448.0f)) * scale;
+                    ggml_dsv4_e4m3fn_dequant(q) * scale;
             }
         }
 
@@ -11858,10 +11863,12 @@ static void ggml_compute_forward_dsv4_sparse_attn_t(
         for (int64_t d = 0; d < head_dim_kv; ++d) acc_o[d] = 0.0f;
 
         // Window-mask pointer for this token (rows are over n_window, columns over n_tokens).
-        // GGML mask layout: ne[0]=n_window (innermost), ne[1]=n_tokens.
+        // GGML mask layout: ne[0]=n_window (innermost), ne[1]=n_tokens, ne[3]=stream/batch.
+        // Support both per-stream masks (ne[3] == batch) and broadcast masks (ne[3] == 1).
         const float * wmask_row = nullptr;
         if (src_wmask) {
-            wmask_row = (const float *)((const char *)src_wmask->data + t * src_wmask->nb[1]);
+            const int64_t b_mask = src_wmask->ne[3] == 1 ? 0 : b;
+            wmask_row = (const float *)((const char *)src_wmask->data + b_mask * src_wmask->nb[3] + t * src_wmask->nb[1]);
         }
 
         // Phase 1: window positions (contiguous, optionally masked for causality).
