@@ -17,8 +17,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -151,6 +153,12 @@ struct server_slot {
     bool has_new_line   = false;
     bool truncated      = false;
 
+    // DeepSeek4 DSML tool-call state (for decode-time greedy-in-tool-call behavior).
+    // `dsv4_tool_scan_tail` is only a tiny marker-boundary buffer used to detect
+    // open/close tags across token-piece boundaries; it does NOT store or cap tool content.
+    bool dsv4_tool_call_open = false;
+    std::string dsv4_tool_scan_tail;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -233,6 +241,8 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        dsv4_tool_call_open = false;
+        dsv4_tool_scan_tail.clear();
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -320,6 +330,55 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    void dsv4_update_tool_state(const std::string & piece) {
+        if (piece.empty()) {
+            return;
+        }
+
+        static const std::array<const char *, 2> starts = {
+            "<｜DSML｜tool_calls>",
+            "<DSML｜tool_calls>",
+        };
+        static const std::array<const char *, 2> ends = {
+            "</｜DSML｜tool_calls>",
+            "</DSML｜tool_calls>",
+        };
+
+        std::string scan = dsv4_tool_scan_tail + piece;
+
+        if (!dsv4_tool_call_open) {
+            for (const auto * s : starts) {
+                if (scan.find(s) != std::string::npos) {
+                    dsv4_tool_call_open = true;
+                    break;
+                }
+            }
+        }
+
+        if (dsv4_tool_call_open) {
+            for (const auto * e : ends) {
+                if (scan.find(e) != std::string::npos) {
+                    dsv4_tool_call_open = false;
+                    break;
+                }
+            }
+        }
+
+        size_t keep = 0;
+        for (const auto * s : starts) {
+            keep = std::max(keep, std::strlen(s));
+        }
+        for (const auto * e : ends) {
+            keep = std::max(keep, std::strlen(e));
+        }
+
+        if (scan.size() > keep) {
+            dsv4_tool_scan_tail = scan.substr(scan.size() - keep);
+        } else {
+            dsv4_tool_scan_tail = std::move(scan);
+        }
     }
 
     void add_token(const completion_token_output & token) {
@@ -1374,6 +1433,10 @@ private:
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
+        if (slot.task->params.dsv4_arch && slot.task->params.chat_parser_params.parse_tool_calls) {
+            slot.dsv4_update_tool_state(token_str);
+        }
+
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
@@ -1498,6 +1561,21 @@ private:
         SLT_DBG(slot, "n_decoded = %d, n_remaining = %d, next token: %5d '%s'\n", slot.n_decoded, slot.n_remaining, result.tok, token_str.c_str());
 
         return slot.has_next_token; // continue
+    }
+
+    llama_token sample_argmax_token(llama_context * ctx, int idx) const {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+        llama_token best_tok = 0;
+        float best_logit = logits[0];
+        for (llama_token tok = 1; tok < n_vocab; ++tok) {
+            if (logits[tok] > best_logit) {
+                best_logit = logits[tok];
+                best_tok = tok;
+            }
+        }
+        return best_tok;
     }
 
     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
@@ -3005,7 +3083,17 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                llama_token id;
+                const bool dsv4_force_greedy_tool_call =
+                    slot.task->params.dsv4_arch &&
+                    slot.task->params.chat_parser_params.parse_tool_calls &&
+                    slot.dsv4_tool_call_open;
+
+                if (dsv4_force_greedy_tool_call) {
+                    id = sample_argmax_token(slot.ctx, tok_idx);
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
+                }
 
                 slot.i_batch = -1;
 
@@ -3865,7 +3953,9 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3883,7 +3973,9 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3911,7 +4003,9 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3929,7 +4023,9 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3947,7 +4043,9 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
 
         json prompt = body_parsed.at("prompt");
         llama_tokens tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true);
@@ -3963,7 +4061,9 @@ void server_routes::init_routes() {
         json data = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            ctx_server.vocab,
+            ctx_server.model != nullptr && ctx_server.model->arch == LLM_ARCH_DEEPSEEK4);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };

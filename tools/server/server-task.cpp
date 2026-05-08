@@ -261,6 +261,8 @@ task_params server_task::params_from_json_cmpl(
 
     params.stream           = json_value(data,       "stream",             false);
     auto stream_opt         = json_value(data,       "stream_options",     json::object());
+    params.dsv4_arch        = json_value(data,       "dsv4_arch",          false);
+    params.dsv4_thinking_mode = json_value(data,     "dsv4_thinking_mode", false);
     params.include_usage    = json_value(stream_opt, "include_usage",      false);
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
@@ -602,6 +604,22 @@ task_params server_task::params_from_json_cmpl(
         } else {
             params.sampling.samplers = defaults.sampling.samplers;
         }
+    }
+
+    if (params.dsv4_arch) {
+        // ds4-style server parity: no server-side prompt-cache reuse, no speculative decoding,
+        // and a minimal sampler chain matching top_k/top_p/min_p/temp behavior.
+        params.cache_prompt = false;
+        params.n_cache_reuse = 0;
+        params.speculative.n_min = 0;
+        params.speculative.n_max = 0;
+        params.speculative.p_min = 0.0f;
+        params.sampling.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K,
+            COMMON_SAMPLER_TYPE_TOP_P,
+            COMMON_SAMPLER_TYPE_MIN_P,
+            COMMON_SAMPLER_TYPE_TEMPERATURE,
+        };
     }
 
     if (params.n_cmpl > params_base.n_parallel) {

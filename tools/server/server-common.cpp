@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-chat-deepseek4.h"
 
 #include <random>
 #include <sstream>
@@ -911,7 +912,9 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    const llama_vocab * vocab,
+    bool is_deepseek4_arch)
 {
     json llama_params;
 
@@ -919,6 +922,7 @@ json oaicompat_chat_params_parse(
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+    const bool dsv4_compat = is_deepseek4_arch;
 
     if (!opt.use_jinja) {
         if (has_tools) {
@@ -1108,16 +1112,38 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
-    llama_params["prompt"]      = chat_params.prompt;
-    if (!chat_params.grammar.empty()) {
+
+    if (dsv4_compat) {
+        const bool tool_choice_none = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE;
+        llama_params["prompt"] = dsv4_build_prompt_tokens(
+            messages,
+            tools,
+            inputs.chat_template_kwargs,
+            inputs.enable_thinking,
+            tool_choice_none,
+            vocab);
+        llama_params["dsv4_arch"] = true;
+        llama_params["dsv4_thinking_mode"] = inputs.enable_thinking;
+        llama_params["cache_prompt"] = false;
+        llama_params["n_cache_reuse"] = 0;
+        llama_params["speculative.n_min"] = 0;
+        llama_params["speculative.n_max"] = 0;
+    } else {
+        llama_params["prompt"] = chat_params.prompt;
+    }
+
+    if (!chat_params.grammar.empty() && !dsv4_compat) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");
     }
-    llama_params["grammar_lazy"] = chat_params.grammar_lazy;
-    auto grammar_triggers        = json::array();
-    for (const auto & trigger : chat_params.grammar_triggers) {
-        server_grammar_trigger ct(trigger);
-        grammar_triggers.push_back(ct.to_json());
+
+    llama_params["grammar_lazy"] = dsv4_compat ? false : chat_params.grammar_lazy;
+    auto grammar_triggers = json::array();
+    if (!dsv4_compat) {
+        for (const auto & trigger : chat_params.grammar_triggers) {
+            server_grammar_trigger ct(trigger);
+            grammar_triggers.push_back(ct.to_json());
+        }
     }
     llama_params["grammar_triggers"]  = grammar_triggers;
     llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
@@ -1142,6 +1168,10 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
             llama_params["reasoning_budget_message"] = opt.reasoning_budget_message;
         }
+    }
+
+    if (dsv4_compat) {
+        dsv4_apply_sampling_defaults(llama_params, body, inputs.enable_thinking);
     }
 
     // Handle "logprobs" field
