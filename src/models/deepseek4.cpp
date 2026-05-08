@@ -1933,7 +1933,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(shexp_gate, "ffn_shexp_gate", il);
 
             // ds4 parity: shared expert uses plain SwiGLU (no clamp).
-            ggml_tensor * shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
+            // Cast to f32 first — FP8 path carries BF16 activations but
+            // CUDA/CPU swiglu kernels require f32 or f16.
+            ggml_tensor * shexp_mid = ggml_swiglu_split(ctx0, as_f32(shexp_gate), as_f32(shexp_up));
             cb(shexp_mid, "ffn_shexp_swiglu", il);
 
             ggml_tensor * shexp_mid_src = ggml_cast(ctx0, shexp_mid, GGML_TYPE_BF16);
