@@ -2322,9 +2322,19 @@ private:
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
 
-        auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
+        auto generated_token_piece = [&](server_slot & slot, llama_token token) {
+            // ds4 appends the decoded text for every generated non-EOS token,
+            // including DeepSeek literal/control tokens, before parsing the
+            // assistant message. Do the same for DeepSeek4; otherwise control
+            // tokens detokenize to empty strings and disappear from the parser.
+            const bool dsv4_render_generated_special =
+                slot.task->params.dsv4_arch && !llama_vocab_is_eog(vocab, token);
+            const bool render_special =
+                dsv4_render_generated_special ||
+                params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+
+            return common_token_to_piece(slot.ctx, token, render_special);
         };
 
         // first, add sampled tokens from any ongoing sequences
@@ -3114,7 +3124,7 @@ private:
 
                 completion_token_output result;
                 result.tok          = id;
-                result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
+                result.text_to_send = generated_token_piece(slot, result.tok);
                 result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
                 if (slot.task->params.sampling.n_probs > 0) {
@@ -3218,7 +3228,7 @@ private:
                     completion_token_output result;
 
                     result.tok          = ids[i];
-                    result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
+                    result.text_to_send = generated_token_piece(slot, result.tok);
                     result.prob         = 1.0f; // set later
 
                     // TODO: set result.probs

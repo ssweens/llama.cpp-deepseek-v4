@@ -115,6 +115,9 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
             break;
         }
         case REASONING_BUDGET_FORCING:
+            if (ctx->force_pos < ctx->forced_tokens.size() && token != ctx->forced_tokens[ctx->force_pos]) {
+                break;
+            }
             ctx->force_pos++;
             if (ctx->force_pos >= ctx->forced_tokens.size()) {
                 ctx->state = REASONING_BUDGET_DONE;
@@ -140,9 +143,12 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
 
     const llama_token forced = ctx->forced_tokens[ctx->force_pos];
 
-    // set all logits to -inf except the forced token
+    // set all logits to -inf except the forced token. Make the forced
+    // token finite even if the model/backend had masked that token out.
     for (size_t i = 0; i < cur_p->size; i++) {
-        if (cur_p->data[i].id != forced) {
+        if (cur_p->data[i].id == forced) {
+            cur_p->data[i].logit = 0.0f;
+        } else {
             cur_p->data[i].logit = -INFINITY;
         }
     }

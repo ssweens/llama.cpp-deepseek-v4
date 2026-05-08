@@ -20,6 +20,40 @@ static bool dsv4_debug_paths_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+class dsv4_position_graph_guard : public llm_graph_input_i {
+public:
+    explicit dsv4_position_graph_guard(const llama_ubatch & ubatch) :
+        n_tokens(ubatch.n_tokens),
+        n_pos(ubatch.n_pos) {
+        if (ubatch.pos != nullptr) {
+            pos.assign(ubatch.pos, ubatch.pos + (size_t) ubatch.n_tokens * ubatch.n_pos);
+        }
+    }
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const llama_ubatch & ubatch = params.ubatch;
+        if (ubatch.n_tokens != n_tokens || ubatch.n_pos != n_pos) {
+            return false;
+        }
+        if ((ubatch.pos == nullptr) != pos.empty()) {
+            return false;
+        }
+        if (ubatch.pos == nullptr) {
+            return true;
+        }
+        return std::equal(pos.begin(), pos.end(), ubatch.pos);
+    }
+
+private:
+    uint32_t n_tokens = 0;
+    uint32_t n_pos = 0;
+    std::vector<llama_pos> pos;
+};
+
 static inline float dsv4_e4m3_to_float(uint8_t x) {
     const uint8_t sign = (x >> 7) & 0x1u;
     const uint8_t exp  = (x >> 3) & 0xFu;
@@ -890,6 +924,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return pool;
     };
 
+    res->add_input(std::make_unique<dsv4_position_graph_guard>(ubatch));
     ggml_tensor * inp_pos = build_inp_pos();
     llm_graph_input_mem_hybrid_iswa * inp_mem = nullptr;
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
@@ -1323,13 +1358,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         }
 
         const uint32_t prompt_window_size = hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : (uint32_t) n_tokens;
+        const llama_pos first_pos_batch = ubatch.pos ? ubatch.pos[0] : 0;
+        const bool use_local_prompt_attn = is_prefill && n_tokens > 1 && first_pos_batch == 0;
         bool use_prompt_sparse_attn = false;
         // Unified sparse-gather attention path for prompt eval.
-        // Active iff the layer has a compressor + indexer AND there is at least one
-        // compressed position to gather from. Otherwise fall through to the standard
-        // window-only `build_attn` path below.
+        // Active iff this is the first prompt chunk, the layer has a compressor +
+        // indexer, and there is at least one compressed position to gather from.
+        // Later prompt chunks must use the cache-aware decode/replay path below;
+        // otherwise they lose all context from previous chunks.
         const bool can_use_sparse_prompt =
-            n_tokens > 1 &&
+            use_local_prompt_attn &&
             c_pool != nullptr && c_pool->ne[1] > 0 &&
             idx_pool != nullptr &&
             model.layers[il].attn_indexer_q_b != nullptr &&
@@ -1338,7 +1376,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
         ggml_tensor * prompt_comp_pos = nullptr;
         ggml_tensor * prompt_c_attn = nullptr;
-        const int64_t n_comp_prompt = (!can_use_sparse_prompt && c_pool != nullptr) ? c_pool->ne[1] : 0;
+        const int64_t n_comp_prompt = (use_local_prompt_attn && !can_use_sparse_prompt && c_pool != nullptr) ? c_pool->ne[1] : 0;
         if (n_comp_prompt > 0) {
             ggml_tensor * comp_pos_idx = cache_mask(
                 "comp_pos_idx:" + std::to_string((uint32_t)compress_ratio) + ":" + std::to_string(n_comp_prompt),
@@ -1541,7 +1579,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     return t;
                 });
             ggml_tensor * attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
-            ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
+            // DeepSeek4 raw+compressed prompt attention uses a concatenated
+            // F32 mask. The FlashAttention path produced non-finite logits for
+            // long prompts here; keep this path on the standard F32 softmax MHA.
+            ggml_tensor * attn_mask_cnv = attn_mask;
             ggml_tensor * k_all = ggml_concat(ctx0, Kcur, prompt_c_attn, 2);
 
             ggml_tensor * sink = model.layers[il].attn_sinks;
@@ -1549,7 +1590,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
             }
 
-            cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il);
+            cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il, true);
             cb(cur, "attn_compressed_prompt", il);
             use_prompt_sparse_attn = true;
         }
@@ -1566,7 +1607,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         // use_prompt_sparse_attn=false and let the standard build_attn() path handle the
         // window-only attention (no -inf mask, no FA bug).
         // -----------------------------------------------------------------------------
-        if (!use_prompt_sparse_attn && !(is_prefill && n_tokens > 1) && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
+        if (!use_prompt_sparse_attn && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             if (dsv4_debug_paths_enabled()) {
                 const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
                 const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
@@ -1794,7 +1835,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                         return t;
                     });
                 ggml_tensor * attn_mask = ggml_concat(ctx0, inp_attn_iswa->self_kq_mask_swa, comp_mask, 0);
-                ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
+                // DeepSeek4 raw+compressed continuation attention uses the same
+                // mixed mask/KV shape as prompt compressed attention; force the
+                // standard F32 softmax MHA instead of FlashAttention.
+                ggml_tensor * attn_mask_cnv = attn_mask;
                 ggml_tensor * k_all = ggml_concat(ctx0, k_raw, kv_comp_cache, 2);
 
                 ggml_tensor * sink = model.layers[il].attn_sinks;
@@ -1802,7 +1846,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     sink = ggml_cast(ctx0, sink, GGML_TYPE_F32);
                 }
 
-                cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il);
+                cur = build_attn_mha(Qcur, k_all, k_all, nullptr, attn_mask_cnv, sink, nullptr, kq_scale, il, true);
                 cb(cur, "attn_compressed_decode", il);
                 use_prompt_sparse_attn = true;
             }
