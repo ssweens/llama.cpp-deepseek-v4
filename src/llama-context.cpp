@@ -2954,6 +2954,24 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+        // DeepSeek4 applies its own DSv4 FP8 KV round-trip in the model graph
+        // before values are cached. Generic llama.cpp quantized KV cache types
+        // would quantize those already-rounded values a second time using a
+        // different, non-DSv4-aware scheme (q8_0/q4_0/etc.). Match ds4's
+        // float-addressable cache behavior by using F16 storage instead.
+        if (ggml_is_quantized(params.type_k)) {
+            LLAMA_LOG_WARN("%s: DeepSeek4 applies DSv4 FP8 KV semantics; overriding K cache type %s -> %s to avoid double quantization\n",
+                    __func__, ggml_type_name(params.type_k), ggml_type_name(GGML_TYPE_F16));
+            params.type_k = GGML_TYPE_F16;
+        }
+        if (ggml_is_quantized(params.type_v)) {
+            LLAMA_LOG_WARN("%s: DeepSeek4 applies DSv4 FP8 KV semantics; overriding V cache type %s -> %s to avoid double quantization\n",
+                    __func__, ggml_type_name(params.type_v), ggml_type_name(GGML_TYPE_F16));
+            params.type_v = GGML_TYPE_F16;
+        }
+    }
+
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
