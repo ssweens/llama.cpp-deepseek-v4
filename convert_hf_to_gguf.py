@@ -9317,6 +9317,7 @@ class DeepseekV4Model(TextModel):
 
         block_size = tuple(quant_config.get("weight_block_size", (128, 128)))
         tensors_to_remove: list[str] = []
+        dequantized_fp8_weights: set[str] = set()
 
         for name in list(self.model_tensors.keys()):
             if not name.endswith(".scale"):
@@ -9338,10 +9339,14 @@ class DeepseekV4Model(TextModel):
             weight = self.model_tensors[weight_name]
             scale = self.model_tensors[name]
             self.model_tensors[weight_name] = lambda w=weight, s=scale, bs=block_size: self._dequant_fp8(w(), s(), bs)
+            dequantized_fp8_weights.add(weight_name)
             tensors_to_remove.append(name)
 
         for name in tensors_to_remove:
             self.model_tensors.pop(name, None)
+
+        if dequantized_fp8_weights:
+            self.hparams["_deepseek4_dequantized_fp8_weights"] = dequantized_fp8_weights
 
     def set_vocab(self):
         try:
@@ -9420,16 +9425,26 @@ class DeepseekV4Model(TextModel):
         if (nextn_predict_layers := hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(nextn_predict_layers)
         self.gguf_writer.add_compress_rope_theta(hparams["compress_rope_theta"])
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.dense_fp8", (hparams.get("quantization_config") or {}).get("quant_method") == "fp8")
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_qkv",
-                                  self._has_tensor_suffix('.attn.wq_a.scale') or self._has_tensor_suffix('.attn.wq_b.scale') or self._has_tensor_suffix('.attn.wkv.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_a", self._has_tensor_suffix('.attn.wq_a.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_b", self._has_tensor_suffix('.attn.wq_b.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wkv", self._has_tensor_suffix('.attn.wkv.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_out", self._has_tensor_suffix('.attn.wo_b.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.indexer_q", self._has_tensor_suffix('.attn.indexer.wq_b.scale'))
-        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.shared_expert",
-                                  self._has_tensor_suffix('.ffn.shared_experts.w1.scale') or self._has_tensor_suffix('.ffn.shared_experts.w2.scale') or self._has_tensor_suffix('.ffn.shared_experts.w3.scale'))
+        dense_fp8 = (hparams.get("quantization_config") or {}).get("quant_method") == "fp8"
+        dequantized_fp8_weights = hparams.get("_deepseek4_dequantized_fp8_weights", set())
+        had_fp8_weight_suffix = lambda suffix: any(name.endswith(suffix) for name in dequantized_fp8_weights)
+        fp8_wq_a = self._has_tensor_suffix('.attn.wq_a.scale') or had_fp8_weight_suffix('.attn.wq_a.weight')
+        fp8_wq_b = self._has_tensor_suffix('.attn.wq_b.scale') or had_fp8_weight_suffix('.attn.wq_b.weight')
+        fp8_wkv = self._has_tensor_suffix('.attn.wkv.scale') or had_fp8_weight_suffix('.attn.wkv.weight')
+        fp8_attn_out = self._has_tensor_suffix('.attn.wo_b.scale') or had_fp8_weight_suffix('.attn.wo_b.weight')
+        fp8_indexer_q = self._has_tensor_suffix('.attn.indexer.wq_b.scale') or had_fp8_weight_suffix('.attn.indexer.wq_b.weight')
+        fp8_shared_expert = (
+            self._has_tensor_suffix('.ffn.shared_experts.w1.scale') or had_fp8_weight_suffix('.ffn.shared_experts.w1.weight') or
+            self._has_tensor_suffix('.ffn.shared_experts.w2.scale') or had_fp8_weight_suffix('.ffn.shared_experts.w2.weight') or
+            self._has_tensor_suffix('.ffn.shared_experts.w3.scale') or had_fp8_weight_suffix('.ffn.shared_experts.w3.weight'))
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.dense_fp8", dense_fp8)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_qkv", fp8_wq_a or fp8_wq_b or fp8_wkv)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_a", fp8_wq_a)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wq_b", fp8_wq_b)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.wkv", fp8_wkv)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.attn_out", fp8_attn_out)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.indexer_q", fp8_indexer_q)
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.fp8.shared_expert", fp8_shared_expert)
         self.gguf_writer.add_sliding_window(hparams["sliding_window"])
         self.gguf_writer.add_hyperconnection_count(hparams["hc_mult"])
         self.gguf_writer.add_hyperconnection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
