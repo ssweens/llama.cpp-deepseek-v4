@@ -1911,12 +1911,38 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         moe_out = as_f32(moe_out);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * shexp_out = build_ffn(ffn_act_inp,
-                model.layers[il].ffn_up_shexp,   nullptr, nullptr,
-                model.layers[il].ffn_gate_shexp, nullptr, nullptr,
-                model.layers[il].ffn_down_shexp, nullptr, nullptr,
-                nullptr,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        ggml_tensor * shexp_out = nullptr;
+        if (hparams.deepseek4_fp8_shared_expert) {
+            // DeepSeek-V4 official inference runs shared expert Linears in FP8 mode,
+            // which applies activation quantization per Linear input. Mirror that
+            // QAT flow here: input -> (w1,w3), then SwiGLU hidden -> w2.
+            ggml_tensor * shexp_inp_src = ggml_cast(ctx0, ffn_act_inp, GGML_TYPE_BF16);
+            ggml_tensor * shexp_inp = apply_dense_fp8_qat(shexp_inp_src, true, "ffn_shexp_inp_fp8_qat", il);
+
+            ggml_tensor * shexp_up = mul_mat_checked(model.layers[il].ffn_up_shexp, shexp_inp, "ffn.shexp.w3");
+            shexp_up = cast_dense_fp8_out(shexp_up, true);
+            cb(shexp_up, "ffn_shexp_up", il);
+
+            ggml_tensor * shexp_gate = mul_mat_checked(model.layers[il].ffn_gate_shexp, shexp_inp, "ffn.shexp.w1");
+            shexp_gate = cast_dense_fp8_out(shexp_gate, true);
+            cb(shexp_gate, "ffn_shexp_gate", il);
+
+            ggml_tensor * shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
+            cb(shexp_mid, "ffn_shexp_swiglu", il);
+
+            ggml_tensor * shexp_mid_src = ggml_cast(ctx0, shexp_mid, GGML_TYPE_BF16);
+            ggml_tensor * shexp_mid_fp8 = apply_dense_fp8_qat(shexp_mid_src, true, "ffn_shexp_mid_fp8_qat", il);
+
+            shexp_out = mul_mat_checked(model.layers[il].ffn_down_shexp, shexp_mid_fp8, "ffn.shexp.w2");
+            shexp_out = cast_dense_fp8_out(shexp_out, true);
+        } else {
+            shexp_out = build_ffn(ffn_act_inp,
+                    model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                    model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                    model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                    nullptr,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         shexp_out = as_f32(shexp_out);
         cb(shexp_out, "ffn_shexp_out", il);
 
