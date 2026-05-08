@@ -1932,18 +1932,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             shexp_gate = cast_dense_fp8_out(shexp_gate, true);
             cb(shexp_gate, "ffn_shexp_gate", il);
 
-            ggml_tensor * shexp_mid = nullptr;
-            {
-                const float limit = hparams.f_swiglu_limit;
-                constexpr float eps = 1e-6f;
-                if (limit > eps) {
-                    shexp_mid = ggml_swiglu_clamped(ctx0, shexp_gate, shexp_up, limit);
-                    cb(shexp_mid, "ffn_shexp_swiglu_limited", il);
-                } else {
-                    shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
-                    cb(shexp_mid, "ffn_shexp_swiglu", il);
-                }
-            }
+            // ds4 parity: shared expert uses plain SwiGLU (no clamp).
+            ggml_tensor * shexp_mid = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
+            cb(shexp_mid, "ffn_shexp_swiglu", il);
 
             ggml_tensor * shexp_mid_src = ggml_cast(ctx0, shexp_mid, GGML_TYPE_BF16);
             ggml_tensor * shexp_mid_fp8 = apply_dense_fp8_qat(shexp_mid_src, true, "ffn_shexp_mid_fp8_qat", il);
