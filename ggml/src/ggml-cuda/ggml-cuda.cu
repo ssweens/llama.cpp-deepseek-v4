@@ -2696,8 +2696,10 @@ struct dsv4_op_profiler {
     struct entry { double ms = 0.0; int64_t calls = 0; };
     std::unordered_map<int, entry> by_op;
     std::unordered_map<std::string, entry> by_tag;
+    std::unordered_map<std::string, entry> by_op_tag;
     std::unordered_map<std::string, std::unordered_map<int, entry>> by_split_op;
     std::unordered_map<std::string, std::unordered_map<std::string, entry>> by_split_tag;
+    std::unordered_map<std::string, std::unordered_map<std::string, entry>> by_split_op_tag;
 
     static dsv4_op_profiler & get() {
         static dsv4_op_profiler p;
@@ -2740,14 +2742,18 @@ struct dsv4_op_profiler {
         if (name) {
             std::string tag;
             if      (strstr(name, "attn_sparse"))       tag = "attn_sparse";
+            else if (strstr(name, "attn_o_a"))          tag = "attn.grouped_o_a";
             else if (strstr(name, "attn_indexer"))      tag = "attn_indexer";
             else if (strstr(name, "attn_compressor"))   tag = "attn_compressor";
             else if (strstr(name, "compressor"))        tag = "compressor_other";
             else if (strstr(name, "indexer"))           tag = "indexer_other";
+            else if (strstr(name, "ffn_moe_down"))      tag = "moe.ffn_down";
+            else if (strstr(name, "ffn_moe_gate"))      tag = "moe.ffn_gate";
+            else if (strstr(name, "ffn_moe_up"))        tag = "moe.ffn_up";
+            else if (strstr(name, "ffn_moe_logits") || strstr(name, "ffn_gate_inp")) tag = "moe.router";
             else if (strstr(name, "ffn_down_exps"))     tag = "moe.ffn_down";
             else if (strstr(name, "ffn_gate_exps"))     tag = "moe.ffn_gate";
             else if (strstr(name, "ffn_up_exps"))       tag = "moe.ffn_up";
-            else if (strstr(name, "ffn_gate_inp"))      tag = "moe.router";
             else if (strstr(name, "_shexp"))            tag = "shared_expert";
             else if (strstr(name, "hc_"))               tag = "hc_split";
             else if (strstr(name, "attn"))              tag = "attn_other";
@@ -2756,9 +2762,16 @@ struct dsv4_op_profiler {
             auto & en = by_tag[tag];
             en.ms += ms;
             en.calls += 1;
+            const std::string op_tag = std::string(ggml_op_name((ggml_op) dst->op)) + ":" + tag;
+            auto & eot = by_op_tag[op_tag];
+            eot.ms += ms;
+            eot.calls += 1;
             auto & en_split = by_split_tag[sk][tag];
             en_split.ms += ms;
             en_split.calls += 1;
+            auto & eot_split = by_split_op_tag[sk][op_tag];
+            eot_split.ms += ms;
+            eot_split.calls += 1;
         }
     }
     ~dsv4_op_profiler() {
@@ -2783,6 +2796,17 @@ struct dsv4_op_profiler {
             fprintf(stderr, "%-32s %12s %10s %8s\n", "tag", "total_ms", "calls", "pct");
             for (auto & p : tags) {
                 fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                        p.first.c_str(), p.second.ms, (long long) p.second.calls,
+                        (total > 0.0) ? (100.0 * p.second.ms / total) : 0.0);
+            }
+        }
+        if (!by_op_tag.empty()) {
+            std::vector<std::pair<std::string, entry>> op_tags(by_op_tag.begin(), by_op_tag.end());
+            std::sort(op_tags.begin(), op_tags.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+            fprintf(stderr, "\nDSv4 op+tag buckets:\n");
+            fprintf(stderr, "%-40s %12s %10s %8s\n", "op:tag", "total_ms", "calls", "pct");
+            for (auto & p : op_tags) {
+                fprintf(stderr, "%-40s %12.2f %10lld %7.2f%%\n",
                         p.first.c_str(), p.second.ms, (long long) p.second.calls,
                         (total > 0.0) ? (100.0 * p.second.ms / total) : 0.0);
             }
@@ -2819,6 +2843,18 @@ struct dsv4_op_profiler {
                     fprintf(stderr, "%-32s %12s %10s %8s\n", "tag", "total_ms", "calls", "pct");
                     for (auto & p : split_tags) {
                         fprintf(stderr, "%-32s %12.2f %10lld %7.2f%%\n",
+                                p.first.c_str(), p.second.ms, (long long) p.second.calls,
+                                (split_total > 0.0) ? (100.0 * p.second.ms / split_total) : 0.0);
+                    }
+                }
+                auto it_op_tag = by_split_op_tag.find(sk);
+                if (it_op_tag != by_split_op_tag.end() && !it_op_tag->second.empty()) {
+                    std::vector<std::pair<std::string, entry>> split_op_tags(it_op_tag->second.begin(), it_op_tag->second.end());
+                    std::sort(split_op_tags.begin(), split_op_tags.end(), [](const auto & a, const auto & b) { return a.second.ms > b.second.ms; });
+                    fprintf(stderr, "split op+tag buckets:\n");
+                    fprintf(stderr, "%-40s %12s %10s %8s\n", "op:tag", "total_ms", "calls", "pct");
+                    for (auto & p : split_op_tags) {
+                        fprintf(stderr, "%-40s %12.2f %10lld %7.2f%%\n",
                                 p.first.c_str(), p.second.ms, (long long) p.second.calls,
                                 (split_total > 0.0) ? (100.0 * p.second.ms / split_total) : 0.0);
                     }

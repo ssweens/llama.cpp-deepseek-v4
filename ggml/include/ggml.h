@@ -2646,7 +2646,8 @@ extern "C" {
             struct ggml_tensor  * window_mask,  // may be NULL
             struct ggml_tensor  * topk_idxs,
             struct ggml_tensor  * attn_sink,    // may be NULL
-            float                 scale);
+            float                 scale,
+            int32_t               raw_window_limit); // 0 = scan full kv_window
 
     // custom operators
 

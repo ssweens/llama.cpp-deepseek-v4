@@ -124,6 +124,41 @@
 - Main now includes commit `22eaf7d89 perf(deepseek4): reduce prefill checkpoint fragmentation`.
 - `work/dsv4-prefill-speedup` remains alive and points at the same commit as `main` for follow-up bug fixes.
 
+## General DSv4 prefill speed follow-up — vectorized continuation compressor
+- [x] Implement a guarded vectorized continuation-prefill compressor for contiguous single-sequence ratio-4 chunks that start after position 0, so large cold prompts do not route all post-first chunks through per-token decode replay.
+- [x] Keep the existing decode/replay path as the fallback for decode, multi-seq, non-contiguous positions, non-ratio-4 layers, or unsafe alignment.
+- [x] Build and validate `llama-server` after the graph change: host `build-vulkan-linux-release` build passed; mounted CUDA/HIP `build-dsv4-container` build passed.
+- [x] Run the DeepSeek4 endpoint regression harness with IQ2_XXS and compare prompt chunk/path logs for large prompts: all 7 regression cases passed; debug logs confirmed `path=prefill-replay` on aligned continuation chunks.
+- [x] Record results and decide whether backend fusion/profiling is still needed. Clean no-debug IQ2_XXS Mina timing: fresh 2486-token prefill `265.04 tok/s` vs previous ~`220.83 tok/s`; checkpoint-replayed 1078-token prefill `189.85-194.73 tok/s` vs previous ~`151-155 tok/s`. This is a useful ~20-28% improvement, not 2x; next candidates are larger backend fusion/profile work around prompt indexer/top-k, compressor pooling, and MoE/expert matmul throughput.
+
+## CUDA prefill profiling — IQ2_XXS
+- [ ] Free the ad hoc mounted-code server container only, leaving Corral/systemd-managed services untouched.
+- [ ] Build/check a bounded standalone profiling harness (`llama-bench` or equivalent) in `build-dsv4-container`.
+- [ ] Run non-profiled CUDA prefill baselines for prompt sizes 512/2048/8192 with `-n 1` and key `-ub` settings.
+- [ ] Run `GGML_PROFILE_OPS=1` prefill profiles for representative prompt sizes/configs and capture op-share summaries.
+- [ ] Compare op mix: `MUL_MAT`, `MUL_MAT_ID`, `DSV4_SPARSE_ATTN`, `ARGSORT`, compressor ops, `CPY`, `SET_ROWS`, and scheduler split/copy indicators.
+- [x] Record findings and choose the next implementation target: profiles show CUDA prefill is dominated by `DSV4_SPARSE_ATTN` for large prompt ubatches because the prompt path passes `Kcur` as `n_window=n_tokens` with a dense `[n_tokens,n_tokens]` mask, so the kernel scans masked-out raw positions even though DSv4 logical SWA is 128.
+
+## CUDA prefill optimization — bounded prompt sparse raw window
+- [x] Add a bounded raw-window mode to `GGML_OP_DSV4_SPARSE_ATTN` via op params, defaulting to current behavior for decode/Vulkan and any caller that passes `0`.
+- [x] Pass `prompt_window_size` from the DSv4 prompt sparse path when causal prompt attention is active.
+- [x] Keep decode path unchanged and preserve the dense mask as a correctness guard for visible positions.
+- [x] Preserve ROCm/HIP behavior: the shared CUDA/HIP sparse-attn source compiles, and bounded prompt scanning remains semantically identical to the mask-scanning path for visible rows.
+- [x] Build CUDA/HIP and host targets. Host `llama-server llama-bench` build passed; mounted Docker CUDA/HIP `llama-bench llama-server` build passed.
+- [x] Re-profile IQ2_XXS prefill to verify `DSV4_SPARSE_ATTN` time drops and run IQ2_XXS endpoint regressions; run at least a bounded ROCm smoke if hardware/runtime permits. CUDA p2048/ub2048 improved `345.66 -> 612.91 tok/s` non-profiled and `DSV4_SPARSE_ATTN` dropped `3866.68 -> 1315.55 ms`; IQ2_XXS regression passed on retry after one non-deterministic cache-reuse tool-name miss; ROCm0 p64 smoke passed at `49.49 tok/s`.
+
+## CUDA prefill optimization — MoE / `MUL_MAT_ID` long-prompt target
+- [x] Commit bounded sparse-attention work: `e68598bab perf(deepseek4): bound prompt sparse raw attention`.
+- [x] Free only the ad hoc mounted-code server container before benchmarking; no Corral/systemd-managed containers were touched.
+- [x] Establish current grid after bounded sparse-attn: IQ2_XXS CUDA p2048/ub512 `298.47 tok/s`, p8192/ub512 `262.53 tok/s`, p2048/ub1024 `349.44 tok/s`, p8192/ub1024 `251.89 tok/s`, p2048/ub2048 `644.81 tok/s`, p8192/ub2048 crashes.
+- [x] Profile p2048/ub512 vs p8192/ub512 with the same ubatch to separate pure context-length effects from chunk-size effects. After sparse mask-skip, p8192/ub512 improved to `285.11 tok/s`; detailed profile shows `MUL_MAT_ID` now dominates and `DSV4_SPARSE_ATTN` fell to `5055.68 ms / 15.42%`.
+- [x] Instrument or derive the `GGML_OP_MUL_MAT_ID` dispatch path for DSv4 IQ2_XXS: MMVQ for tiny `ne2`, MMQ for large routed-expert prefill, slow host-sorted path must remain avoided. Component profiling with graphs disabled shows ID compaction + activation quantization are tiny; expert MMQ matmul itself is ~96% of routed expert time.
+- [x] Switch further multi-variant perf sweeps to a persistent resident model plus `llama-benchy` API harness from `.venv`; avoid repeated full-model `docker run llama-bench` reloads except for one-off backend-only checks. First coherence-enabled API baseline against resident mounted-code server (`-ub 1024`) passed coherence and measured p2048 `357.04 tok/s`, p8192 `277.28 tok/s` via benchy; server logs showed p2048 `365.39 tok/s`, p8192 `279.26 tok/s`.
+- [ ] Debug the p8192/ub2048 CUDA graph/cuBLAS crash with precise CUDA error text and, if needed, narrower prompt/ubatch bisect; p4096/ub2048 passes with `GGML_CUDA_DISABLE_GRAPHS=1`, so at least one failure mode is CUDA-graph-specific.
+- [ ] If MMQ remains the dominant wall after API-based baselines, target the GPU-side routed-expert MMQ matmul/tile shape; `mm_ids_helper` and `quantize_mmq_q8_1_cuda` are not the wall.
+- [ ] Preserve ROCm/HIP behavior: any shared CUDA/HIP kernel change must compile in the HIP build and get at least a ROCm0 smoke when hardware/runtime permits.
+- [x] Re-run IQ2_XXS endpoint regression and compare prefill grid after any code change. Post-commit resident-server regression passed all 7 cases with `--max-tokens 2048` against `http://127.0.0.1:18089` after correcting the harness base URL (the harness appends `/v1/chat/completions`).
+
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
 ### Goal

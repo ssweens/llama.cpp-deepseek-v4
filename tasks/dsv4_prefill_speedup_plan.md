@@ -107,53 +107,88 @@ Risk:
 
 ## Candidate 2 — larger architecture win: vectorized continuation prefill compressor
 
+Status: implemented for guarded ratio-4 continuation chunks on `work/dsv4-prefill-speedup` after the main merge.
+
 Current `is_prefill` is effectively only true for chunks starting at position 0:
 
 ```cpp
 const bool is_prefill = ubatch.pos == nullptr || ubatch.pos[0] == 0;
 ```
 
-Continuation prompt chunks after cache restore or after the first `n_batch` chunk use decode-style compressor logic. For long prompts, this means most prompt tokens can miss the vectorized prefill path.
+Continuation prompt chunks after cache restore or after the first `n_batch` chunk used decode-style compressor logic. For long prompts, this meant most prompt tokens could miss the vectorized prefill path.
 
-Implement a vectorized continuation prefill path for contiguous single-sequence chunks that start on a safe compression/checkpoint boundary:
+Implemented a vectorized continuation prefill path for the common safe case:
 
-- Preconditions:
-  - `has_hybrid_iswa`
-  - single contiguous sequence
-  - `n_tokens > 1`
-  - `first_pos % compress_ratio == 0` or stronger DSv4 alignment (`first_pos % 128 == 0`) for current cache-safety rules
-- For ratio 4, seed the first shifted/previous window from `prev_kv_state` / `prev_score_state` instead of zero/`-inf`, then use the same vectorized pooling style as `build_compressed_pool` for the chunk.
-- Store the generated compressed rows and final recurrent state exactly as the decode-chunk path does.
+- `compress_ratio == 4`
+- single sequence / one seq id
+- `n_tokens > 1`
+- `first_pos > 0`
+- `first_pos % 4 == 0`
+- `n_tokens % 4 == 0`
+- `ubatch.pos[i] == first_pos + i`
 
-Expected effect:
+The helper mirrors `/home/bigkahuna/src/ds4` Metal `compressor_prefill_ratio4_replay` semantics:
 
-- Large continuation prefill chunks after prompt-cache restore should move from per-token recurrent graph construction to parallel compressor/pool math.
-- This is the more plausible path to a real 2x prefill improvement on multi-thousand-token prompts.
+- Project `kv` and `score` for the whole chunk once.
+- Add APE in vectorized `{width, ratio, n_comp}` layout.
+- Seed the first shifted previous half from rows `0..3` of the previous compressor state.
+- Use the current chunk's previous half for later compressed rows.
+- Pool all compressed rows in parallel, apply RMS/norm and compressed RoPE positions.
+- Leave recurrent state in post-prefill layout: rows `0..3` hold the final full window; rows `4..7` are cleared until decode writes the next current half.
 
-Risk:
-
-- Higher correctness risk than Candidate 1: ratio-4 overlap state must match decode semantics exactly.
-- Needs parity against existing decode-chunk path for several `(first_pos, n_tokens, ratio)` cases.
+Fallback remains the existing per-token decode/replay path for decode, multi-seq, non-contiguous positions, non-ratio-4 layers, or unaligned chunks.
 
 Validation:
 
-- Build a small backend/unit harness or add debug compare mode that constructs both old decode-chunk and new vectorized-continuation outputs for the same chunk and checks final `kv_state`, `score_state`, and `kv_comp`.
-- Then validate full model with systemctl-managed Corral histories.
+- Host build: `cmake --build build-vulkan-linux-release --target llama-server -j 8` passed.
+- Mounted CUDA/HIP build: `cmake --build /src/build-dsv4-container --target llama-server -j 8` passed inside `llamatrifecta_deepseekv4:latest`.
+- First runtime attempt caught a real bug: reshaping non-contiguous previous-state seed views. Fixed by applying `cont_if_needed()` before reshape.
+- IQ2_XXS endpoint regression passed all 7 cases after the fix.
+- Debug run confirmed `path=prefill-replay` on aligned continuation chunks.
+
+Clean no-debug IQ2_XXS timing from the Mina regression:
+
+| Case | Before vectorized replay | After vectorized replay |
+|------|--------------------------|-------------------------|
+| Fresh 2486-token Mina prefill | ~220.83 tok/s | 265.04 tok/s |
+| Replayed 1078-token Mina continuation | ~151-155 tok/s | 189.85-194.73 tok/s |
+
+Result: useful ~20-28% prefill improvement, but not 2x. Further general-prefill gains likely need backend/profile-led work in prompt indexer/top-k, compressor pooling fusion, cache writes, or MoE/expert matmul throughput.
 
 ## Candidate 3 — profiling-guided backend work
 
-After chunking/path fixes, use `GGML_CUDA_PROFILE_OPS=1` on a controlled standalone harness or systemctl-managed service config to identify remaining prefill op costs.
+After chunking/path fixes, `GGML_PROFILE_OPS=1` on controlled `llama-bench` runs showed sparse attention was material for CUDA prefill:
 
-Likely cost centers to confirm:
+- IQ2_XXS, p2048/ub2048 before bounded raw-window scan:
+  - non-profiled: `345.66 tok/s`
+  - profiled `DSV4_SPARSE_ATTN`: `3866.68 ms` / `69.82%`
+- Root cause: prompt sparse attention passed `Kcur` as `n_window=n_tokens` plus a dense `[n_tokens,n_tokens]` causal/SWA mask. The CUDA/HIP kernel scanned the full prompt chunk even though DSv4 logical raw SWA is 128 tokens.
 
-- MoE `MUL_MAT_ID`
-- dense `MUL_MAT` / cuBLAS projections
-- compressor/indexer projections
-- KV/cache writes (`CPY`, `SET_ROWS`)
-- scheduler split copies on multi-GPU layer split
-- host-filled mask inputs for prompt/decode masks
+Implemented bounded prompt raw-window scanning in `GGML_OP_DSV4_SPARSE_ATTN`:
 
-Do not optimize sparse attention first unless profiling shows it is actually material.
+- New op param `raw_window_limit`; `0` preserves prior full-window behavior.
+- Prompt sparse path passes `prompt_window_size` when causal attention is active.
+- Decode path passes `0` unchanged.
+- CPU and shared CUDA/HIP reference paths honor the bound; Vulkan clone preserves the param but Vulkan execution remains conservative.
+- The dense mask is still applied to all scanned rows as a correctness guard.
+
+Results:
+
+| Case | Before | After |
+|------|--------|-------|
+| CUDA IQ2_XXS p2048/ub2048 non-profiled | 345.66 tok/s | 612.91 tok/s |
+| CUDA IQ2_XXS p2048/ub2048 `DSV4_SPARSE_ATTN` | 3866.68 ms / 69.82% | 1315.55 ms / 44.56% |
+| CUDA IQ2_XXS p8192/ub512 non-profiled | 263.05 tok/s | 263.42 tok/s |
+| ROCm0 IQ2_XXS p64 smoke | n/a | 49.49 tok/s |
+
+Interpretation:
+
+- The bounded raw-window code fix removes a major large-ubatch prompt sparse-attention waste.
+- Follow-up mask-skip inside `DSV4_SPARSE_ATTN` avoids loading/dotting raw-window slots that the cache-backed SWA mask marks `-INFINITY`. This preserves behavior because masked slots contribute zero softmax weight.
+- CUDA IQ2_XXS p8192/ub512 improved from ~`263 tok/s` after bounded raw-window to `285.11 tok/s` in standalone bench; the same shape's profiled sparse-attn time dropped from `7601.75 ms / 21.75%` to `5055.68 ms / 15.42%`.
+- Resident-server API baseline via `llama-benchy` with coherence enabled and `-ub 1024` measured pp2048 `356.36 ± 3.12 tok/s` and pp8192 `276.37 ± 1.18 tok/s` over three runs. Server logs agreed: pp2048 around `366 tok/s`, pp8192 around `277-280 tok/s`.
+- Detailed op+tag profiling now shows the remaining wall is routed expert MMQ matmul: `MUL_MAT_ID:moe.ffn_gate`, `MUL_MAT_ID:moe.ffn_up`, and `MUL_MAT_ID:moe.ffn_down` are each ~`4.2-4.3 s` in p8192/ub512. Component diagnostics showed ID compaction and activation quantization are tiny; the expert matmul kernel itself is the wall.
+- Reasonable low-risk sparse-attn/prefill cleanup is now mostly squeezed. Further wins require a separate MoE MMQ kernel/tile project or debugging the p8192/ub2048 graph/cuBLAS crash, not small graph plumbing changes.
 
 ## Initial ranking
 

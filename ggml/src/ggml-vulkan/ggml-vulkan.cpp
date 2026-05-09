@@ -17224,7 +17224,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_dsv4_rope_tail(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], n_dims, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, inverse);
         } else if (tensor->op == GGML_OP_DSV4_SPARSE_ATTN) {
             const float scale = ggml_get_op_params_f32(tensor, 0);
-            tensor_clone = ggml_dsv4_sparse_attn(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], src_clone[5], scale);
+            const int32_t raw_window_limit = ggml_get_op_params_i32(tensor, 1);
+            tensor_clone = ggml_dsv4_sparse_attn(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], src_clone[5], scale, raw_window_limit);
         }
         else {
             std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;

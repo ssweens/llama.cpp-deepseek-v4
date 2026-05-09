@@ -1156,6 +1156,83 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return { kv_state, score_state, kv_comp };
     };
 
+    auto dsv4_build_compressor_prefill_ratio4_replay = [&](ggml_tensor * x, ggml_tensor * prev_kv_state, ggml_tensor * prev_score_state,
+                                                            ggml_tensor * wkv, ggml_tensor * wgate, ggml_tensor * ape, ggml_tensor * norm,
+                                                            int64_t head_dim, llama_pos first_pos, const dsv4_rope_cfg & rope_cfg,
+                                                            const char * tag, int il_cur) -> dsv4_decode_compressor {
+        // Fast path for aligned continuation prefill chunks. This mirrors the ds4
+        // Metal `compressor_prefill_ratio4_replay` path: project the whole chunk,
+        // seed the first pooled compressed row from the previous compressor state,
+        // then pool all compressed rows in parallel instead of emitting one
+        // SET_ROWS/softmax/RoPE mini-graph per token.
+        constexpr int64_t ratio = 4;
+        GGML_ASSERT(n_tokens > 0 && n_tokens % ratio == 0);
+        GGML_ASSERT(first_pos > 0 && first_pos % ratio == 0);
+
+        const dsv4_state_layout layout = dsv4_make_state_layout(ratio, head_dim);
+        const int64_t n_comp = n_tokens / ratio;
+
+        ggml_tensor * kv_all = ggml_mul_mat(ctx0, wkv, x);   // [2*head_dim, n_tokens]
+        ggml_tensor * sc_all = ggml_mul_mat(ctx0, wgate, x);
+        ggml_tensor * ape_f = ape->type == GGML_TYPE_F32 ? ape : ggml_cast(ctx0, ape, GGML_TYPE_F32);
+
+        ggml_tensor * kv_3d = ggml_reshape_3d(ctx0, kv_all, layout.width, ratio, n_comp);
+        ggml_tensor * sc_3d = ggml_reshape_3d(ctx0, sc_all, layout.width, ratio, n_comp);
+        ggml_tensor * ape_3d = ggml_repeat(ctx0, ggml_reshape_3d(ctx0, ape_f, layout.width, ratio, 1), sc_3d);
+        sc_3d = ggml_add(ctx0, sc_3d, ape_3d);
+
+        ggml_tensor * kv_a = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, n_comp, kv_3d->nb[1], kv_3d->nb[2], 0);
+        ggml_tensor * kv_b = ggml_view_3d(ctx0, kv_3d, head_dim, ratio, n_comp, kv_3d->nb[1], kv_3d->nb[2], kv_3d->nb[0] * head_dim);
+        ggml_tensor * sc_a = ggml_view_3d(ctx0, sc_3d, head_dim, ratio, n_comp, sc_3d->nb[1], sc_3d->nb[2], 0);
+        ggml_tensor * sc_b = ggml_view_3d(ctx0, sc_3d, head_dim, ratio, n_comp, sc_3d->nb[1], sc_3d->nb[2], sc_3d->nb[0] * head_dim);
+
+        ggml_tensor * kv_seed = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, dsv4_view_cols(ctx0, prev_kv_state, head_dim, ratio, 0, 0)), head_dim, ratio, 1);
+        ggml_tensor * sc_seed = ggml_reshape_3d(ctx0, cont_if_needed(ctx0, dsv4_view_cols(ctx0, prev_score_state, head_dim, ratio, 0, 0)), head_dim, ratio, 1);
+
+        ggml_tensor * kv_a_shift = kv_seed;
+        ggml_tensor * sc_a_shift = sc_seed;
+        if (n_comp > 1) {
+            ggml_tensor * kv_a_prev = ggml_view_3d(ctx0, kv_a, head_dim, ratio, n_comp - 1, kv_a->nb[1], kv_a->nb[2], 0);
+            ggml_tensor * sc_a_prev = ggml_view_3d(ctx0, sc_a, head_dim, ratio, n_comp - 1, sc_a->nb[1], sc_a->nb[2], 0);
+            kv_a_shift = ggml_concat(ctx0, kv_seed, kv_a_prev, 2);
+            sc_a_shift = ggml_concat(ctx0, sc_seed, sc_a_prev, 2);
+        }
+
+        ggml_tensor * kv_ov = ggml_concat(ctx0, kv_a_shift, kv_b, 1);       // [head_dim, 8, n_comp]
+        ggml_tensor * sc_ov = ggml_concat(ctx0, sc_a_shift, sc_b, 1);       // [head_dim, 8, n_comp]
+
+        ggml_tensor * sc_s = ggml_permute(ctx0, sc_ov, 1, 0, 2, 3);         // [8, head_dim, n_comp]
+        ggml_tensor * w = ggml_soft_max(ctx0, cont_if_needed(ctx0, sc_s));
+        w = ggml_permute(ctx0, w, 1, 0, 2, 3);                              // [head_dim, 8, n_comp]
+
+        ggml_tensor * pooled = ggml_mul(ctx0, kv_ov, w);
+        pooled = ggml_permute(ctx0, pooled, 1, 0, 2, 3);                    // [8, head_dim, n_comp]
+        pooled = cont_if_needed(ctx0, ggml_cast(ctx0, pooled, GGML_TYPE_F32));
+        pooled = ggml_sum_rows(ctx0, pooled);                              // [1, head_dim, n_comp]
+        pooled = ggml_reshape_2d(ctx0, pooled, head_dim, n_comp);
+        pooled = ggml_rms_norm(ctx0, pooled, hparams.f_norm_rms_eps);
+        pooled = ggml_mul(ctx0, pooled, norm);
+
+        ggml_tensor * kv_comp = ggml_reshape_3d(ctx0, pooled, head_dim, 1, n_comp);
+        ggml_tensor * comp_pos = ggml_cast(ctx0, ggml_arange(ctx0, (float) first_pos, (float) (first_pos + n_tokens), (float) ratio), GGML_TYPE_I32);
+        kv_comp = apply_partial_rope_with_pos(kv_comp, comp_pos, rope_cfg, /*inverse=*/false);
+        cb(kv_comp, tag, il_cur);
+
+        // Post-prefill recurrent state: rows 0..3 contain the final full window;
+        // rows 4..7 are clear until subsequent decode writes the next current
+        // half. This matches ds4's prefill-state finalization.
+        ggml_tensor * kv_last = ggml_view_2d(ctx0, kv_3d, layout.width, ratio, kv_3d->nb[1], (n_comp - 1) * kv_3d->nb[2]);
+        ggml_tensor * sc_last = ggml_view_2d(ctx0, sc_3d, layout.width, ratio, sc_3d->nb[1], (n_comp - 1) * sc_3d->nb[2]);
+        ggml_tensor * kv_empty = ggml_fill(ctx0, cont_if_needed(ctx0, kv_last), 0.0f);
+        ggml_tensor * sc_empty = ggml_fill(ctx0, cont_if_needed(ctx0, sc_last), -INFINITY);
+
+        return {
+            ggml_concat(ctx0, kv_last, kv_empty, 1),
+            ggml_concat(ctx0, sc_last, sc_empty, 1),
+            kv_comp,
+        };
+    };
+
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     ggml_tensor * hc_state = make_hc_state(inpL);
     cb(hc_state, "hc_state_init", -1);
@@ -1542,7 +1619,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 window_mask,            // [n_tokens, n_tokens] causal+SWA mask
                 idx_sel,                // [n_idx_topk, n_tokens]
                 sink,                   // [n_heads]
-                kq_scale);
+                kq_scale,
+                cparams.causal_attn ? (int32_t) prompt_window_size : 0);
             cb(cur, "attn_sparse_prompt", il);
             use_prompt_sparse_attn = true;
         } else if (prompt_c_attn != nullptr) {
@@ -1612,12 +1690,6 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         // window-only attention (no -inf mask, no FA bug).
         // -----------------------------------------------------------------------------
         if (!use_prompt_sparse_attn && has_hybrid_iswa && compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
-            if (dsv4_debug_paths_enabled()) {
-                const llama_pos first_pos = ubatch.pos ? ubatch.pos[0] : 0;
-                const llama_pos last_pos  = ubatch.pos ? ubatch.pos[n_tokens - 1] : n_tokens - 1;
-                LLAMA_LOG_WARN("deepseek4/path: layer=%d path=decode-replay n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
-                        il, (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
-            }
             // For multi-seq decode, each token belongs to a different sequence.
             // We use seq_id from token 0; for n_seqs > 1 with equal_seqs,
             // all tokens within a sub-batch share the same seq_id.
@@ -1632,6 +1704,29 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             const int64_t n_comp_before  = first_pos / (llama_pos) compress_ratio;
             const int64_t n_comp_visible = (last_pos + 1) / (llama_pos) compress_ratio;
 
+            bool can_use_vectorized_replay =
+                compress_ratio == 4 &&
+                n_tokens > 1 &&
+                n_seqs == 1 &&
+                ubatch.n_seq_id[0] == 1 &&
+                ubatch.pos != nullptr &&
+                first_pos > 0 &&
+                first_pos % (llama_pos) compress_ratio == 0 &&
+                n_tokens % (int64_t) compress_ratio == 0;
+            if (can_use_vectorized_replay) {
+                for (int64_t i = 1; i < n_tokens; ++i) {
+                    if (ubatch.pos[i] != first_pos + (llama_pos) i) {
+                        can_use_vectorized_replay = false;
+                        break;
+                    }
+                }
+            }
+            if (dsv4_debug_paths_enabled()) {
+                LLAMA_LOG_WARN("deepseek4/path: layer=%d path=%s n_tokens=%lld n_seq_tokens=%lld first_pos=%d last_pos=%d is_prefill=%d compress_ratio=%u\n",
+                        il, can_use_vectorized_replay ? "prefill-replay" : "decode-replay",
+                        (long long) n_tokens, (long long) n_seq_tokens, first_pos, last_pos, (int) is_prefill, compress_ratio);
+            }
+
             dsv4_decode_compressor dec = n_tokens == 1
                     ? dsv4_build_compressor_decode(attn_inp, prev_attn_kv_state, prev_attn_sc_state,
                             model.layers[il].attn_compressor_wkv,
@@ -1639,12 +1734,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                             model.layers[il].attn_compressor_ape,
                             model.layers[il].attn_compressor_norm,
                             n_embd_head, first_pos, compress_ratio, rope_cfg)
-                    : dsv4_build_compressor_decode_chunk(attn_inp, prev_attn_kv_state, prev_attn_sc_state,
-                            model.layers[il].attn_compressor_wkv,
-                            model.layers[il].attn_compressor_wgate,
-                            model.layers[il].attn_compressor_ape,
-                            model.layers[il].attn_compressor_norm,
-                            n_embd_head, compress_ratio, rope_cfg);
+                    : can_use_vectorized_replay
+                        ? dsv4_build_compressor_prefill_ratio4_replay(attn_inp, prev_attn_kv_state, prev_attn_sc_state,
+                                model.layers[il].attn_compressor_wkv,
+                                model.layers[il].attn_compressor_wgate,
+                                model.layers[il].attn_compressor_ape,
+                                model.layers[il].attn_compressor_norm,
+                                n_embd_head, first_pos, rope_cfg, "attn_compressor_replay_prefill", il)
+                        : dsv4_build_compressor_decode_chunk(attn_inp, prev_attn_kv_state, prev_attn_sc_state,
+                                model.layers[il].attn_compressor_wkv,
+                                model.layers[il].attn_compressor_wgate,
+                                model.layers[il].attn_compressor_ape,
+                                model.layers[il].attn_compressor_norm,
+                                n_embd_head, compress_ratio, rope_cfg);
 
             dsv4_store_state_segment(ctx0, gf, dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, 0, n_seqs);
             dsv4_store_state_segment(ctx0, gf, dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, 0, n_seqs);
@@ -1673,12 +1775,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                                 model.layers[il].attn_indexer_compressor_ape,
                                 model.layers[il].attn_indexer_compressor_norm,
                                 hparams.n_embd_head_index, first_pos, compress_ratio, rope_cfg)
-                        : dsv4_build_compressor_decode_chunk(attn_inp, prev_index_kv_state, prev_index_sc_state,
-                                model.layers[il].attn_indexer_compressor_wkv,
-                                model.layers[il].attn_indexer_compressor_wgate,
-                                model.layers[il].attn_indexer_compressor_ape,
-                                model.layers[il].attn_indexer_compressor_norm,
-                                hparams.n_embd_head_index, compress_ratio, rope_cfg);
+                        : can_use_vectorized_replay
+                            ? dsv4_build_compressor_prefill_ratio4_replay(attn_inp, prev_index_kv_state, prev_index_sc_state,
+                                    model.layers[il].attn_indexer_compressor_wkv,
+                                    model.layers[il].attn_indexer_compressor_wgate,
+                                    model.layers[il].attn_indexer_compressor_ape,
+                                    model.layers[il].attn_indexer_compressor_norm,
+                                    hparams.n_embd_head_index, first_pos, rope_cfg, "attn_indexer_replay_prefill", il)
+                            : dsv4_build_compressor_decode_chunk(attn_inp, prev_index_kv_state, prev_index_sc_state,
+                                    model.layers[il].attn_indexer_compressor_wkv,
+                                    model.layers[il].attn_indexer_compressor_wgate,
+                                    model.layers[il].attn_indexer_compressor_ape,
+                                    model.layers[il].attn_indexer_compressor_norm,
+                                    hparams.n_embd_head_index, compress_ratio, rope_cfg);
 
                 dsv4_store_state_segment(ctx0, gf, idx_dec.kv_state, inp_rs->mctx->get_r_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
                 dsv4_store_state_segment(ctx0, gf, idx_dec.score_state, inp_rs->mctx->get_s_l(il), state_size, inp_rs->head, attn_state_layout.elems, n_seqs);
@@ -1795,7 +1904,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     window_mask,      // [n_window, n_tokens] SWA validity + causal
                     idx_topk,         // [n_idx_topk, n_tokens]
                     sink,             // [n_heads]
-                    kq_scale);
+                    kq_scale,
+                    0);
                 cb(cur, "attn_sparse_decode", il);
                 use_prompt_sparse_attn = true;
             } else if (n_comp_visible > 0) {

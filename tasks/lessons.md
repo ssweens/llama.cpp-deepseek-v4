@@ -195,3 +195,13 @@ But my polling loop only watched for model/server log patterns (`Timings`, `GGML
 - **Before long bench runs, choose or verify an unused port explicitly.** Do not assume `9999` is free; pass a high port via `PORT=...` or inspect listeners first.
 - **Poll loops must treat Docker startup failures as terminal.** Include `docker: Error`, `failed to bind host port`, and empty container status after startup as failure conditions, not as "still loading".
 - **Bench scripts should fail fast after `docker run -d`.** A detached container start can fail before any model log exists; check the `docker run` exit status/log output immediately and surface it.
+
+## DeepSeek4 perf sweeps should keep the model resident (2026-05-09)
+
+### What happened
+While chasing the next prefill target after bounded sparse attention, I repeatedly launched `docker run ... llama-bench` for small A/B variants. Each run reloaded the ~78 GiB IQ2_XXS model and reinitialized the multi-GPU backend, turning quick hypothesis checks into multi-thousand-second jobs. One diagnostic `GGML_CUDA_MMQ_ID_NO_STREAM_K=1` run appeared hung and had to be stopped.
+
+### Lesson
+- **For multi-variant DSv4 performance sweeps, keep the model resident.** Start one persistent server, then use the API benchmark harness (`llama-benchy` from the repo venv) to run prompt-size/parameter sweeps against `/v1`.
+- **Use repeated `llama-bench` process launches only for one-off low-level backend checks** where API serving cannot exercise the path. If more than one variant is needed, switch to API benchmarking before the second run.
+- **Treat diagnostic env experiments as suspect until bounded.** Set a clear timeout/stop condition and avoid launching long model-load jobs for exploratory env toggles.
