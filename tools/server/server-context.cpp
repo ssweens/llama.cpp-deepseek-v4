@@ -2832,7 +2832,7 @@ private:
 
                             if (should_checkpoint_tail(4 + n_ubatch)) {
                                 should_break = true;
-                            } else if (n_swa > 0 && n_swa < n_ubatch) {
+                            } else if (dsv4_cache_alignment <= 1 && n_swa > 0 && n_swa < n_ubatch) {
                                 for (int offset = 4 + ((n_ubatch / n_swa) * n_swa); offset > 4; offset -= n_swa) {
                                     if (should_checkpoint_tail(offset)) {
                                         should_break = true;

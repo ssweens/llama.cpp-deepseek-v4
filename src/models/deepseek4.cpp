@@ -1266,6 +1266,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
         const int64_t n_seqs       = ubatch.n_seqs;
         const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+        const llama_pos first_pos_batch = ubatch.pos ? ubatch.pos[0] : 0;
+        const bool use_local_prompt_attn = is_prefill && n_tokens > 1 && first_pos_batch == 0;
 
         if (compress_ratio > 0 && model.layers[il].attn_compressor_wkv != nullptr) {
             if (has_hybrid_iswa) {
@@ -1293,21 +1295,23 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
             }
 
-            const int64_t compressor_dim = n_embd_head * (compress_ratio == 4 ? 2 : 1);
-            c_pool = build_compressed_pool(
-                    attn_inp,
-                    model.layers[il].attn_compressor_wkv,
-                    model.layers[il].attn_compressor_wgate,
-                    model.layers[il].attn_compressor_ape,
-                    model.layers[il].attn_compressor_norm,
-                    compressor_dim,
-                    n_embd_head,
-                    compress_ratio,
-                    "attn_compressor_pool",
-                    il);
+            if (use_local_prompt_attn) {
+                const int64_t compressor_dim = n_embd_head * (compress_ratio == 4 ? 2 : 1);
+                c_pool = build_compressed_pool(
+                        attn_inp,
+                        model.layers[il].attn_compressor_wkv,
+                        model.layers[il].attn_compressor_wgate,
+                        model.layers[il].attn_compressor_ape,
+                        model.layers[il].attn_compressor_norm,
+                        compressor_dim,
+                        n_embd_head,
+                        compress_ratio,
+                        "attn_compressor_pool",
+                        il);
 
-            if (c_pool != nullptr) {
-                cb(c_pool, "attn_compressor_pool_ready", il);
+                if (c_pool != nullptr) {
+                    cb(c_pool, "attn_compressor_pool_ready", il);
+                }
             }
 
             if (compress_ratio == 4 &&
@@ -1338,28 +1342,28 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 GGML_ASSERT(model.layers[il].attn_indexer_weights_proj->ne[0] == n_embd);
                 GGML_ASSERT(model.layers[il].attn_indexer_weights_proj->ne[1] == hparams.n_head_index);
 
-                const int64_t idx_dim = hparams.n_embd_head_index;
-                const int64_t idx_comp_dim = idx_dim * 2;
-                idx_pool = build_compressed_pool(
-                        attn_inp,
-                        model.layers[il].attn_indexer_compressor_wkv,
-                        model.layers[il].attn_indexer_compressor_wgate,
-                        model.layers[il].attn_indexer_compressor_ape,
-                        model.layers[il].attn_indexer_compressor_norm,
-                        idx_comp_dim,
-                        idx_dim,
-                        compress_ratio,
-                        "attn_indexer_pool",
-                        il);
-                if (idx_pool != nullptr) {
-                    cb(idx_pool, "attn_indexer_pool_ready", il);
+                if (use_local_prompt_attn) {
+                    const int64_t idx_dim = hparams.n_embd_head_index;
+                    const int64_t idx_comp_dim = idx_dim * 2;
+                    idx_pool = build_compressed_pool(
+                            attn_inp,
+                            model.layers[il].attn_indexer_compressor_wkv,
+                            model.layers[il].attn_indexer_compressor_wgate,
+                            model.layers[il].attn_indexer_compressor_ape,
+                            model.layers[il].attn_indexer_compressor_norm,
+                            idx_comp_dim,
+                            idx_dim,
+                            compress_ratio,
+                            "attn_indexer_pool",
+                            il);
+                    if (idx_pool != nullptr) {
+                        cb(idx_pool, "attn_indexer_pool_ready", il);
+                    }
                 }
             }
         }
 
         const uint32_t prompt_window_size = hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : (uint32_t) n_tokens;
-        const llama_pos first_pos_batch = ubatch.pos ? ubatch.pos[0] : 0;
-        const bool use_local_prompt_attn = is_prefill && n_tokens > 1 && first_pos_batch == 0;
         bool use_prompt_sparse_attn = false;
         // Unified sparse-gather attention path for prompt eval.
         // Active iff this is the first prompt chunk, the layer has a compressor +

@@ -34,6 +34,20 @@
   - Net change: deepseek4.cpp -156 lines
   - **Validated**: BF16 `-fa on` short prompt produces correct "6 apples" coherent reasoning (was bracket spam under the buggy dense path)
 
+## Active branch: `work/dsv4-prefill-speedup` — DSv4 prefill speed evaluation
+- [x] Create working branch from current DeepSeek4 runtime head.
+- [x] Add a repeatable DeepSeek4 endpoint regression harness for simple chat, coherence, structured tool calls, streaming tool-call deltas, prompt-cache reuse, and optional short antirez/ds4 official vectors before changing prefill behavior. Added `scripts/dsv4_regression.py` plus tracked replay fixture `tasks/replays/dsv4_mina_turn02_tools_request.json`; syntax/help/fixture validation passed.
+- [ ] Run the DeepSeek4 endpoint regression suite against `deepseek-ai/DeepSeek-V4-Flash-IQ1_M` using the existing full DeepSeek Docker layer with the working tree mounted, building/running code inside that container instead of rebuilding Docker images.
+- [x] Establish current prefill bottleneck from existing systemctl Corral logs and code paths, without manually starting Corral. Logs show DSv4/IQ1_M prompts split into repeated 128-token prefill chunks due checkpoint-tail policy, with prompt eval around ~184 tok/s for an 858-token prompt and ~170 tok/s for large continuation chunks.
+- [x] Audit prompt prefill chunking/checkpoint policy: `server-context.cpp` breaks prompt batches at SWA-spaced tail offsets (`n_swa=128`), so even prompts below `n_ubatch` get fragmented into 128-token chunks to create rollback checkpoints.
+- [x] Audit DSv4 graph inputs and graph reuse for prefill: custom input `can_reuse()` implementations exist, but chunk shape changes (`4096 -> 128 -> final`) still limit graph reuse and the artificial chunking moves most tokens off the first-chunk vectorized prefill path.
+- [ ] Profile or derive prefill op cost centers for current IQ1/IQ2/MXFP4 paths: MoE `MUL_MAT_ID`, dense matmuls, compressor/indexer, sparse attention, KV/cache writes, scheduler splits/copies.
+- [x] Identify low-risk architecture/code changes that could plausibly 2x prefill: (1) stop creating SWA-spaced tail checkpoints by default for DSv4 prefill so short/medium prompts run as one vectorized prompt graph; (2) implement vectorized continuation prefill compressor for aligned chunks after cache restore instead of per-token `dsv4_build_compressor_decode_chunk()` graph expansion.
+- [x] Implement Candidate 1 low-risk chunking change: DeepSeek4 compressed-KV contexts now skip the SWA-spaced tail checkpoint loop, keeping only the `4 + n_ubatch` and final aligned checkpoint guards. Local `build-vulkan-linux-release` llama-server build passed.
+- [x] Implement immediate continuation-prefill waste fix: nonzero-position DSv4 prompt chunks no longer build unused `attn_compressor_pool` / `attn_indexer_pool` prompt-only tensors before falling through to the cache-aware decode/replay path. Local `build-vulkan-linux-release` llama-server build passed.
+- [x] Rank remaining candidates by expected gain/risk: validate Candidate 1 + 1.5 first because they are low-risk and may already approach the desired 2x on continuation prefill; defer full vectorized continuation compressor until after measuring. Minimal acceptance bench: rebuild DeepSeek image from this branch, restart Corral via systemctl only, replay a multi-turn IQ2_XXS history, and compare prompt chunk pattern / prompt eval tps against the 128-token-fragmented baseline.
+- [x] Triage tester regression report: IQ1_M emitted literal XML tool-call text in strict tool-call tests, but the same mounted-code build with the usual IQ2_XXS model passed all 7 regression cases, including streaming and checkpoint-restored Mina replay with `cached_tokens=1408`. Switched `scripts/dsv4_regression.py` default to IQ2_XXS and updated `tasks/dsv4_regression_handoff.md`.
+
 ## In Progress
 - [x] Long-prompt validation: BF16 `-fa on` with isolation prompt + n_predict=400 — perfect structured output
 - [x] Verify IQ2_XS short prompt with the unified sparse path — coherent ("answer":"6") at 40 tok/s
@@ -99,6 +113,12 @@
 - [ ] Add/update corral config entry for DSV4-Flash IQ2_S
 - [ ] Update documentation (README, TEST_COVERAGE, etc.)
 - [ ] Final commit + push of any remaining changes
+
+## Merge `work/dsv4-prefill-speedup` to `main` (requested 2026-05-09)
+- [ ] Commit intended prefill/regression changes on `work/dsv4-prefill-speedup` while leaving scratch files untracked.
+- [ ] Run quality gates: whitespace check, Python syntax check for regression harness, mounted-code `llama-server` build evidence, and IQ2_XXS regression suite evidence.
+- [ ] Merge the branch into local `main` and keep `work/dsv4-prefill-speedup` branch alive for follow-up bugs.
+- [ ] Ask before pushing `main` or the working branch to remote.
 
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
