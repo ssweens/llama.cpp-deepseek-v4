@@ -1272,6 +1272,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+                size_t n_new_split_inputs = 0;
+                size_t new_split_input_ids[GGML_MAX_SRC];
+
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1286,17 +1289,33 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             break;
                         }
                     }
-                    // check if the split has too many inputs
-                    // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
-                        const size_t id = hash_id(src);
-                        int src_backend_id = sched->hv_tensor_backend_ids[id];
-                        bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-                        if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
-                            need_new_split = true;
-                            break;
+
+                    // Check if this node would overflow the split input list. A single
+                    // node can introduce multiple new cross-backend inputs, so checking
+                    // only for split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS before
+                    // adding each input can still overflow from e.g. 29 -> 31.
+                    const size_t id = hash_id(src);
+                    const int src_backend_id = sched->hv_tensor_backend_ids[id];
+                    GGML_ASSERT(src_backend_id != -1);
+
+                    if (src_backend_id != cur_backend_id &&
+                            tensor_id_copy(id, cur_backend_id, 0) == NULL &&
+                            !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        bool already_counted = false;
+                        for (size_t k = 0; k < n_new_split_inputs; k++) {
+                            if (new_split_input_ids[k] == id) {
+                                already_counted = true;
+                                break;
+                            }
+                        }
+                        if (!already_counted) {
+                            new_split_input_ids[n_new_split_inputs++] = id;
                         }
                     }
+                }
+
+                if (!need_new_split && split->n_inputs + n_new_split_inputs > GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    need_new_split = true;
                 }
             }
 
