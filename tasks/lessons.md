@@ -205,3 +205,13 @@ While chasing the next prefill target after bounded sparse attention, I repeated
 - **For multi-variant DSv4 performance sweeps, keep the model resident.** Start one persistent server, then use the API benchmark harness (`llama-benchy` from the repo venv) to run prompt-size/parameter sweeps against `/v1`.
 - **Use repeated `llama-bench` process launches only for one-off low-level backend checks** where API serving cannot exercise the path. If more than one variant is needed, switch to API benchmarking before the second run.
 - **Treat diagnostic env experiments as suspect until bounded.** Set a clear timeout/stop condition and avoid launching long model-load jobs for exploratory env toggles.
+
+## Sanitization must include fixtures, filenames, and defaults (2026-05-09)
+
+### What happened
+I sanitized newly added runbook docs and the regression script's local DS4 path, then said the regression materials were clean without first scrubbing the tracked replay fixture itself. The fixture still had a product-specific name/content and was referenced by a product-specific default path.
+
+### Lesson
+- **When sanitizing public-facing test materials, include tracked fixtures and filenames.** Search docs, scripts, fixture contents, and default paths together.
+- **Prefer generic replay names and environment-variable defaults.** Avoid machine-local paths, usernames, and product-specific names in committed regression fixtures unless intentionally public.
+- **Keep cleanup commits tightly scoped.** Do not include unrelated planning-doc edits in a sanitization/regression-materials commit; inspect `git show --name-status` before reporting the commit as done.

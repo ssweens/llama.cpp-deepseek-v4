@@ -9,8 +9,8 @@ Core checks lock in the failure modes we previously fixed:
   - simple non-tool chat sanity
   - basic arithmetic/coherence sanity
   - minimal structured tool calls (auto + required)
-  - Mina turn-02 multi-turn tool-call replay (non-streaming + streaming)
-  - prompt-cache reuse on repeated Mina turn-02 replay
+  - multi-turn tool-call replay fixture (non-streaming + streaming)
+  - prompt-cache reuse on repeated tool-call replay
 
 Optional exact antirez/ds4 short-vector checks are available via
 --include-official-vectors. They are deterministic byte-level checks and are best
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -30,7 +31,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MINA_REPLAY = REPO_ROOT / "tasks" / "replays" / "dsv4_mina_turn02_tools_request.json"
+DEFAULT_TOOL_REPLAY = REPO_ROOT / "tasks" / "replays" / "dsv4_agent_tool_replay_turn02_request.json"
+DEFAULT_DS4_ROOT = Path(os.environ.get("DS4_ROOT", str(REPO_ROOT.parent / "ds4")))
 DEFAULT_SHORT_VECTOR_CASES = {"short_reasoning_plain", "short_code_completion"}
 
 
@@ -341,19 +343,19 @@ def main(argv: Iterable[str]) -> int:
     ap.add_argument("--model", default="deepseek-ai/DeepSeek-V4-Flash-IQ2_XXS", help="model id to send in requests")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--timeout", type=int, default=900)
-    ap.add_argument("--mina-replay", type=Path, default=DEFAULT_MINA_REPLAY)
+    ap.add_argument("--tool-replay", type=Path, default=DEFAULT_TOOL_REPLAY)
     ap.add_argument("--skip-cache-reuse", action="store_true", help="skip repeated-replay cached_tokens assertion")
     ap.add_argument("--skip-stream", action="store_true", help="skip streaming tool-call replay")
     ap.add_argument("--include-official-vectors", action="store_true", help="run exact antirez/ds4 short vector checks")
-    ap.add_argument("--ds4-root", type=Path, default=Path("/home/bigkahuna/src/ds4"))
+    ap.add_argument("--ds4-root", type=Path, default=DEFAULT_DS4_ROOT, help="path to antirez/ds4 checkout; defaults to DS4_ROOT or ../ds4")
     ap.add_argument("--official-case", action="append", help="official vector case id; default short cases")
     args = ap.parse_args(list(argv))
 
-    if not args.mina_replay.exists():
-        print(f"missing Mina replay fixture: {args.mina_replay}", file=sys.stderr)
+    if not args.tool_replay.exists():
+        print(f"missing tool replay fixture: {args.tool_replay}", file=sys.stderr)
         return 2
 
-    replay_body = json.loads(args.mina_replay.read_text(encoding="utf-8"))
+    replay_body = json.loads(args.tool_replay.read_text(encoding="utf-8"))
     results: list[TestResult] = []
 
     def simple_ok() -> str:
@@ -402,11 +404,11 @@ def main(argv: Iterable[str]) -> int:
         }
         return assert_bash_ls_tool_call(post_json(args.base_url, body, args.timeout))
 
-    def mina_nonstream() -> str:
+    def tool_replay_nonstream() -> str:
         body = with_model_and_limits(replay_body, args.model, args.max_tokens, stream=False)
         return assert_bash_ls_tool_call(post_json(args.base_url, body, args.timeout))
 
-    def mina_stream() -> str:
+    def tool_replay_stream() -> str:
         body = with_model_and_limits(replay_body, args.model, args.max_tokens, stream=True)
         events = post_stream(args.base_url, body, args.timeout)
         if not events:
@@ -414,7 +416,7 @@ def main(argv: Iterable[str]) -> int:
         resp = aggregate_stream(events)
         return assert_bash_ls_tool_call(resp, require_finish_reason=False) + f", sse_events={len(events)}"
 
-    def mina_cache_reuse() -> str:
+    def tool_replay_cache_reuse() -> str:
         body = with_model_and_limits(replay_body, args.model, args.max_tokens, stream=False)
         first = post_json(args.base_url, body, args.timeout)
         assert_bash_ls_tool_call(first)
@@ -422,7 +424,7 @@ def main(argv: Iterable[str]) -> int:
         assert_bash_ls_tool_call(second)
         cached = usage_cached_tokens(second)
         if cached <= 0:
-            raise RegressionError("expected cached_tokens > 0 on repeated Mina turn-02 replay, got 0")
+            raise RegressionError("expected cached_tokens > 0 on repeated tool-call replay, got 0")
         return f"second_cached_tokens={cached}, first_cached_tokens={usage_cached_tokens(first)}"
 
     for name, fn in [
@@ -430,14 +432,14 @@ def main(argv: Iterable[str]) -> int:
         ("basic_math", basic_math),
         ("minimal_tool_auto", minimal_tool_auto),
         ("minimal_tool_required", minimal_tool_required),
-        ("mina_turn02_nonstream_tool", mina_nonstream),
+        ("tool_replay_turn02_nonstream", tool_replay_nonstream),
     ]:
         results.append(run_test(name, fn))
 
     if not args.skip_stream:
-        results.append(run_test("mina_turn02_stream_tool", mina_stream))
+        results.append(run_test("tool_replay_turn02_stream", tool_replay_stream))
     if not args.skip_cache_reuse:
-        results.append(run_test("mina_turn02_cache_reuse", mina_cache_reuse))
+        results.append(run_test("tool_replay_turn02_cache_reuse", tool_replay_cache_reuse))
 
     if args.include_official_vectors:
         vec_path = args.ds4_root / "tests" / "test-vectors" / "official.vec"
