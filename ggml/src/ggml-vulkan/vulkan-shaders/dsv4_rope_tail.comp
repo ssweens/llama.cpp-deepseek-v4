@@ -1,0 +1,113 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+// DSV4 RoPE tail: apply RoPE only to the trailing n_dims dimensions of each row,
+// copying the leading (ne0 - n_dims) "nope" dimensions unchanged.
+//
+// A_TYPE / D_TYPE set via preprocessor (float or float16_t)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A    { A_TYPE data_a[];   };
+layout (binding = 1) readonly  buffer POS  { int    data_pos[]; };
+layout (binding = 2) readonly  buffer FREQ { float  data_freq[]; };
+layout (binding = 3) writeonly buffer D    { D_TYPE data_d[];   };
+
+layout (push_constant) uniform parameter {
+    uint ne0;
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint nb01; // src0 strides in element units
+    uint nb02;
+    uint nb03;
+    uint nb1;  // dst strides in element units
+    uint nb2;
+    uint nb3;
+    int  n_dims;
+    int  mode;         // 0=normal, 2=neox
+    int  n_ctx_orig;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    uint  has_freq_factors;
+    uint  inverse;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total_rows = p.ne1 * p.ne2 * p.ne3;
+    const uint row = idx / p.ne0;
+    const uint col = idx % p.ne0;
+
+    if (row >= total_rows) return;
+
+    const uint i1 = row % p.ne1;
+    const uint i2 = (row / p.ne1) % p.ne2;
+    const uint i3 = row / (p.ne1 * p.ne2);
+
+    const uint src_idx = i3 * p.nb03 + i2 * p.nb02 + i1 * p.nb01 + col;
+    const uint dst_idx = i3 * p.nb3  + i2 * p.nb2  + i1 * p.nb1  + col;
+
+    const uint n_nope = p.ne0 - uint(p.n_dims);
+
+    // Non-RoPE (nope) dimensions: copy through
+    if (col < n_nope) {
+        data_d[dst_idx] = data_a[src_idx];
+        return;
+    }
+
+    // RoPE tail dimensions
+    uint tail_col = col - n_nope;
+    uint pair_idx;
+    bool is_second;
+
+    if (p.mode == 2) {
+        // NeoX mode: pairs are (i, i + n_dims/2)
+        pair_idx = tail_col % (uint(p.n_dims) / 2);
+        is_second = tail_col >= (uint(p.n_dims) / 2);
+    } else {
+        // Normal mode: adjacent pairs
+        pair_idx = tail_col / 2;
+        is_second = (tail_col & 1) != 0;
+    }
+
+    float theta = float(data_pos[i2]) * pow(p.freq_base, -2.0 * float(pair_idx) / float(p.n_dims));
+
+    if (p.has_freq_factors != 0) {
+        theta *= p.freq_scale / data_freq[pair_idx];
+    } else {
+        theta *= p.freq_scale;
+    }
+
+    float cos_theta = cos(theta);
+    float sin_theta = sin(theta);
+    if (p.inverse != 0) {
+        sin_theta = -sin_theta;
+    }
+
+    uint other_col;
+    if (p.mode == 2) {
+        other_col = is_second ? (col - uint(p.n_dims) / 2) : (col + uint(p.n_dims) / 2);
+    } else {
+        other_col = is_second ? (col - 1) : (col + 1);
+    }
+
+    uint other_src_idx = i3 * p.nb03 + i2 * p.nb02 + i1 * p.nb01 + other_col;
+
+    float x0 = float(data_a[src_idx]);
+    float x1 = float(data_a[other_src_idx]);
+
+    float result;
+    if (is_second) {
+        result = x0 * cos_theta + x1 * sin_theta;
+    } else {
+        result = x0 * cos_theta - x1 * sin_theta;
+    }
+
+    data_d[dst_idx] = D_TYPE(result);
+}

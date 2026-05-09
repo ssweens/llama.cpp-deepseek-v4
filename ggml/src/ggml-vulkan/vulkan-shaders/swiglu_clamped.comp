@@ -1,0 +1,13 @@
+#version 450
+
+#include "glu_head.glsl"
+
+float op(float a, float b) {
+    // gate = clamp(gate, -INF, +limit), up = clamp(up, -limit, +limit)
+    // out = silu(gate) * up
+    float gate = min(a, p.limit);
+    float up   = max(min(b, p.limit), -p.limit);
+    return gate / (1.0f + exp(-gate)) * up;
+}
+
+#include "glu_main.glsl"

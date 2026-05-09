@@ -1185,12 +1185,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        // the previous graph_compute_async may still be running on async backends (e.g. Vulkan).
+        // synchronize before set_inputs to avoid overwriting reused input tensors that the
+        // previous compute is still reading. Pipeline-parallel execution is one case where this
+        // was already required, but prompt microbatch graph reuse has the same hazard.
+        ggml_backend_sched_synchronize(sched.get());
 
         n_reused++;
     } else {

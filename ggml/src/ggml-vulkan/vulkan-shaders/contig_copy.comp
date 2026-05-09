@@ -19,11 +19,16 @@ void main() {
     if (idx + (num_iter-1)*num_threads < p.ne) {
         [[unroll]] for (uint i = 0; i < num_iter; ++i) {
 
-#if defined(DATA_D_BF16)
+#if defined(DATA_A_BF16)
+            float f = bf16_to_fp32(uint32_t(data_a[get_aoffset() + idx]));
+#else
             float f = float(data_a[get_aoffset() + idx]);
+#endif
+
+#if defined(DATA_D_BF16)
             data_d[get_doffset() + idx] = D_TYPE(fp32_to_bf16(f));
 #elif !defined(OPTIMIZATION_ERROR_WORKAROUND)
-            data_d[get_doffset() + idx] = D_TYPE(data_a[get_aoffset() + idx]);
+            data_d[get_doffset() + idx] = D_TYPE(f);
 #else
             data_d[get_doffset() + idx] = data_a[get_aoffset() + idx];
 #endif
@@ -35,11 +40,16 @@ void main() {
                 continue;
             }
 
-#if defined(DATA_D_BF16)
+#if defined(DATA_A_BF16)
+            float f = bf16_to_fp32(uint32_t(data_a[get_aoffset() + idx]));
+#else
             float f = float(data_a[get_aoffset() + idx]);
+#endif
+
+#if defined(DATA_D_BF16)
             data_d[get_doffset() + idx] = D_TYPE(fp32_to_bf16(f));
 #elif !defined(OPTIMIZATION_ERROR_WORKAROUND)
-            data_d[get_doffset() + idx] = D_TYPE(data_a[get_aoffset() + idx]);
+            data_d[get_doffset() + idx] = D_TYPE(f);
 #else
             data_d[get_doffset() + idx] = data_a[get_aoffset() + idx];
 #endif

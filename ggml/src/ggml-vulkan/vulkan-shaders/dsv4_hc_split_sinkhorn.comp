@@ -1,0 +1,128 @@
+#version 450
+
+// DSV4 Hyper-Connection split + Sinkhorn normalization.
+//
+// Input:  mixes [(2+n_hc)*n_hc, n_tokens]  (src0)
+//         scale [3]                          (src1)
+//         base  [(2+n_hc)*n_hc]             (src2)
+// Output: dst   [(2+n_hc)*n_hc, n_tokens]
+//   dst[0..n_hc)             = sigmoid(mix[i]*pre_scale + base[i]) + eps        (pre weights)
+//   dst[n_hc..2*n_hc)       = 2 * sigmoid(mix[i]*post_scale + base[i])         (post weights)
+//   dst[2*n_hc..2*n_hc+n_hc*n_hc) = Sinkhorn-normalized combination matrix
+//
+// One workgroup per token row.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer MIX   { float data_mix[];   };
+layout (binding = 1) readonly  buffer SCALE { float data_scale[]; };
+layout (binding = 2) readonly  buffer BASE  { float data_base[];  };
+layout (binding = 3) writeonly buffer D     { float data_d[];     };
+
+layout (push_constant) uniform parameter {
+    uint n_hc;
+    uint sinkhorn_iters;
+    float eps;
+    uint mix_stride;   // nb1 for mixes (in floats)
+    uint dst_stride;   // nb1 for dst (in floats)
+    uint n_rows;
+} p;
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    if (row >= p.n_rows) return;
+
+    const uint n_hc = p.n_hc;
+    const float pre_scale  = data_scale[0];
+    const float post_scale = data_scale[1];
+    const float comb_scale = data_scale[2];
+
+    const uint mix_off = row * p.mix_stride;
+    const uint dst_off = row * p.dst_stride;
+
+    // Pre weights: sigmoid + eps
+    for (uint i = 0; i < n_hc; i++) {
+        float z = data_mix[mix_off + i] * pre_scale + data_base[i];
+        data_d[dst_off + i] = 1.0 / (1.0 + exp(-z)) + p.eps;
+    }
+
+    // Post weights: 2 * sigmoid
+    for (uint i = 0; i < n_hc; i++) {
+        uint off = n_hc + i;
+        float z = data_mix[mix_off + off] * post_scale + data_base[off];
+        data_d[dst_off + off] = 2.0 / (1.0 + exp(-z));
+    }
+
+    // Combination matrix: softmax per dst_hc row, then alternating Sinkhorn normalization
+    // Use shared memory for the n_hc x n_hc matrix (max 16x16 = 256)
+    float c[256]; // n_hc <= 16
+
+    // Initial softmax per dst_hc row
+    for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+        float row_max = -1.0/0.0; // -inf
+        for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+            uint idx = src_hc + dst_hc * n_hc;
+            uint off = 2 * n_hc + idx;
+            float v = data_mix[mix_off + off] * comb_scale + data_base[off];
+            c[idx] = v;
+            row_max = max(row_max, v);
+        }
+
+        float row_sum = 0.0;
+        for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+            uint idx = src_hc + dst_hc * n_hc;
+            float v = exp(c[idx] - row_max);
+            c[idx] = v;
+            row_sum += v;
+        }
+
+        float inv_sum = 1.0 / row_sum;
+        for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+            uint idx = src_hc + dst_hc * n_hc;
+            c[idx] = c[idx] * inv_sum + p.eps;
+        }
+    }
+
+    // First column normalization
+    for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+        float sum = 0.0;
+        for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            sum += c[src_hc + dst_hc * n_hc];
+        }
+        float inv_denom = 1.0 / (sum + p.eps);
+        for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            c[src_hc + dst_hc * n_hc] *= inv_denom;
+        }
+    }
+
+    // Remaining Sinkhorn iterations
+    for (uint iter = 1; iter < p.sinkhorn_iters; iter++) {
+        // Row normalization
+        for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+            float sum = 0.0;
+            for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+                sum += c[src_hc + dst_hc * n_hc];
+            }
+            float inv_denom = 1.0 / (sum + p.eps);
+            for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+                c[src_hc + dst_hc * n_hc] *= inv_denom;
+            }
+        }
+        // Column normalization
+        for (uint src_hc = 0; src_hc < n_hc; src_hc++) {
+            float sum = 0.0;
+            for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                sum += c[src_hc + dst_hc * n_hc];
+            }
+            float inv_denom = 1.0 / (sum + p.eps);
+            for (uint dst_hc = 0; dst_hc < n_hc; dst_hc++) {
+                c[src_hc + dst_hc * n_hc] *= inv_denom;
+            }
+        }
+    }
+
+    // Write combination matrix
+    for (uint i = 0; i < n_hc * n_hc; i++) {
+        data_d[dst_off + 2 * n_hc + i] = c[i];
+    }
+}

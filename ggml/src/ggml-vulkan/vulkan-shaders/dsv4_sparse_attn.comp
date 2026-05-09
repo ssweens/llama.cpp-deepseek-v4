@@ -1,0 +1,176 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#if defined(KV_IS_F16)
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// DSV4 Sparse Attention: unified indexed gather-attention for DeepSeek V4.
+//
+// For each (batch, token, head):
+//   1. Window positions: iterate kv_window, accumulate softmax stats
+//   2. Top-k gathered: iterate topk_idxs into kv_comp, accumulate
+//   3. Attention sink: contributes to denominator only
+//   4. Normalize and write output
+//
+// KV_TYPE is set via preprocessor: float, float16_t, or uint16_t (bf16)
+
+// BF16 -> F32 conversion
+float bf16_to_f32(uint16_t v) {
+    return uintBitsToFloat(uint(v) << 16);
+}
+
+float load_kv(KV_TYPE v) {
+#if defined(KV_IS_BF16)
+    return bf16_to_f32(v);
+#elif defined(KV_IS_F16)
+    return float(v);
+#else
+    return v;
+#endif
+}
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Q     { float   data_q[];    };
+layout (binding = 1) readonly  buffer KVC   { KV_TYPE data_kvc[];  };
+layout (binding = 2) readonly  buffer KVW   { KV_TYPE data_kvw[];  };
+layout (binding = 3) readonly  buffer WMASK { float   data_wmask[]; };
+layout (binding = 4) readonly  buffer IDX   { int     data_idx[];  };
+layout (binding = 5) readonly  buffer SINK  { float   data_sink[]; };
+layout (binding = 6) buffer D     { float   data_d[];    };
+
+layout (push_constant) uniform parameter {
+    float    scale;
+    uint head_dim_q;
+    uint head_dim_kv;
+    uint n_heads;
+    uint n_tokens;
+    uint batch;
+    uint n_kv_comp;
+    uint n_window;
+    uint topk;
+    // Q strides (in floats)
+    uint nb_q1;
+    uint nb_q2;
+    uint nb_q3;
+    // kv_comp strides (in KV_TYPE units)
+    uint nb_kvc2;
+    uint nb_kvc3;
+    // kv_window strides
+    uint nb_kvw2;
+    uint nb_kvw3;
+    // wmask strides
+    uint nb_wmask1;
+    uint nb_wmask3;
+    // idx strides (in int units)
+    uint nb_idx1;
+    uint nb_idx2;
+    // dst strides (in floats)
+    uint nb_d1;
+    uint nb_d2;
+    uint nb_d3;
+    // flags
+    uint has_window;
+    uint has_wmask;
+    uint has_sink;
+} p;
+
+void main() {
+    const uint work_idx = gl_GlobalInvocationID.x;
+    const uint total = p.batch * p.n_tokens * p.n_heads;
+    if (work_idx >= total) return;
+
+    const uint h = work_idx % p.n_heads;
+    const uint t = (work_idx / p.n_heads) % p.n_tokens;
+    const uint b = work_idx / (p.n_heads * p.n_tokens);
+
+    const uint q_off = b * p.nb_q3 + t * p.nb_q2 + h * p.nb_q1;
+    const uint d_off = b * p.nb_d3 + t * p.nb_d2 + h * p.nb_d1;
+
+    float scores_max = -1.0/0.0;
+    float sum_exp = 0.0;
+
+    // Initialize output to zero
+    for (uint d = 0; d < p.head_dim_kv; d++) {
+        data_d[d_off + d] = 0.0;
+    }
+
+    // Phase 1: window positions
+    if (p.has_window != 0) {
+        const uint kvw_batch_off = b * p.nb_kvw3;
+
+        for (uint k = 0; k < p.n_window; k++) {
+            if (p.has_wmask != 0) {
+                float m = data_wmask[t * p.nb_wmask1 + k + b * p.nb_wmask3];
+                if (isinf(m) && m < 0.0) continue;
+            }
+
+            float dot = 0.0;
+            uint kv_off = kvw_batch_off + k * p.nb_kvw2;
+            for (uint d = 0; d < p.head_dim_kv; d++) {
+                dot += data_q[q_off + d] * load_kv(data_kvw[kv_off + d]);
+            }
+            float s = dot * p.scale;
+
+            if (p.has_wmask != 0) {
+                s += data_wmask[t * p.nb_wmask1 + k + b * p.nb_wmask3];
+            }
+
+            float new_max = max(scores_max, s);
+            float scale_prev = isinf(scores_max) ? 0.0 : exp(scores_max - new_max);
+            float w = exp(s - new_max);
+            sum_exp = sum_exp * scale_prev + w;
+
+            for (uint d = 0; d < p.head_dim_kv; d++) {
+                data_d[d_off + d] = data_d[d_off + d] * scale_prev + w * load_kv(data_kvw[kv_off + d]);
+            }
+            scores_max = new_max;
+        }
+    }
+
+    // Phase 2: top-k gathered positions
+    const uint idx_off = b * p.nb_idx2 + t * p.nb_idx1;
+    const uint kvc_batch_off = b * p.nb_kvc3;
+
+    for (uint i = 0; i < p.topk; i++) {
+        int kv_pos = data_idx[idx_off + i];
+        if (kv_pos < 0 || kv_pos >= int(p.n_kv_comp)) continue;
+
+        float dot = 0.0;
+        uint kv_off = kvc_batch_off + uint(kv_pos) * p.nb_kvc2;
+        for (uint d = 0; d < p.head_dim_kv; d++) {
+            dot += data_q[q_off + d] * load_kv(data_kvc[kv_off + d]);
+        }
+        float s = dot * p.scale;
+
+        float new_max = max(scores_max, s);
+        float scale_prev = isinf(scores_max) ? 0.0 : exp(scores_max - new_max);
+        float w = exp(s - new_max);
+        sum_exp = sum_exp * scale_prev + w;
+
+        for (uint d = 0; d < p.head_dim_kv; d++) {
+            data_d[d_off + d] = data_d[d_off + d] * scale_prev + w * load_kv(data_kvc[kv_off + d]);
+        }
+        scores_max = new_max;
+    }
+
+    // Phase 3: attention sink (denominator only)
+    if (p.has_sink != 0) {
+        float sink_val = data_sink[h];
+        float new_max = max(scores_max, sink_val);
+        float scale_prev = isinf(scores_max) ? 0.0 : exp(scores_max - new_max);
+        sum_exp = sum_exp * scale_prev + exp(sink_val - new_max);
+        for (uint d = 0; d < p.head_dim_kv; d++) {
+            data_d[d_off + d] = data_d[d_off + d] * scale_prev;
+        }
+        scores_max = new_max;
+    }
+
+    // Phase 4: normalize
+    float inv = sum_exp > 0.0 ? (1.0 / sum_exp) : 0.0;
+    for (uint d = 0; d < p.head_dim_kv; d++) {
+        data_d[d_off + d] *= inv;
+    }
+}

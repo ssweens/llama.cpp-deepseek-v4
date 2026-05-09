@@ -1,0 +1,40 @@
+#version 450
+
+// DSV4 Hyper-Connection weighted sum:
+//   dst[d, t] = sum_h( x[d, h, t] * weights[h, t] )
+// x:       [n_embd, n_hc, n_tokens]
+// weights: [n_hc, n_tokens]
+// dst:     [n_embd, n_tokens]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X { float data_x[]; };
+layout (binding = 1) readonly  buffer W { float data_w[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_embd;
+    uint n_hc;
+    uint n_tokens;
+    uint nb_x1;  // x stride for hc dim (in floats)
+    uint nb_x2;  // x stride for token dim (in floats)
+    uint nb_w1;  // weights stride for token dim (in floats)
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = p.n_embd * p.n_tokens;
+    if (idx >= total) return;
+
+    const uint d = idx % p.n_embd;
+    const uint t = idx / p.n_embd;
+
+    float acc = 0.0;
+    for (uint h = 0; h < p.n_hc; h++) {
+        float xv = data_x[d + h * p.nb_x1 + t * p.nb_x2];
+        float wv = data_w[h + t * p.nb_w1];
+        acc += xv * wv;
+    }
+
+    data_d[idx] = acc;
+}

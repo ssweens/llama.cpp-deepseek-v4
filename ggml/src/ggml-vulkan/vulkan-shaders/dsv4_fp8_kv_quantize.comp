@@ -1,0 +1,99 @@
+#version 450
+
+// DSV4 FP8 E4M3 KV quantize: round-trip the non-RoPE dimensions through E4M3
+// block quantization (block_size=64), pass-through RoPE dimensions unchanged.
+//
+// src0: [head_dim, ...] f32
+// dst:  [head_dim, ...] f32  (same shape)
+// op_params[0] = n_rot
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer A { float data_a[]; };
+layout (binding = 1) writeonly buffer D { float data_d[]; };
+
+layout (push_constant) uniform parameter {
+    uint head_dim;
+    uint n_rot;
+    uint n_rows;
+} p;
+
+// E4M3 FN dequant lookup table (127 entries for codes 1..126; code 0 = 0.0)
+// exp=0 (subnormals): val = mant * 2^-9
+// exp>0 (normals):    val = (1 + mant/8) * 2^(exp-7)
+float e4m3_dequant(float x) {
+    float sign = x < 0.0 ? -1.0 : 1.0;
+    float ax = abs(x);
+    ax = min(ax, 448.0);
+
+    // Brute-force search for nearest E4M3 value (127 codes)
+    int best = 0;
+    float best_diff = ax;
+    for (int i = 1; i < 127; i++) {
+        int e = (i >> 3) & 0x0f;
+        int m = i & 0x07;
+        float val;
+        if (e == 0) {
+            val = ldexp(float(m), -9);
+        } else {
+            val = ldexp(1.0 + float(m) / 8.0, e - 7);
+        }
+        float diff = abs(ax - val);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+
+    int e = (best >> 3) & 0x0f;
+    int m = best & 0x07;
+    float val;
+    if (e == 0) {
+        val = ldexp(float(m), -9);
+    } else {
+        val = ldexp(1.0 + float(m) / 8.0, e - 7);
+    }
+    return sign * val;
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint n_nope = p.head_dim - p.n_rot;
+    const uint row_idx = idx / p.head_dim;
+    const uint col_idx = idx % p.head_dim;
+
+    if (row_idx >= p.n_rows) return;
+
+    const uint base = row_idx * p.head_dim;
+
+    if (col_idx >= n_nope) {
+        // RoPE dimensions: pass through
+        data_d[base + col_idx] = data_a[base + col_idx];
+        return;
+    }
+
+    // Non-RoPE dimensions: FP8 E4M3 block quantize (block_size=64)
+    // Only process on block-aligned threads
+    uint block_start = (col_idx / 64) * 64;
+    if (col_idx != block_start) {
+        // This thread is not the block leader; need to find amax first
+        // Since we can't synchronize across invocations within a row easily,
+        // we do the full block computation for every thread in the block.
+    }
+
+    // Find amax for this block of 64
+    float amax = 0.0;
+    uint block_end = min(block_start + 64, n_nope);
+    for (uint i = block_start; i < block_end; i++) {
+        amax = max(amax, abs(data_a[base + i]));
+    }
+    amax = max(amax, 1.0e-4);
+
+    // Compute scale as power-of-2
+    float scale = exp2(ceil(log2(amax / 448.0)));
+
+    // Quantize this element
+    float v = data_a[base + col_idx];
+    float q = clamp(v / scale, -448.0, 448.0);
+    data_d[base + col_idx] = e4m3_dequant(q) * scale;
+}

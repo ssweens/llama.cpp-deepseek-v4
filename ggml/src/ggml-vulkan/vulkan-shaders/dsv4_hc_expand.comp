@@ -1,0 +1,63 @@
+#version 450
+
+// DSV4 Hyper-Connection expand:
+//   dst[d, dst_hc, t] = block_out[d, t] * post[dst_hc, t]
+//                      + sum_src_hc( comb[dst_hc, src_hc, t] * residual[d, src_hc, t] )
+//
+// block_out: [n_embd, n_tokens]
+// residual:  [n_embd, n_hc, n_tokens]
+// post:      [n_hc, n_tokens]
+// comb:      [n_hc, n_hc, n_tokens]   (ne[0]=dst_hc stride, ne[1]=src_hc)
+// dst:       [n_embd, n_hc, n_tokens]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer BLOCK { float data_block[]; };
+layout (binding = 1) readonly  buffer RES   { float data_res[];   };
+layout (binding = 2) readonly  buffer POST  { float data_post[];  };
+layout (binding = 3) readonly  buffer COMB  { float data_comb[];  };
+layout (binding = 4) writeonly buffer D     { float data_d[];     };
+
+layout (push_constant) uniform parameter {
+    uint n_embd;
+    uint n_hc;
+    uint n_tokens;
+    // block_out strides (in floats)
+    uint nb_block1;
+    // residual strides (in floats)
+    uint nb_res1;
+    uint nb_res2;
+    // post strides (in floats)
+    uint nb_post1;
+    // comb strides (in floats)
+    uint nb_comb0;  // dst_hc stride
+    uint nb_comb1;  // src_hc stride
+    uint nb_comb2;  // token stride
+    // dst strides (in floats)
+    uint nb_dst1;
+    uint nb_dst2;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = p.n_embd * p.n_hc * p.n_tokens;
+    if (idx >= total) return;
+
+    const uint d      = idx % p.n_embd;
+    const uint tmp    = idx / p.n_embd;
+    const uint dst_hc = tmp % p.n_hc;
+    const uint t      = tmp / p.n_hc;
+
+    float block_v = data_block[d + t * p.nb_block1];
+    float post_v  = data_post[dst_hc + t * p.nb_post1];
+
+    float acc = block_v * post_v;
+
+    for (uint src_hc = 0; src_hc < p.n_hc; src_hc++) {
+        float comb_v = data_comb[dst_hc * p.nb_comb0 + src_hc * p.nb_comb1 + t * p.nb_comb2];
+        float res_v  = data_res[d + src_hc * p.nb_res1 + t * p.nb_res2];
+        acc += comb_v * res_v;
+    }
+
+    data_d[d + dst_hc * p.nb_dst1 + t * p.nb_dst2] = acc;
+}
