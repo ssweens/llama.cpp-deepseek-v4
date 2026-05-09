@@ -816,7 +816,12 @@ void llm_graph_result::reset() {
 
     inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    // Keep a small amount of slack for ggml object alignment/padding during
+    // graph construction. Some large architecture-specific graphs can otherwise
+    // exhaust the metadata arena by a single tensor object even when max_nodes is
+    // sufficient for the final graph.
+    constexpr size_t meta_slack = 1024 * 1024;
+    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false) + meta_slack);
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),

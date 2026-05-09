@@ -2071,7 +2071,11 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 80, 128u * model.n_tensors());
+        // DeepSeek4 continuation graphs vary slightly with absolute position and
+        // compressed-cache replay shape. Reserve a small metadata margin beyond
+        // the nominal tensor-count heuristic so long tool-schema prompts do not
+        // exhaust ggml's graph metadata arena by a handful of tensor objects.
+        return std::max<uint32_t>(n_tokens * 80, 128u * model.n_tensors()) + 8192u;
     }
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
