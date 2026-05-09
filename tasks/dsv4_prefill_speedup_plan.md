@@ -107,38 +107,53 @@ Risk:
 
 ## Candidate 2 — larger architecture win: vectorized continuation prefill compressor
 
+Status: implemented for guarded ratio-4 continuation chunks on `work/dsv4-prefill-speedup` after the main merge.
+
 Current `is_prefill` is effectively only true for chunks starting at position 0:
 
 ```cpp
 const bool is_prefill = ubatch.pos == nullptr || ubatch.pos[0] == 0;
 ```
 
-Continuation prompt chunks after cache restore or after the first `n_batch` chunk use decode-style compressor logic. For long prompts, this means most prompt tokens can miss the vectorized prefill path.
+Continuation prompt chunks after cache restore or after the first `n_batch` chunk used decode-style compressor logic. For long prompts, this meant most prompt tokens could miss the vectorized prefill path.
 
-Implement a vectorized continuation prefill path for contiguous single-sequence chunks that start on a safe compression/checkpoint boundary:
+Implemented a vectorized continuation prefill path for the common safe case:
 
-- Preconditions:
-  - `has_hybrid_iswa`
-  - single contiguous sequence
-  - `n_tokens > 1`
-  - `first_pos % compress_ratio == 0` or stronger DSv4 alignment (`first_pos % 128 == 0`) for current cache-safety rules
-- For ratio 4, seed the first shifted/previous window from `prev_kv_state` / `prev_score_state` instead of zero/`-inf`, then use the same vectorized pooling style as `build_compressed_pool` for the chunk.
-- Store the generated compressed rows and final recurrent state exactly as the decode-chunk path does.
+- `compress_ratio == 4`
+- single sequence / one seq id
+- `n_tokens > 1`
+- `first_pos > 0`
+- `first_pos % 4 == 0`
+- `n_tokens % 4 == 0`
+- `ubatch.pos[i] == first_pos + i`
 
-Expected effect:
+The helper mirrors `/home/bigkahuna/src/ds4` Metal `compressor_prefill_ratio4_replay` semantics:
 
-- Large continuation prefill chunks after prompt-cache restore should move from per-token recurrent graph construction to parallel compressor/pool math.
-- This is the more plausible path to a real 2x prefill improvement on multi-thousand-token prompts.
+- Project `kv` and `score` for the whole chunk once.
+- Add APE in vectorized `{width, ratio, n_comp}` layout.
+- Seed the first shifted previous half from rows `0..3` of the previous compressor state.
+- Use the current chunk's previous half for later compressed rows.
+- Pool all compressed rows in parallel, apply RMS/norm and compressed RoPE positions.
+- Leave recurrent state in post-prefill layout: rows `0..3` hold the final full window; rows `4..7` are cleared until decode writes the next current half.
 
-Risk:
-
-- Higher correctness risk than Candidate 1: ratio-4 overlap state must match decode semantics exactly.
-- Needs parity against existing decode-chunk path for several `(first_pos, n_tokens, ratio)` cases.
+Fallback remains the existing per-token decode/replay path for decode, multi-seq, non-contiguous positions, non-ratio-4 layers, or unaligned chunks.
 
 Validation:
 
-- Build a small backend/unit harness or add debug compare mode that constructs both old decode-chunk and new vectorized-continuation outputs for the same chunk and checks final `kv_state`, `score_state`, and `kv_comp`.
-- Then validate full model with systemctl-managed Corral histories.
+- Host build: `cmake --build build-vulkan-linux-release --target llama-server -j 8` passed.
+- Mounted CUDA/HIP build: `cmake --build /src/build-dsv4-container --target llama-server -j 8` passed inside `llamatrifecta_deepseekv4:latest`.
+- First runtime attempt caught a real bug: reshaping non-contiguous previous-state seed views. Fixed by applying `cont_if_needed()` before reshape.
+- IQ2_XXS endpoint regression passed all 7 cases after the fix.
+- Debug run confirmed `path=prefill-replay` on aligned continuation chunks.
+
+Clean no-debug IQ2_XXS timing from the Mina regression:
+
+| Case | Before vectorized replay | After vectorized replay |
+|------|--------------------------|-------------------------|
+| Fresh 2486-token Mina prefill | ~220.83 tok/s | 265.04 tok/s |
+| Replayed 1078-token Mina continuation | ~151-155 tok/s | 189.85-194.73 tok/s |
+
+Result: useful ~20-28% prefill improvement, but not 2x. Further general-prefill gains likely need backend/profile-led work in prompt indexer/top-k, compressor pooling fusion, cache writes, or MoE/expert matmul throughput.
 
 ## Candidate 3 — profiling-guided backend work
 

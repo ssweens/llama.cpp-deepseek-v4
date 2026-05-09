@@ -124,6 +124,13 @@
 - Main now includes commit `22eaf7d89 perf(deepseek4): reduce prefill checkpoint fragmentation`.
 - `work/dsv4-prefill-speedup` remains alive and points at the same commit as `main` for follow-up bug fixes.
 
+## General DSv4 prefill speed follow-up — vectorized continuation compressor
+- [x] Implement a guarded vectorized continuation-prefill compressor for contiguous single-sequence ratio-4 chunks that start after position 0, so large cold prompts do not route all post-first chunks through per-token decode replay.
+- [x] Keep the existing decode/replay path as the fallback for decode, multi-seq, non-contiguous positions, non-ratio-4 layers, or unsafe alignment.
+- [x] Build and validate `llama-server` after the graph change: host `build-vulkan-linux-release` build passed; mounted CUDA/HIP `build-dsv4-container` build passed.
+- [x] Run the DeepSeek4 endpoint regression harness with IQ2_XXS and compare prompt chunk/path logs for large prompts: all 7 regression cases passed; debug logs confirmed `path=prefill-replay` on aligned continuation chunks.
+- [x] Record results and decide whether backend fusion/profiling is still needed. Clean no-debug IQ2_XXS Mina timing: fresh 2486-token prefill `265.04 tok/s` vs previous ~`220.83 tok/s`; checkpoint-replayed 1078-token prefill `189.85-194.73 tok/s` vs previous ~`151-155 tok/s`. This is a useful ~20-28% improvement, not 2x; next candidates are larger backend fusion/profile work around prompt indexer/top-k, compressor pooling, and MoE/expert matmul throughput.
+
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
 ### Goal
