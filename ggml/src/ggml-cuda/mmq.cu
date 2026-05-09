@@ -3,6 +3,116 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+struct mmq_id_profiler {
+    struct entry {
+        double ids_ms = 0.0;
+        double quant_ms = 0.0;
+        double matmul_ms = 0.0;
+        int64_t calls = 0;
+        int64_t n_tokens_min = std::numeric_limits<int64_t>::max();
+        int64_t n_tokens_max = 0;
+        int64_t n_experts = 0;
+        int64_t n_expert_used = 0;
+        int64_t nonempty_experts_sum = 0;
+        int64_t max_cols_sum = 0;
+        int64_t max_cols_max = 0;
+        int64_t tile_slots_current_sum = 0;
+        int64_t tile_slots_tight_sum = 0;
+    };
+
+    std::unordered_map<std::string, entry> by_tag;
+
+    static bool enabled() {
+        static const bool e = getenv("GGML_PROFILE_MMQ_ID") != nullptr;
+        return e;
+    }
+
+    static mmq_id_profiler & get() {
+        static mmq_id_profiler p;
+        return p;
+    }
+
+    static const char * tag_for(const ggml_tensor * src0) {
+        const char * name = ggml_get_name(src0);
+        if (!name) return "_unknown";
+        if (strstr(name, "ffn_moe_gate") || strstr(name, "ffn_gate_exps")) return "moe.ffn_gate";
+        if (strstr(name, "ffn_moe_up")   || strstr(name, "ffn_up_exps"))   return "moe.ffn_up";
+        if (strstr(name, "ffn_moe_down") || strstr(name, "ffn_down_exps")) return "moe.ffn_down";
+        if (strstr(name, "attn")) return "attn";
+        return "_other";
+    }
+
+    static std::string key_for(const ggml_tensor * src0, int64_t n_tokens, int64_t n_experts, int64_t n_expert_used) {
+        std::string key = tag_for(src0);
+        key += ":";
+        key += ggml_type_name(src0->type);
+        key += ":tok=" + std::to_string(n_tokens);
+        key += ":experts=" + std::to_string(n_experts);
+        key += ":used=" + std::to_string(n_expert_used);
+        return key;
+    }
+
+    void record(const std::string & key, int64_t n_tokens, int64_t n_experts, int64_t n_expert_used,
+            int64_t nonempty_experts, int64_t max_cols, int64_t tile_slots_current, int64_t tile_slots_tight,
+            double ids_ms, double quant_ms, double matmul_ms) {
+        auto & e = by_tag[key];
+        e.ids_ms += ids_ms;
+        e.quant_ms += quant_ms;
+        e.matmul_ms += matmul_ms;
+        e.calls += 1;
+        e.n_tokens_min = std::min(e.n_tokens_min, n_tokens);
+        e.n_tokens_max = std::max(e.n_tokens_max, n_tokens);
+        e.n_experts = n_experts;
+        e.n_expert_used = n_expert_used;
+        e.nonempty_experts_sum += nonempty_experts;
+        e.max_cols_sum += max_cols;
+        e.max_cols_max = std::max(e.max_cols_max, max_cols);
+        e.tile_slots_current_sum += tile_slots_current;
+        e.tile_slots_tight_sum += tile_slots_tight;
+    }
+
+    ~mmq_id_profiler() {
+        if (!enabled() || by_tag.empty()) return;
+        std::vector<std::pair<std::string, entry>> rows(by_tag.begin(), by_tag.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+            const double at = a.second.ids_ms + a.second.quant_ms + a.second.matmul_ms;
+            const double bt = b.second.ids_ms + b.second.quant_ms + b.second.matmul_ms;
+            return at > bt;
+        });
+        double total = 0.0;
+        for (const auto & r : rows) {
+            total += r.second.ids_ms + r.second.quant_ms + r.second.matmul_ms;
+        }
+        fprintf(stderr, "\n=== MMQ MUL_MAT_ID profile (GGML_PROFILE_MMQ_ID; run with CUDA graphs disabled) ===\n");
+        fprintf(stderr, "%-38s %7s %12s %11s %12s %12s %7s %8s %8s %8s %9s %9s\n",
+                "key", "calls", "ids_ms", "quant_ms", "matmul_ms", "total_ms", "pct", "nonempt", "avg_max", "max_col", "tiles_cur", "tiles_tgt");
+        for (const auto & r : rows) {
+            const auto & e = r.second;
+            const double row_total = e.ids_ms + e.quant_ms + e.matmul_ms;
+            const double inv_calls = e.calls > 0 ? 1.0 / (double) e.calls : 0.0;
+            fprintf(stderr, "%-38s %7lld %12.2f %11.2f %12.2f %12.2f %6.2f%% %8.1f %8.1f %8lld %9.1f %9.1f\n",
+                    r.first.c_str(), (long long) e.calls, e.ids_ms, e.quant_ms, e.matmul_ms, row_total,
+                    total > 0.0 ? 100.0 * row_total / total : 0.0,
+                    e.nonempty_experts_sum * inv_calls,
+                    e.max_cols_sum * inv_calls,
+                    (long long) e.max_cols_max,
+                    e.tile_slots_current_sum * inv_calls,
+                    e.tile_slots_tight_sum * inv_calls);
+        }
+        fprintf(stderr, "=== MMQ MUL_MAT_ID measured total: %.2f ms ===\n", total);
+    }
+};
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -171,11 +281,28 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
+    const bool profile_mmq_id = mmq_id_profiler::enabled();
+    double profile_ids_ms = 0.0;
+    double profile_quant_ms = 0.0;
+    double profile_matmul_ms = 0.0;
+    auto time_component = [&](auto && fn) -> double {
+        if (!profile_mmq_id) {
+            fn();
+            return 0.0;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
-    {
+    profile_ids_ms = time_component([&]() {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
@@ -183,7 +310,7 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());
-    }
+    });
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
@@ -193,7 +320,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
-    {
+    profile_quant_ms = time_component([&]() {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -206,7 +333,7 @@ void ggml_cuda_mul_mat_q(
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
-    }
+    });
 
     const int64_t s12 = use_native_mxfp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (8 * QK_MXFP4 * sizeof(int)) :
                                            ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
@@ -220,7 +347,34 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    profile_matmul_ms = time_component([&]() {
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    });
+
+    if (profile_mmq_id) {
+        std::vector<int32_t> bounds(ne02 + 1);
+        CUDA_CHECK(cudaMemcpyAsync(bounds.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        int64_t nonempty_experts = 0;
+        int64_t max_cols = 0;
+        int64_t tile_slots_tight = 0;
+        constexpr int assumed_mmq_x = 128;
+        for (int64_t ie = 0; ie < ne02; ++ie) {
+            const int64_t cols = bounds[ie + 1] - bounds[ie];
+            GGML_ASSERT(cols >= 0);
+            if (cols > 0) {
+                nonempty_experts++;
+            }
+            max_cols = std::max(max_cols, cols);
+            tile_slots_tight += (cols + assumed_mmq_x - 1) / assumed_mmq_x;
+        }
+        const int64_t tile_slots_current = ne02 * ((ne12 + assumed_mmq_x - 1) / assumed_mmq_x);
+        mmq_id_profiler::get().record(
+            mmq_id_profiler::key_for(src0, ne12, ne02, n_expert_used), ne12, ne02, n_expert_used,
+            nonempty_experts, max_cols, tile_slots_current, tile_slots_tight,
+            profile_ids_ms, profile_quant_ms, profile_matmul_ms);
+    }
 }
 
 void ggml_cuda_op_mul_mat_q(
