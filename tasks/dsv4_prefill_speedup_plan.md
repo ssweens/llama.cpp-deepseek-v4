@@ -157,18 +157,35 @@ Result: useful ~20-28% prefill improvement, but not 2x. Further general-prefill 
 
 ## Candidate 3 — profiling-guided backend work
 
-After chunking/path fixes, use `GGML_CUDA_PROFILE_OPS=1` on a controlled standalone harness or systemctl-managed service config to identify remaining prefill op costs.
+After chunking/path fixes, `GGML_PROFILE_OPS=1` on controlled `llama-bench` runs showed sparse attention was material for CUDA prefill:
 
-Likely cost centers to confirm:
+- IQ2_XXS, p2048/ub2048 before bounded raw-window scan:
+  - non-profiled: `345.66 tok/s`
+  - profiled `DSV4_SPARSE_ATTN`: `3866.68 ms` / `69.82%`
+- Root cause: prompt sparse attention passed `Kcur` as `n_window=n_tokens` plus a dense `[n_tokens,n_tokens]` causal/SWA mask. The CUDA/HIP kernel scanned the full prompt chunk even though DSv4 logical raw SWA is 128 tokens.
 
-- MoE `MUL_MAT_ID`
-- dense `MUL_MAT` / cuBLAS projections
-- compressor/indexer projections
-- KV/cache writes (`CPY`, `SET_ROWS`)
-- scheduler split copies on multi-GPU layer split
-- host-filled mask inputs for prompt/decode masks
+Implemented bounded prompt raw-window scanning in `GGML_OP_DSV4_SPARSE_ATTN`:
 
-Do not optimize sparse attention first unless profiling shows it is actually material.
+- New op param `raw_window_limit`; `0` preserves prior full-window behavior.
+- Prompt sparse path passes `prompt_window_size` when causal attention is active.
+- Decode path passes `0` unchanged.
+- CPU and shared CUDA/HIP reference paths honor the bound; Vulkan clone preserves the param but Vulkan execution remains conservative.
+- The dense mask is still applied to all scanned rows as a correctness guard.
+
+Results:
+
+| Case | Before | After |
+|------|--------|-------|
+| CUDA IQ2_XXS p2048/ub2048 non-profiled | 345.66 tok/s | 612.91 tok/s |
+| CUDA IQ2_XXS p2048/ub2048 `DSV4_SPARSE_ATTN` | 3866.68 ms / 69.82% | 1315.55 ms / 44.56% |
+| CUDA IQ2_XXS p8192/ub512 non-profiled | 263.05 tok/s | 263.42 tok/s |
+| ROCm0 IQ2_XXS p64 smoke | n/a | 49.49 tok/s |
+
+Interpretation:
+
+- The code fix removes a major large-ubatch prompt sparse-attention waste.
+- Long p8192/ub512 stays flat because smaller chunks were already less sparse-attn dominated; `MUL_MAT_ID` / expert matmul dominates there.
+- Next backend targets after this are MoE/expert matmul throughput and possibly a tensor-core/MMA sparse-attention kernel for the remaining 128 raw + top-k work.
 
 ## Initial ranking
 

@@ -131,6 +131,22 @@
 - [x] Run the DeepSeek4 endpoint regression harness with IQ2_XXS and compare prompt chunk/path logs for large prompts: all 7 regression cases passed; debug logs confirmed `path=prefill-replay` on aligned continuation chunks.
 - [x] Record results and decide whether backend fusion/profiling is still needed. Clean no-debug IQ2_XXS Mina timing: fresh 2486-token prefill `265.04 tok/s` vs previous ~`220.83 tok/s`; checkpoint-replayed 1078-token prefill `189.85-194.73 tok/s` vs previous ~`151-155 tok/s`. This is a useful ~20-28% improvement, not 2x; next candidates are larger backend fusion/profile work around prompt indexer/top-k, compressor pooling, and MoE/expert matmul throughput.
 
+## CUDA prefill profiling — IQ2_XXS
+- [ ] Free the ad hoc mounted-code server container only, leaving Corral/systemd-managed services untouched.
+- [ ] Build/check a bounded standalone profiling harness (`llama-bench` or equivalent) in `build-dsv4-container`.
+- [ ] Run non-profiled CUDA prefill baselines for prompt sizes 512/2048/8192 with `-n 1` and key `-ub` settings.
+- [ ] Run `GGML_PROFILE_OPS=1` prefill profiles for representative prompt sizes/configs and capture op-share summaries.
+- [ ] Compare op mix: `MUL_MAT`, `MUL_MAT_ID`, `DSV4_SPARSE_ATTN`, `ARGSORT`, compressor ops, `CPY`, `SET_ROWS`, and scheduler split/copy indicators.
+- [x] Record findings and choose the next implementation target: profiles show CUDA prefill is dominated by `DSV4_SPARSE_ATTN` for large prompt ubatches because the prompt path passes `Kcur` as `n_window=n_tokens` with a dense `[n_tokens,n_tokens]` mask, so the kernel scans masked-out raw positions even though DSv4 logical SWA is 128.
+
+## CUDA prefill optimization — bounded prompt sparse raw window
+- [x] Add a bounded raw-window mode to `GGML_OP_DSV4_SPARSE_ATTN` via op params, defaulting to current behavior for decode/Vulkan and any caller that passes `0`.
+- [x] Pass `prompt_window_size` from the DSv4 prompt sparse path when causal prompt attention is active.
+- [x] Keep decode path unchanged and preserve the dense mask as a correctness guard for visible positions.
+- [x] Preserve ROCm/HIP behavior: the shared CUDA/HIP sparse-attn source compiles, and bounded prompt scanning remains semantically identical to the mask-scanning path for visible rows.
+- [x] Build CUDA/HIP and host targets. Host `llama-server llama-bench` build passed; mounted Docker CUDA/HIP `llama-bench llama-server` build passed.
+- [x] Re-profile IQ2_XXS prefill to verify `DSV4_SPARSE_ATTN` time drops and run IQ2_XXS endpoint regressions; run at least a bounded ROCm smoke if hardware/runtime permits. CUDA p2048/ub2048 improved `345.66 -> 612.91 tok/s` non-profiled and `DSV4_SPARSE_ATTN` dropped `3866.68 -> 1315.55 ms`; IQ2_XXS regression passed on retry after one non-deterministic cache-reuse tool-name miss; ROCm0 p64 smoke passed at `49.49 tok/s`.
+
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
 ### Goal

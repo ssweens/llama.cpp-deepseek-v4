@@ -11791,6 +11791,7 @@ static void ggml_compute_forward_dsv4_sparse_attn_t(
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
+    const int32_t raw_window_limit = ggml_get_op_params_i32(dst, 1);
 
     const int64_t head_dim_q  = src_q->ne[0];
     const int64_t n_heads     = src_q->ne[1];
@@ -11872,7 +11873,13 @@ static void ggml_compute_forward_dsv4_sparse_attn_t(
         }
 
         // Phase 1: window positions (contiguous, optionally masked for causality).
-        for (int64_t k = 0; k < n_window; ++k) {
+        int64_t k_begin = 0;
+        int64_t k_end = n_window;
+        if (raw_window_limit > 0) {
+            k_end = std::min<int64_t>(n_window, t + 1);
+            k_begin = std::max<int64_t>(0, k_end - raw_window_limit);
+        }
+        for (int64_t k = k_begin; k < k_end; ++k) {
             const KVT * kv_row = (const KVT *)(kv_w_base + k * src_kv_w->nb[2]);
             float dot = 0.0f;
             for (int64_t d = 0; d < head_dim_kv; ++d) {

@@ -1619,7 +1619,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 window_mask,            // [n_tokens, n_tokens] causal+SWA mask
                 idx_sel,                // [n_idx_topk, n_tokens]
                 sink,                   // [n_heads]
-                kq_scale);
+                kq_scale,
+                cparams.causal_attn ? (int32_t) prompt_window_size : 0);
             cb(cur, "attn_sparse_prompt", il);
             use_prompt_sparse_attn = true;
         } else if (prompt_c_attn != nullptr) {
@@ -1903,7 +1904,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     window_mask,      // [n_window, n_tokens] SWA validity + causal
                     idx_topk,         // [n_idx_topk, n_tokens]
                     sink,             // [n_heads]
-                    kq_scale);
+                    kq_scale,
+                    0);
                 cb(cur, "attn_sparse_decode", il);
                 use_prompt_sparse_attn = true;
             } else if (n_comp_visible > 0) {

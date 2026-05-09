@@ -62,6 +62,7 @@ static __global__ void dsv4_sparse_attn_kernel(
         const int                      n_kv_comp,
         const int                      n_window,
         const int                      topk,
+        const int                      raw_window_limit,
         // strides in elements (not bytes)
         const int64_t                  q_stride_h,
         const int64_t                  q_stride_t,
@@ -247,8 +248,18 @@ static __global__ void dsv4_sparse_attn_kernel(
     };
 
     // ---- Phase 1: window positions (with optional causal/SWA mask). ----
-    for (int kv_base = 0; kv_base < n_window; kv_base += CHUNK_KV) {
-        const int n_pos = min(CHUNK_KV, n_window - kv_base);
+    // Prompt prefill passes kv_window=Kcur with n_window=n_tokens and a dense
+    // causal/SWA mask. DSv4's logical raw SWA is only 128 tokens, so when the
+    // caller provides raw_window_limit we skip the obviously masked prefix
+    // instead of scanning the whole prompt chunk for every query.
+    int kv_begin = 0;
+    int kv_end   = n_window;
+    if (raw_window_limit > 0) {
+        kv_end   = min(n_window, t_idx + 1);
+        kv_begin = max(0, kv_end - raw_window_limit);
+    }
+    for (int kv_base = kv_begin; kv_base < kv_end; kv_base += CHUNK_KV) {
+        const int n_pos = min(CHUNK_KV, kv_end - kv_base);
         process_chunk([&](int slot, const KVT *& kv_row, float & mask_add) {
             const int k = kv_base + slot;
             kv_row   = kv_w_base + (int64_t) k * kw_stride_p;
@@ -315,6 +326,7 @@ static void launch_dsv4_sparse_attn(
         const int        n_kv_comp,
         const int        n_window,
         const int        topk,
+        const int        raw_window_limit,
         const int        batch,
         const int64_t    q_stride_h,
         const int64_t    q_stride_t,
@@ -340,7 +352,7 @@ static void launch_dsv4_sparse_attn(
     }
     dsv4_sparse_attn_kernel<KVT, 512, BLOCK_THREADS><<<grid, BLOCK_THREADS, 0, stream>>>(
         q, kv_comp, kv_window, window_mask, topk_idxs, attn_sink, out, scale,
-        head_dim_q, n_heads, n_tokens, n_kv_comp, n_window, topk,
+        head_dim_q, n_heads, n_tokens, n_kv_comp, n_window, topk, raw_window_limit,
         q_stride_h, q_stride_t, q_stride_b,
         kc_stride_p, kc_stride_b,
         kw_stride_p, kw_stride_b,
@@ -378,6 +390,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
     const int n_window    = src_kv_w ? (int) src_kv_w->ne[2] : 0;
 
     const int topk        = (int) src_idx->ne[0];
+    const int raw_window_limit = ggml_get_op_params_i32(dst, 1);
 
     // Strides in elements.
     auto stride_elems = [](const ggml_tensor * t, int dim) -> int64_t {
@@ -418,7 +431,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const float * kw = src_kv_w ? (const float *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<float>(
                 q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
-                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
+                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, raw_window_limit, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
@@ -432,7 +445,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const half * kw = src_kv_w ? (const half *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<half>(
                 q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
-                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
+                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, raw_window_limit, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,
@@ -446,7 +459,7 @@ void ggml_cuda_op_dsv4_sparse_attn(ggml_backend_cuda_context & ctx, struct ggml_
             const nv_bfloat16 * kw = src_kv_w ? (const nv_bfloat16 *) src_kv_w->data : nullptr;
             launch_dsv4_sparse_attn<nv_bfloat16>(
                 q_data, kc, kw, wmask_data, idx_data, sink_data, o_data, scale,
-                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, batch,
+                head_dim_q, head_dim_kv, n_heads, n_tokens, n_kv_comp, n_window, topk, raw_window_limit, batch,
                 q_stride_h, q_stride_t, q_stride_b,
                 kc_stride_p, kc_stride_b,
                 kw_stride_p, kw_stride_b,

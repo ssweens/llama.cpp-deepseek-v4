@@ -6395,7 +6395,8 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
         struct ggml_tensor  * window_mask,
         struct ggml_tensor  * topk_idxs,
         struct ggml_tensor  * attn_sink,
-        float                 scale) {
+        float                 scale,
+        int32_t               raw_window_limit) {
     GGML_ASSERT(q != NULL);
     GGML_ASSERT(kv_comp != NULL);
     GGML_ASSERT(topk_idxs != NULL);
@@ -6434,6 +6435,7 @@ struct ggml_tensor * ggml_dsv4_sparse_attn(
 
     int32_t params[4] = { 0 };
     memcpy(params + 0, &scale, sizeof(float));
+    params[1] = raw_window_limit;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_DSV4_SPARSE_ATTN;
