@@ -159,6 +159,15 @@
 - [ ] Preserve ROCm/HIP behavior: any shared CUDA/HIP kernel change must compile in the HIP build and get at least a ROCm0 smoke when hardware/runtime permits.
 - [x] Re-run IQ2_XXS endpoint regression and compare prefill grid after any code change. Post-commit resident-server regression passed all 7 cases with `--max-tokens 2048` against `http://127.0.0.1:18089` after correcting the harness base URL (the harness appends `/v1/chat/completions`).
 
+### Branch kickoff: `work/dsv4-mmq-kernel`
+- [x] Pull merged `main` and create `work/dsv4-mmq-kernel` from merge commit `b24ca65ba`.
+- [ ] Re-establish resident-server/API baselines with coherence enabled for the exact starting branch state before changing MMQ code.
+- [ ] Restore only the useful env-gated MMQ component profiler if needed; avoid committing experimental stream-k overrides unless measured and justified.
+- [ ] Inspect the routed-expert `MUL_MAT_ID` MMQ shapes: `ne12`, expert population distribution, `expert_bounds`, tile/grid selection, stream-k path, and IQ2_XXS quant type dispatch.
+- [ ] Prototype one guarded MMQ tile/scheduling change at a time, preserving CUDA graph compatibility and avoiding the host-sorted slow path.
+- [ ] Preserve ROCm/HIP behavior: shared CUDA/HIP changes must compile in HIP and get a bounded ROCm0 smoke when runtime permits.
+- [ ] Run DeepSeek4 IQ2_XXS endpoint regression with `--max-tokens 2048` after any functional/kernel change.
+
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
 ### Goal
