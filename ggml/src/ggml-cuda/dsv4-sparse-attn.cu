@@ -170,11 +170,15 @@ static __global__ void dsv4_sparse_attn_kernel(
                 get_kv_row(slot, src, m);
             }
             const bool valid = (slot < n_pos) && (src != nullptr) && (m != -INFINITY);
-            // Each active warp loads its own slot's KV row.
-            for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
-                kv_chunk_shared[slot * HEAD_DIM_KV + d] = valid
-                    ? src[d]
-                    : (KVT) 0;
+            // Each active warp loads its own slot's KV row. Masked slots do not
+            // contribute to the online softmax, so avoid both the global/shared
+            // memory traffic and the Q·K dot work for them. This is especially
+            // important for cache-backed SWA replay chunks where the raw cache
+            // layout can be sparse/ring-shaped and most columns are masked.
+            if (valid) {
+                for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
+                    kv_chunk_shared[slot * HEAD_DIM_KV + d] = src[d];
+                }
             }
             if (lane_id == 0) {
                 masks_shared[slot] = valid ? m : -INFINITY;
@@ -186,20 +190,26 @@ static __global__ void dsv4_sparse_attn_kernel(
         // When CHUNK_KV < N_WARPS, the extra warps idle this step.
         if (warp_id < CHUNK_KV) {
             const int slot = warp_id;
-            const KVT * kv_row = &kv_chunk_shared[slot * HEAD_DIM_KV];
-            float partial = 0.0f;
-            #pragma unroll
-            for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
-                partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
-            }
-            // Warp reduction.
-            #pragma unroll
-            for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
-                partial += __shfl_xor_sync(0xffffffff, partial, offset, WARP_SIZE_LOCAL);
-            }
-            if (lane_id == 0) {
-                const float m = masks_shared[slot];
-                scores_shared[slot] = (m == -INFINITY) ? -INFINITY : (partial * scale + m);
+            const float m = masks_shared[slot];
+            if (m == -INFINITY) {
+                if (lane_id == 0) {
+                    scores_shared[slot] = -INFINITY;
+                }
+            } else {
+                const KVT * kv_row = &kv_chunk_shared[slot * HEAD_DIM_KV];
+                float partial = 0.0f;
+                #pragma unroll
+                for (int d = lane_id; d < HEAD_DIM_KV; d += WARP_SIZE_LOCAL) {
+                    partial += q_shared[d] * ggml_cuda_cast<float>(kv_row[d]);
+                }
+                // Warp reduction.
+                #pragma unroll
+                for (int offset = WARP_SIZE_LOCAL / 2; offset > 0; offset >>= 1) {
+                    partial += __shfl_xor_sync(0xffffffff, partial, offset, WARP_SIZE_LOCAL);
+                }
+                if (lane_id == 0) {
+                    scores_shared[slot] = partial * scale + m;
+                }
             }
         }
         __syncthreads();

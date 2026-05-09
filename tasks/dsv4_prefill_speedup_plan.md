@@ -183,9 +183,12 @@ Results:
 
 Interpretation:
 
-- The code fix removes a major large-ubatch prompt sparse-attention waste.
-- Long p8192/ub512 stays flat because smaller chunks were already less sparse-attn dominated; `MUL_MAT_ID` / expert matmul dominates there.
-- Next backend targets after this are MoE/expert matmul throughput and possibly a tensor-core/MMA sparse-attention kernel for the remaining 128 raw + top-k work.
+- The bounded raw-window code fix removes a major large-ubatch prompt sparse-attention waste.
+- Follow-up mask-skip inside `DSV4_SPARSE_ATTN` avoids loading/dotting raw-window slots that the cache-backed SWA mask marks `-INFINITY`. This preserves behavior because masked slots contribute zero softmax weight.
+- CUDA IQ2_XXS p8192/ub512 improved from ~`263 tok/s` after bounded raw-window to `285.11 tok/s` in standalone bench; the same shape's profiled sparse-attn time dropped from `7601.75 ms / 21.75%` to `5055.68 ms / 15.42%`.
+- Resident-server API baseline via `llama-benchy` with coherence enabled and `-ub 1024` measured pp2048 `356.36 ± 3.12 tok/s` and pp8192 `276.37 ± 1.18 tok/s` over three runs. Server logs agreed: pp2048 around `366 tok/s`, pp8192 around `277-280 tok/s`.
+- Detailed op+tag profiling now shows the remaining wall is routed expert MMQ matmul: `MUL_MAT_ID:moe.ffn_gate`, `MUL_MAT_ID:moe.ffn_up`, and `MUL_MAT_ID:moe.ffn_down` are each ~`4.2-4.3 s` in p8192/ub512. Component diagnostics showed ID compaction and activation quantization are tiny; the expert matmul kernel itself is the wall.
+- Reasonable low-risk sparse-attn/prefill cleanup is now mostly squeezed. Further wins require a separate MoE MMQ kernel/tile project or debugging the p8192/ub2048 graph/cuBLAS crash, not small graph plumbing changes.
 
 ## Initial ranking
 

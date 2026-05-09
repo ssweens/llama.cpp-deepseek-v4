@@ -147,6 +147,18 @@
 - [x] Build CUDA/HIP and host targets. Host `llama-server llama-bench` build passed; mounted Docker CUDA/HIP `llama-bench llama-server` build passed.
 - [x] Re-profile IQ2_XXS prefill to verify `DSV4_SPARSE_ATTN` time drops and run IQ2_XXS endpoint regressions; run at least a bounded ROCm smoke if hardware/runtime permits. CUDA p2048/ub2048 improved `345.66 -> 612.91 tok/s` non-profiled and `DSV4_SPARSE_ATTN` dropped `3866.68 -> 1315.55 ms`; IQ2_XXS regression passed on retry after one non-deterministic cache-reuse tool-name miss; ROCm0 p64 smoke passed at `49.49 tok/s`.
 
+## CUDA prefill optimization — MoE / `MUL_MAT_ID` long-prompt target
+- [x] Commit bounded sparse-attention work: `e68598bab perf(deepseek4): bound prompt sparse raw attention`.
+- [x] Free only the ad hoc mounted-code server container before benchmarking; no Corral/systemd-managed containers were touched.
+- [x] Establish current grid after bounded sparse-attn: IQ2_XXS CUDA p2048/ub512 `298.47 tok/s`, p8192/ub512 `262.53 tok/s`, p2048/ub1024 `349.44 tok/s`, p8192/ub1024 `251.89 tok/s`, p2048/ub2048 `644.81 tok/s`, p8192/ub2048 crashes.
+- [x] Profile p2048/ub512 vs p8192/ub512 with the same ubatch to separate pure context-length effects from chunk-size effects. After sparse mask-skip, p8192/ub512 improved to `285.11 tok/s`; detailed profile shows `MUL_MAT_ID` now dominates and `DSV4_SPARSE_ATTN` fell to `5055.68 ms / 15.42%`.
+- [x] Instrument or derive the `GGML_OP_MUL_MAT_ID` dispatch path for DSv4 IQ2_XXS: MMVQ for tiny `ne2`, MMQ for large routed-expert prefill, slow host-sorted path must remain avoided. Component profiling with graphs disabled shows ID compaction + activation quantization are tiny; expert MMQ matmul itself is ~96% of routed expert time.
+- [x] Switch further multi-variant perf sweeps to a persistent resident model plus `llama-benchy` API harness from `.venv`; avoid repeated full-model `docker run llama-bench` reloads except for one-off backend-only checks. First coherence-enabled API baseline against resident mounted-code server (`-ub 1024`) passed coherence and measured p2048 `357.04 tok/s`, p8192 `277.28 tok/s` via benchy; server logs showed p2048 `365.39 tok/s`, p8192 `279.26 tok/s`.
+- [ ] Debug the p8192/ub2048 CUDA graph/cuBLAS crash with precise CUDA error text and, if needed, narrower prompt/ubatch bisect; p4096/ub2048 passes with `GGML_CUDA_DISABLE_GRAPHS=1`, so at least one failure mode is CUDA-graph-specific.
+- [ ] If MMQ remains the dominant wall after API-based baselines, target the GPU-side routed-expert MMQ matmul/tile shape; `mm_ids_helper` and `quantize_mmq_q8_1_cuda` are not the wall.
+- [ ] Preserve ROCm/HIP behavior: any shared CUDA/HIP kernel change must compile in the HIP build and get at least a ROCm0 smoke when hardware/runtime permits.
+- [x] Re-run IQ2_XXS endpoint regression and compare prefill grid after any code change. Post-commit resident-server regression passed all 7 cases with `--max-tokens 2048` against `http://127.0.0.1:18089` after correcting the harness base URL (the harness appends `/v1/chat/completions`).
+
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
 ### Goal
