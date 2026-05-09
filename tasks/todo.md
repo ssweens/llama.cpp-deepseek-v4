@@ -115,10 +115,14 @@
 - [ ] Final commit + push of any remaining changes
 
 ## Merge `work/dsv4-prefill-speedup` to `main` (requested 2026-05-09)
-- [ ] Commit intended prefill/regression changes on `work/dsv4-prefill-speedup` while leaving scratch files untracked.
-- [ ] Run quality gates: whitespace check, Python syntax check for regression harness, mounted-code `llama-server` build evidence, and IQ2_XXS regression suite evidence.
-- [ ] Merge the branch into local `main` and keep `work/dsv4-prefill-speedup` branch alive for follow-up bugs.
-- [ ] Ask before pushing `main` or the working branch to remote.
+- [x] Commit intended prefill/regression changes on `work/dsv4-prefill-speedup` while leaving scratch files untracked.
+- [x] Run available quality gates: `git diff --check`, `python3 -m py_compile scripts/dsv4_regression.py`, and `cmake --build build-vulkan-linux-release --target llama-server -j 8` passed. IQ2_XXS regression was already green and the user explicitly said no need to rerun before merge.
+- [x] Merge the branch into local `main` and keep `work/dsv4-prefill-speedup` branch alive for follow-up bugs.
+- [x] Pushed `main` and `work/dsv4-prefill-speedup` to origin with user approval.
+
+### Review
+- Main now includes commit `22eaf7d89 perf(deepseek4): reduce prefill checkpoint fragmentation`.
+- `work/dsv4-prefill-speedup` remains alive and points at the same commit as `main` for follow-up bug fixes.
 
 ## Independent audit: `perf/dsv4-graph-orchestration` (May 2026)
 
