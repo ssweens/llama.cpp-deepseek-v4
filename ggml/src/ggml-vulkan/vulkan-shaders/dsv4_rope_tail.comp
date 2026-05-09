@@ -38,6 +38,34 @@ layout (push_constant) uniform parameter {
     uint  inverse;
 } p;
 
+float dsv4_rope_yarn_ramp(const float low, const float high, const uint i0) {
+    const float y = (float(i0 / 2) - low) / max(0.001f, high - low);
+    return 1.0f - min(1.0f, max(0.0f, y));
+}
+
+void dsv4_rope_yarn(const float theta_extrap, const uint i0, const float corr_lo, const float corr_hi,
+                    out float cos_theta, out float sin_theta) {
+    float mscale = p.attn_factor;
+    const float theta_interp = p.freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (p.ext_factor != 0.0f) {
+        const float ramp_mix = dsv4_rope_yarn_ramp(corr_lo, corr_hi, i0) * p.ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * log(1.0f / p.freq_scale);
+    }
+    cos_theta = cos(theta) * mscale;
+    sin_theta = sin(theta) * mscale;
+}
+
+void dsv4_rope_yarn_corr_dims(out float corr_lo, out float corr_hi) {
+    const float two_pi = 6.28318530717958647692f;
+    const float denom = 2.0f * log(p.freq_base);
+    const float start = floor(float(p.n_dims) * log(float(p.n_ctx_orig) / (p.beta_fast * two_pi)) / denom);
+    const float end   = ceil (float(p.n_dims) * log(float(p.n_ctx_orig) / (p.beta_slow * two_pi)) / denom);
+    corr_lo = max(0.0f, min(float(p.n_dims - 1), start));
+    corr_hi = max(0.0f, min(float(p.n_dims - 1), end));
+}
+
 void main() {
     const uint idx = gl_GlobalInvocationID.x;
     const uint total_rows = p.ne1 * p.ne2 * p.ne3;
@@ -76,16 +104,15 @@ void main() {
         is_second = (tail_col & 1) != 0;
     }
 
-    float theta = float(data_pos[i2]) * pow(p.freq_base, -2.0 * float(pair_idx) / float(p.n_dims));
+    const uint rel_i0 = 2 * pair_idx;
+    const float theta_extrap = float(data_pos[i2]) * pow(p.freq_base, -float(rel_i0) / float(p.n_dims));
+    const float freq_factor = p.has_freq_factors != 0 ? data_freq[pair_idx] : 1.0f;
 
-    if (p.has_freq_factors != 0) {
-        theta *= p.freq_scale / data_freq[pair_idx];
-    } else {
-        theta *= p.freq_scale;
-    }
+    float corr_lo, corr_hi;
+    dsv4_rope_yarn_corr_dims(corr_lo, corr_hi);
 
-    float cos_theta = cos(theta);
-    float sin_theta = sin(theta);
+    float cos_theta, sin_theta;
+    dsv4_rope_yarn(theta_extrap / freq_factor, rel_i0, corr_lo, corr_hi, cos_theta, sin_theta);
     if (p.inverse != 0) {
         sin_theta = -sin_theta;
     }

@@ -13235,14 +13235,17 @@ static void ggml_vk_dsv4_rope_tail(ggml_backend_vk_context * ctx, vk_context& su
     memcpy(&beta_fast,   (int32_t *) dst->op_params + 8, sizeof(float));
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 9, sizeof(float));
 
+    const uint32_t src0_type_size = ggml_type_size(src0->type);
+    const uint32_t dst_type_size  = ggml_type_size(dst->type);
+
     vk_op_dsv4_rope_tail_push_constants pc = {
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3],
-        (uint32_t)(src0->nb[1] / sizeof(float)),
-        (uint32_t)(src0->nb[2] / sizeof(float)),
-        (uint32_t)(src0->nb[3] / sizeof(float)),
-        (uint32_t)(dst->nb[1] / sizeof(float)),
-        (uint32_t)(dst->nb[2] / sizeof(float)),
-        (uint32_t)(dst->nb[3] / sizeof(float)),
+        (uint32_t)(src0->nb[1] / src0_type_size),
+        (uint32_t)(src0->nb[2] / src0_type_size),
+        (uint32_t)(src0->nb[3] / src0_type_size),
+        (uint32_t)(dst->nb[1] / dst_type_size),
+        (uint32_t)(dst->nb[2] / dst_type_size),
+        (uint32_t)(dst->nb[3] / dst_type_size),
         n_dims, mode, n_ctx_orig,
         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
         (uint32_t)(dst->src[2] != nullptr),
