@@ -1124,7 +1124,9 @@ json oaicompat_chat_params_parse(
             vocab);
         llama_params["dsv4_arch"] = true;
         llama_params["dsv4_thinking_mode"] = inputs.enable_thinking;
-        llama_params["cache_prompt"] = false;
+        // DeepSeek4 compressed KV cannot be position-shifted, so disable
+        // non-contiguous chunk reuse. Keep cache_prompt at the server/request
+        // default so contiguous-prefix prompt reuse and checkpoint restore work.
         llama_params["n_cache_reuse"] = 0;
         llama_params["speculative.n_min"] = 0;
         llama_params["speculative.n_max"] = 0;

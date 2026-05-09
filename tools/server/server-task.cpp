@@ -607,9 +607,10 @@ task_params server_task::params_from_json_cmpl(
     }
 
     if (params.dsv4_arch) {
-        // ds4-style server parity: no server-side prompt-cache reuse, no speculative decoding,
-        // and a minimal sampler chain matching top_k/top_p/min_p/temp behavior.
-        params.cache_prompt = false;
+        // ds4-style server parity: no speculative decoding and a minimal sampler
+        // chain matching top_k/top_p/min_p/temp behavior. DeepSeek4 compressed KV
+        // cannot be K-shifted, so disable non-contiguous chunk reuse but keep
+        // cache_prompt unchanged for safe contiguous-prefix reuse.
         params.n_cache_reuse = 0;
         params.speculative.n_min = 0;
         params.speculative.n_max = 0;
