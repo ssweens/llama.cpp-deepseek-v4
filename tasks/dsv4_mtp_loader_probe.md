@@ -14,6 +14,7 @@ Date: 2026-05-09
 - Added a host-side copy buffer for that MTP handoff state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
+- Fixed CPU-only DeepSeek4 reserve/probe issues found by the real IQ1_M target run: BF16 activation inputs are cast back to F32 for non-BF16 weight matmuls so CPU supports the op, and the disconnected projection-top1 probe tensor is explicitly expanded into the graph before decode copies it.
 - Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables state/projection probe plumbing. Server slot initialization intentionally skips `common_speculative_init()` for MTP until the full runtime drafter is wired.
 - Documented the new server flags in `tools/server/README.md`.
 
@@ -39,7 +40,7 @@ tensors = 32
 
 ## Validation behavior
 
-The server validator is metadata/tensor-directory only in default startup mode. It does not load sidecar tensor data unless `DSV4_MTP_PROBE=1` is also set. Probe mode loads the already-validated sidecar tensors into a persistent backend weight buffer, but still does not run the MTP graph or alter emitted tokens.
+The server validator is metadata/tensor-directory only in default startup mode. It does not load sidecar tensor data unless `DSV4_MTP_PROBE=1` is also set. Probe mode loads the already-validated sidecar tensors into a persistent backend weight buffer and runs the projection-only probe graph, but still does not run the full MTP transformer block or alter emitted tokens.
 
 Validation requires:
 
@@ -94,6 +95,30 @@ curl http://127.0.0.1:18192/health
 ```
 
 Result: health returned `{"status":"ok"}` after 2 seconds.
+
+Real DeepSeek4 target + MTP sidecar probe check:
+
+```text
+DSV4_MTP_PROBE=1 llama-server \
+  -m /mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/deepseek-ai__DeepSeek-V4-Flash-IQ1_M.gguf \
+  --spec-type mtp \
+  --model-draft /mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  --draft-max 1 \
+  --ctx-size 32 --batch-size 16 --ubatch-size 1 --parallel 1 \
+  --no-warmup --threads 8 --threads-batch 8 -fit off --flash-attn off --port 18202
+curl http://127.0.0.1:18202/health
+curl http://127.0.0.1:18202/completion -d '{"prompt":"Hi","n_predict":1,"temperature":0,"cache_prompt":false}'
+```
+
+Result: health returned `{"status":"ok"}` after 82 seconds; one-token completion returned newline after ~6 seconds and logged:
+
+```text
+validated DeepSeek4 MTP sidecar '...DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf' (draft=1)
+load_dsv4_mtp_sidecar: loaded 32 DeepSeek4 MTP sidecar tensors into CPU_Mapped buffer ( 3631.21 MiB)
+dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0
+```
+
+The smaller `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` target was rejected as corrupted/incomplete before MTP validation (`blk.4.ffn_down_exps.weight` out of file bounds), so the real probe used the valid IQ1_M target.
 
 Whitespaces:
 

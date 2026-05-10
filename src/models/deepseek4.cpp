@@ -639,6 +639,11 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     };
 
     auto mul_mat_checked = [&](ggml_tensor * a, ggml_tensor * b, const char * tag) -> ggml_tensor * {
+        // CPU MUL_MAT supports non-BF16 weights with F32 (or quantized vec-dot) RHS, not BF16 RHS.
+        // Casting preserves the BF16-quantized values while keeping CPU-only DeepSeek4 graphs schedulable.
+        if (b->type == GGML_TYPE_BF16 && a->type != GGML_TYPE_BF16) {
+            b = ggml_cast(ctx0, b, GGML_TYPE_F32);
+        }
         if (!(a->ne[0] == b->ne[0] && b->ne[2] % a->ne[2] == 0 && b->ne[3] % a->ne[3] == 0)) {
             GGML_ABORT("deepseek4 mul_mat mismatch at %s: a=[%lld,%lld,%lld,%lld] b=[%lld,%lld,%lld,%lld]",
                     tag,
@@ -2177,6 +2182,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * mtp_top1 = ggml_argsort_top_k(ctx0, mtp_logits, 1);
             cb(mtp_top1, "dsv4_mtp_projection_top1", -1);
             res->t_mtp_probe_top1 = mtp_top1;
+            ggml_build_forward_expand(gf, mtp_top1);
         }
     }
 
