@@ -1992,21 +1992,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const uint32_t raw_window =
                 hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : cparams.n_ctx;
             GGML_ASSERT(raw_window > 0);
+            const uint32_t raw_prior_window = raw_window - 1;
             if (mtp_raw_cache.size() != (size_t) mtp_n_raw * row_size) {
                 mtp_n_raw = 0;
                 mtp_raw_cache.clear();
             }
-            if (mtp_n_raw < raw_window) {
+            if (raw_prior_window == 0) {
+                mtp_n_raw = 0;
+                mtp_raw_cache.clear();
+            } else if (mtp_n_raw < raw_prior_window) {
                 mtp_raw_cache.resize((size_t) (mtp_n_raw + 1) * row_size);
                 std::memcpy(mtp_raw_cache.data() + (size_t) mtp_n_raw * row_size, raw_current.data(),
                             row_size * sizeof(float));
                 mtp_n_raw++;
             } else {
                 std::memmove(mtp_raw_cache.data(), mtp_raw_cache.data() + row_size,
-                             (size_t) (raw_window - 1) * row_size * sizeof(float));
-                std::memcpy(mtp_raw_cache.data() + (size_t) (raw_window - 1) * row_size, raw_current.data(),
+                             (size_t) (raw_prior_window - 1) * row_size * sizeof(float));
+                std::memcpy(mtp_raw_cache.data() + (size_t) (raw_prior_window - 1) * row_size, raw_current.data(),
                             row_size * sizeof(float));
-                mtp_n_raw = raw_window;
+                mtp_n_raw = raw_prior_window;
             }
             mtp_raw_seq_id   = ubatch.seq_id[0][0];
             mtp_raw_last_pos = ubatch.pos[0];

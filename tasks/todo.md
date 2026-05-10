@@ -282,5 +282,6 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Real DeepSeek4 IQ1_M + MTP sidecar projection probe reached health after 82 seconds and logged `dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0` on a one-token completion without changing emitted-token behavior.
 - Real DeepSeek4 IQ1_M + raw-current MTP block probe reached health after 88 seconds and logged `dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0` on a one-token completion without changing emitted-token behavior.
 - Real DeepSeek4 IQ1_M + private raw-cache probe reached health after 94 seconds on an `n_predict=2` run and logged two probe rows, including continuation step `target_argmax=200 draft_top1=5 match=0` after consuming one private MTP raw-cache row.
+- Private MTP raw cache now stores prior rows only and caps at `raw_window - 1`, matching the graph's separate current-row concatenation and avoiding a future long-context `raw_window + 1` attention span.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.

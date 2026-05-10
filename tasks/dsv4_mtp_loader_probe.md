@@ -161,7 +161,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
 - the graph computes a one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax;
 - decode now copies both the target HC handoff and the sidecar block's output HC handoff, preparing recursive MTP draft probing;
-- continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute;
+- continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute; the host cache stores at most `raw_window - 1` prior rows because the graph concatenates the current row separately;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
 This is intentionally still a handoff/probe surface. It does not alter emitted tokens. DS4 authority confirmed the MTP sidecar uses logical layer id 1, whose DeepSeek4 compression ratio is zero, so the sidecar drafter itself needs private raw-window and HC state, not private compressed/indexer state. Target compressed/indexer frontier rollback is covered by existing hybrid-ISWA partial state checkpoints: `llama_kv_cache_iswa` handles SWA KV, `mem_recr` carries compressor/indexer frontiers, and `dsv4_state_write/read` carries sequence-local compressed attention/indexer cache rows.
