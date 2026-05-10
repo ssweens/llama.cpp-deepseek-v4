@@ -10,8 +10,8 @@ Date: 2026-05-09
   - existing `--model-draft FNAME` carries the DeepSeek4 MTP support GGUF path;
   - existing `--draft-max N` / `common_params_speculative::n_max` carries the future draft cap.
 - Added server startup validation for DeepSeek4 MTP sidecar GGUFs.
-- Added a default-off DeepSeek4 final-HC output hook for one-token decode graphs.
-- Added a host-side copy buffer for that final HC state in `llama_context` for the next draft-one probe step.
+- Added a default-off MTP state output hook for one-token decode graphs; DeepSeek4 currently supplies final HC state as that opaque handoff tensor.
+- Added a host-side copy buffer for that MTP handoff state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
 - Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state/projection probe plumbing.
@@ -118,8 +118,8 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - server startup loads the MTP sidecar GGUF tensor data into a persistent backend weight buffer, using the target model HC/output tensor buffer type;
 - server startup sets a private context probe flag;
 - graph reuse accounts for that flag;
-- DeepSeek4 marks the final per-token `hc_state` as an output only for `n_tokens == 1 && n_outputs == 1` graphs, avoiding prompt-prefill HC output blowups;
-- decode copies that F32 HC state into `llama_context::get_dsv4_mtp_hc_state()`;
+- DeepSeek4 marks the final per-token `hc_state` as generic MTP state output only for `n_tokens == 1 && n_outputs == 1` graphs, avoiding prompt-prefill HC output blowups;
+- decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
 - the graph computes a projection-only top-1 through the sidecar input projections and sidecar output head, and the server logs it against the target argmax.
 
 This is intentionally only a handoff/probe surface. It does not alter emitted tokens and does not run the one-layer MTP transformer block yet, so the logged projection top-1 is not a speculative draft token.

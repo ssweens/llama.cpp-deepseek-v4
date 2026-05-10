@@ -826,11 +826,11 @@ float * llama_context::get_embeddings() {
     return embd.data;
 }
 
-const std::vector<float> & llama_context::get_dsv4_mtp_hc_state() const {
-    return dsv4_mtp_hc_state;
+const std::vector<float> & llama_context::get_mtp_state() const {
+    return mtp_state;
 }
 
-const ggml_tensor * llama_context::get_dsv4_mtp_tensor(const char * name) const {
+const ggml_tensor * llama_context::get_mtp_tensor(const char * name) const {
     if (!dsv4_mtp_sidecar) {
         return nullptr;
     }
@@ -839,8 +839,8 @@ const ggml_tensor * llama_context::get_dsv4_mtp_tensor(const char * name) const 
     return it == dsv4_mtp_sidecar->tensors.end() ? nullptr : it->second;
 }
 
-llama_token llama_context::get_dsv4_mtp_probe_top1() const {
-    return dsv4_mtp_probe_top1;
+llama_token llama_context::get_mtp_probe_top1() const {
+    return mtp_probe_top1;
 }
 
 llama_token * llama_context::get_sampled_tokens()  const{
@@ -1082,14 +1082,14 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
-void llama_context::set_dsv4_mtp_probe(bool value) {
+void llama_context::set_mtp_probe(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    if (dsv4_mtp_probe == value) {
+    if (mtp_probe == value) {
         return;
     }
 
-    dsv4_mtp_probe     = value;
+    mtp_probe          = value;
     sched_need_reserve = true;
 }
 
@@ -1909,27 +1909,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        if (auto * t_hc = res->get_dsv4_mtp_hc_state()) {
-            GGML_ASSERT(t_hc->type == GGML_TYPE_F32);
-            ggml_backend_t backend_hc = ggml_backend_sched_get_tensor_backend(sched.get(), t_hc);
-            GGML_ASSERT(backend_hc != nullptr);
+        if (auto * t_mtp_state = res->get_mtp_state()) {
+            GGML_ASSERT(t_mtp_state->type == GGML_TYPE_F32);
+            ggml_backend_t backend_mtp_state = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_state);
+            GGML_ASSERT(backend_mtp_state != nullptr);
 
-            dsv4_mtp_hc_state.resize(ggml_nelements(t_hc));
-            ggml_backend_tensor_get_async(backend_hc, t_hc, dsv4_mtp_hc_state.data(), 0, ggml_nbytes(t_hc));
+            mtp_state.resize(ggml_nelements(t_mtp_state));
+            ggml_backend_tensor_get_async(backend_mtp_state, t_mtp_state, mtp_state.data(), 0,
+                                          ggml_nbytes(t_mtp_state));
         } else {
-            dsv4_mtp_hc_state.clear();
+            mtp_state.clear();
         }
 
-        if (auto * t_mtp_top1 = res->get_dsv4_mtp_probe_top1()) {
+        if (auto * t_mtp_top1 = res->get_mtp_probe_top1()) {
             GGML_ASSERT(t_mtp_top1->type == GGML_TYPE_I32);
             ggml_backend_t backend_top1 = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_top1);
             GGML_ASSERT(backend_top1 != nullptr);
 
-            dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
-            ggml_backend_tensor_get_async(backend_top1, t_mtp_top1, &dsv4_mtp_probe_top1, 0,
-                                          sizeof(dsv4_mtp_probe_top1));
+            mtp_probe_top1 = LLAMA_TOKEN_NULL;
+            ggml_backend_tensor_get_async(backend_top1, t_mtp_top1, &mtp_probe_top1, 0, sizeof(mtp_probe_top1));
         } else {
-            dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
+            mtp_probe_top1 = LLAMA_TOKEN_NULL;
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -2292,8 +2292,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
-        /*.dsv4_mtp_probe =*/dsv4_mtp_probe,
-        /*.dsv4_mtp_tensors =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
+        /*.mtp_probe   =*/mtp_probe,
+        /*.mtp_tensors =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),

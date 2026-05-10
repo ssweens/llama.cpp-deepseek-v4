@@ -2121,17 +2121,17 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(hc_state, "l_out_hc", il);
     }
 
-    if (dsv4_mtp_probe && n_tokens == 1 && n_outputs == 1) {
+    if (mtp_probe && n_tokens == 1 && n_outputs == 1) {
         ggml_tensor * mtp_hc_state = as_f32(hc_state);
         cb(mtp_hc_state, "dsv4_mtp_hc_state", -1);
-        res->t_dsv4_mtp_hc_state = mtp_hc_state;
+        res->t_mtp_state = mtp_hc_state;
 
         auto mtp_tensor = [&](const char * name) -> ggml_tensor * {
-            if (dsv4_mtp_tensors == nullptr) {
+            if (mtp_tensors == nullptr) {
                 return nullptr;
             }
-            const auto it = dsv4_mtp_tensors->find(name);
-            return it == dsv4_mtp_tensors->end() ? nullptr : it->second;
+            const auto it = mtp_tensors->find(name);
+            return it == mtp_tensors->end() ? nullptr : it->second;
         };
 
         ggml_tensor * mtp_e_proj        = mtp_tensor("mtp.0.e_proj.weight");
@@ -2176,7 +2176,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
             ggml_tensor * mtp_top1 = ggml_argsort_top_k(ctx0, mtp_logits, 1);
             cb(mtp_top1, "dsv4_mtp_projection_top1", -1);
-            res->t_dsv4_mtp_probe_top1 = mtp_top1;
+            res->t_mtp_probe_top1 = mtp_top1;
         }
     }
 

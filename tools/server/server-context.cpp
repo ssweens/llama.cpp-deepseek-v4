@@ -1109,7 +1109,7 @@ private:
             SRV_INF("validated DeepSeek4 MTP sidecar '%s' (draft=%d)\n", sidecar_model.c_str(),
                     params_base.speculative.n_max);
             const bool mtp_probe = server_env_truthy("DSV4_MTP_PROBE");
-            ctx->set_dsv4_mtp_probe(mtp_probe);
+            ctx->set_mtp_probe(mtp_probe);
             if (mtp_probe) {
                 std::string mtp_load_err;
                 if (!ctx->load_dsv4_mtp_sidecar(sidecar_model, mtp_load_err)) {
@@ -3372,7 +3372,7 @@ private:
                     id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
                 }
 
-                const llama_token mtp_probe_top1 = slot.ctx->get_dsv4_mtp_probe_top1();
+                const llama_token mtp_probe_top1 = slot.ctx->get_mtp_probe_top1();
                 if (mtp_probe_top1 != LLAMA_TOKEN_NULL) {
                     const llama_token target_argmax =
                         dsv4_force_greedy_tool_call ? id : sample_argmax_token(slot.ctx, tok_idx);

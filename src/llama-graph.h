@@ -547,8 +547,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    bool dsv4_mtp_probe = false;
-    const std::unordered_map<std::string, ggml_tensor *> * dsv4_mtp_tensors = nullptr;
+    bool                                                   mtp_probe   = false;
+    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -630,8 +630,7 @@ struct llm_graph_params {
 
         return cparams.embeddings == other.cparams.embeddings && cparams.causal_attn == other.cparams.causal_attn &&
                arch == other.arch && gtype == other.gtype && cvec == other.cvec && loras == other.loras &&
-               cross == other.cross && dsv4_mtp_probe == other.dsv4_mtp_probe &&
-               dsv4_mtp_tensors == other.dsv4_mtp_tensors;
+               cross == other.cross && mtp_probe == other.mtp_probe && mtp_tensors == other.mtp_tensors;
     }
 };
 
@@ -649,9 +648,9 @@ public:
 
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
 
-    ggml_tensor * get_dsv4_mtp_hc_state() const { return t_dsv4_mtp_hc_state; }
+    ggml_tensor * get_mtp_state() const { return t_mtp_state; }
 
-    ggml_tensor * get_dsv4_mtp_probe_top1() const { return t_dsv4_mtp_probe_top1; }
+    ggml_tensor * get_mtp_probe_top1() const { return t_mtp_probe_top1; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -679,9 +678,9 @@ public:
     ggml_tensor * t_inp_embd          = nullptr;  // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits            = nullptr;
     ggml_tensor * t_embd              = nullptr;
-    ggml_tensor * t_embd_pooled         = nullptr;
-    ggml_tensor * t_dsv4_mtp_hc_state   = nullptr;
-    ggml_tensor * t_dsv4_mtp_probe_top1 = nullptr;
+    ggml_tensor * t_embd_pooled       = nullptr;
+    ggml_tensor * t_mtp_state         = nullptr;
+    ggml_tensor * t_mtp_probe_top1    = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -769,8 +768,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    const bool dsv4_mtp_probe;
-    const std::unordered_map<std::string, ggml_tensor *> * dsv4_mtp_tensors;
+    const bool                                             mtp_probe;
+    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

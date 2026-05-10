@@ -71,9 +71,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
-    const std::vector<float> & get_dsv4_mtp_hc_state() const;
-    const ggml_tensor *        get_dsv4_mtp_tensor(const char * name) const;
-    llama_token                get_dsv4_mtp_probe_top1() const;
+    const std::vector<float> & get_mtp_state() const;
+    const ggml_tensor *        get_mtp_tensor(const char * name) const;
+    llama_token                get_mtp_probe_top1() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -100,7 +100,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
-    void set_dsv4_mtp_probe(bool value);
+    void set_mtp_probe(bool value);
     bool load_dsv4_mtp_sidecar(const std::string & path, std::string & err);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -293,9 +293,9 @@ private:
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
-    // optional DeepSeek4 MTP probe state copied from the final HC tensor for the last single-token decode graph
-    std::vector<float> dsv4_mtp_hc_state;
-    llama_token        dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
+    // optional MTP probe state copied from the model-specific handoff tensor for the last single-token decode graph
+    std::vector<float> mtp_state;
+    llama_token        mtp_probe_top1 = LLAMA_TOKEN_NULL;
 
     struct dsv4_mtp_sidecar_data {
         gguf_context_ptr                               ctx_gguf;
@@ -323,7 +323,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
-    bool dsv4_mtp_probe     = false;
+    bool mtp_probe          = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
