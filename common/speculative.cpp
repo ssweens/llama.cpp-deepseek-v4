@@ -571,6 +571,42 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+struct common_speculative_state_mtp : public common_speculative_state {
+    llama_context * ctx_tgt = nullptr;
+
+    common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx_tgt) :
+        common_speculative_state(type),
+        ctx_tgt(ctx_tgt) {
+        GGML_ASSERT(ctx_tgt != nullptr);
+    }
+
+    void begin(const llama_tokens & prompt) override { GGML_UNUSED(prompt); }
+
+    void draft(const common_params_speculative & params,
+               const llama_tokens &              prompt_tgt,
+               llama_token                       id_last,
+               llama_tokens &                    draft_tokens) override {
+        GGML_UNUSED(prompt_tgt);
+
+        draft_tokens.clear();
+        if (params.n_max <= 0) {
+            return;
+        }
+
+        llama_token drafts[2] = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+        const int32_t n = llama_mtp_draft_tokens(ctx_tgt, id_last, drafts, std::min<int32_t>(params.n_max, 2));
+        for (int32_t i = 0; i < n; ++i) {
+            if (drafts[i] != LLAMA_TOKEN_NULL) {
+                draft_tokens.push_back(drafts[i]);
+            }
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        llama_mtp_accept(ctx_tgt, n_accepted);
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
     common_ngram_simple_config config;
@@ -930,6 +966,7 @@ common_speculative * common_speculative_init(
     {
         bool has_draft = !params.mparams_dft.path.empty();
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+        bool has_mtp          = params.type == COMMON_SPECULATIVE_TYPE_MTP && has_draft;
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -975,6 +1012,9 @@ common_speculative * common_speculative_init(
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
         }
+        if (has_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -999,6 +1039,11 @@ common_speculative * common_speculative_init(
                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
                 break;
             }
+            case COMMON_SPECULATIVE_TYPE_MTP:
+                {
+                    impls.push_back(std::make_unique<common_speculative_state_mtp>(config.type, ctx_tgt));
+                    break;
+                }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
                 common_ngram_map ngram_map = get_common_ngram_map(config);
 
@@ -1106,13 +1151,11 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
-    if (n_accepted == 0) {
-        return;
-    }
-
     common_speculative_state * impl = spec->curr_impl;
 
-    GGML_ASSERT(impl);
+    if (impl == nullptr) {
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);

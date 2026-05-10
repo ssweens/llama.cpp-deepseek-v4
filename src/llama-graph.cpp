@@ -807,12 +807,15 @@ void llm_graph_result::reset() {
     t_logits         = nullptr;
     t_embd           = nullptr;
     t_embd_pooled     = nullptr;
-    t_mtp_state       = nullptr;
+    t_mtp_state           = nullptr;
     t_mtp_next_state      = nullptr;
-    t_mtp_probe_top1      = nullptr;
-    t_mtp_probe_top1_next = nullptr;
-    t_mtp_raw_current     = nullptr;
-    t_mtp_raw_draft       = nullptr;
+    t_mtp_target_top1     = nullptr;
+    t_mtp_probe_top1        = nullptr;
+    t_mtp_probe_top1_next   = nullptr;
+    t_mtp_probe_top1_third  = nullptr;
+    t_mtp_raw_current       = nullptr;
+    t_mtp_raw_draft         = nullptr;
+    t_mtp_raw_draft_accept  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -862,14 +865,26 @@ void llm_graph_result::set_outputs() {
     if (t_mtp_next_state != nullptr) {
         ggml_set_output(t_mtp_next_state);
     }
+    if (t_mtp_target_top1 != nullptr) {
+        ggml_set_output(t_mtp_target_top1);
+    }
     if (t_mtp_probe_top1 != nullptr) {
         ggml_set_output(t_mtp_probe_top1);
     }
     if (t_mtp_probe_top1_next != nullptr) {
         ggml_set_output(t_mtp_probe_top1_next);
     }
+    if (t_mtp_probe_top1_third != nullptr) {
+        ggml_set_output(t_mtp_probe_top1_third);
+    }
+    if (t_mtp_raw_current != nullptr) {
+        ggml_set_output(t_mtp_raw_current);
+    }
     if (t_mtp_raw_draft != nullptr) {
         ggml_set_output(t_mtp_raw_draft);
+    }
+    if (t_mtp_raw_draft_accept != nullptr) {
+        ggml_set_output(t_mtp_raw_draft_accept);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -975,8 +990,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx(params.mctx),
     cross(params.cross),
     mtp_probe(params.mtp_probe),
+    mtp_diagnostics(params.mtp_diagnostics),
     mtp_tensors(params.mtp_tensors),
     mtp_raw_cache(params.mtp_raw_cache),
+    mtp_hc_input(params.mtp_hc_input),
     mtp_n_raw(params.mtp_n_raw),
     mtp_probe_draft_max(params.mtp_probe_draft_max),
     samplers(params.samplers),

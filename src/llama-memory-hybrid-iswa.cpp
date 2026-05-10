@@ -112,6 +112,57 @@ static void dsv4_copy_cache_rows(ggml_tensor * t, llama_seq_id seq_id_src, llama
     ggml_backend_tensor_set(t, tmp.data(), dst_offset, n_bytes);
 }
 
+class dsv4_vector_writer : public llama_io_write_i {
+public:
+    explicit dsv4_vector_writer(std::vector<uint8_t> & data) : data(data) {
+        data.clear();
+    }
+
+    void write(const void * src, size_t size) override {
+        const auto * bytes = static_cast<const uint8_t *>(src);
+        data.insert(data.end(), bytes, bytes + size);
+    }
+
+    void write_tensor(const ggml_tensor * tensor, size_t offset, size_t size) override {
+        const size_t old_size = data.size();
+        data.resize(old_size + size);
+        ggml_backend_tensor_get(tensor, data.data() + old_size, offset, size);
+    }
+
+    size_t n_bytes() override {
+        return data.size();
+    }
+
+private:
+    std::vector<uint8_t> & data;
+};
+
+class dsv4_vector_reader : public llama_io_read_i {
+public:
+    explicit dsv4_vector_reader(const std::vector<uint8_t> & data) : data(data) {}
+
+    const uint8_t * read(size_t size) override {
+        if (offset + size > data.size()) {
+            throw std::runtime_error("unexpected end of DeepSeek4 recurrent state snapshot");
+        }
+        const uint8_t * ptr = data.data() + offset;
+        offset += size;
+        return ptr;
+    }
+
+    void read_to(void * dst, size_t size) override {
+        memcpy(dst, read(size), size);
+    }
+
+    size_t n_bytes() override {
+        return offset;
+    }
+
+private:
+    const std::vector<uint8_t> & data;
+    size_t offset = 0;
+};
+
 } // namespace
 
 //
@@ -369,6 +420,7 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
     const bool debug_seq_rm = dsv4_debug_seq_rm_enabled();
     const llama_pos attn_pos_min_before = debug_seq_rm ? mem_attn->seq_pos_min(seq_id) : -1;
     const llama_pos attn_pos_max_before = debug_seq_rm ? mem_attn->seq_pos_max(seq_id) : -1;
+    const llama_pos dsv4_pos_max_before = seq_id >= 0 ? seq_pos_max(seq_id) : -1;
     const llama_pos recr_pos_min_before = debug_seq_rm ? mem_recr->seq_pos_min(seq_id) : -1;
     const llama_pos recr_pos_max_before = debug_seq_rm ? mem_recr->seq_pos_max(seq_id) : -1;
 
@@ -392,7 +444,14 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
         }
         return false;
     }
-    dsv4_seq_rm(seq_id, p0, p1);
+    llama_pos dsv4_p1 = p1;
+    if (seq_id >= 0 && p0 >= 0 && p1 < 0 && dsv4_pos_max_before >= p0) {
+        // Speculative tail rollback removes only rows that could have been written by the
+        // live sequence.  Do not clear from p0 to the allocated context capacity: DS4's
+        // compressed cache can be huge, and the references roll back the live frontier only.
+        dsv4_p1 = dsv4_pos_max_before + 1;
+    }
+    dsv4_seq_rm(seq_id, p0, dsv4_p1);
 
     if (debug_seq_rm) {
         LLAMA_LOG_WARN("%s: seq=%d p0=%d p1=%d attn [%d,%d] -> [%d,%d], recurrent [%d,%d] -> [%d,%d], hybrid [%d,%d]\n",
@@ -837,6 +896,45 @@ bool llama_memory_hybrid_iswa::has_dsv4_compressed_kv() const {
     }
 
     return false;
+}
+
+bool llama_memory_hybrid_iswa::recurrent_state_save(llama_seq_id seq_id, std::vector<uint8_t> & data) const {
+    return dsv4_recurrent_state_save(seq_id, data);
+}
+
+bool llama_memory_hybrid_iswa::recurrent_state_restore(llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    return dsv4_recurrent_state_restore(seq_id, data);
+}
+
+bool llama_memory_hybrid_iswa::dsv4_recurrent_state_save(llama_seq_id seq_id, std::vector<uint8_t> & data) const {
+    if (!has_dsv4_compressed_kv() || seq_id < 0 || (uint32_t) seq_id >= dsv4_n_seq_max) {
+        return false;
+    }
+
+    try {
+        dsv4_vector_writer writer(data);
+        mem_recr->state_write(writer, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        return !data.empty();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_WARN("%s: failed to save recurrent state: %s\n", __func__, err.what());
+        data.clear();
+        return false;
+    }
+}
+
+bool llama_memory_hybrid_iswa::dsv4_recurrent_state_restore(llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (!has_dsv4_compressed_kv() || seq_id < 0 || (uint32_t) seq_id >= dsv4_n_seq_max || data.empty()) {
+        return false;
+    }
+
+    try {
+        dsv4_vector_reader reader(data);
+        mem_recr->state_read(reader, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        return reader.n_bytes() == data.size();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_WARN("%s: failed to restore recurrent state: %s\n", __func__, err.what());
+        return false;
+    }
 }
 
 uint32_t llama_memory_hybrid_iswa::get_dsv4_n_comp(int32_t il) const {

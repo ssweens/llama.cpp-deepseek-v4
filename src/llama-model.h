@@ -645,6 +645,9 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
+    bool validate_mtp_draft_gguf(const std::string & path, std::string & err) const;
+    uint32_t mtp_raw_window(uint32_t fallback) const;
+
     // TODO: move this to new llm_arch_model_i interface
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 

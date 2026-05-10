@@ -607,14 +607,17 @@ task_params server_task::params_from_json_cmpl(
     }
 
     if (params.dsv4_arch) {
-        // ds4-style server parity: no speculative decoding and a minimal sampler
-        // chain matching top_k/top_p/min_p/temp behavior. DeepSeek4 compressed KV
-        // cannot be K-shifted, so disable non-contiguous chunk reuse but keep
-        // cache_prompt unchanged for safe contiguous-prefix reuse.
+        // ds4-style server parity: use a minimal sampler chain matching
+        // top_k/top_p/min_p/temp behavior. DeepSeek4 compressed KV cannot be
+        // K-shifted, so disable non-contiguous chunk reuse but keep cache_prompt
+        // unchanged for safe contiguous-prefix reuse. Preserve model-native MTP
+        // speculative settings so `--spec-type mtp` can use the target verifier.
         params.n_cache_reuse = 0;
-        params.speculative.n_min = 0;
-        params.speculative.n_max = 0;
-        params.speculative.p_min = 0.0f;
+        if (params.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
+            params.speculative.n_min = 0;
+            params.speculative.n_max = 0;
+            params.speculative.p_min = 0.0f;
+        }
         params.sampling.samplers = {
             COMMON_SAMPLER_TYPE_TOP_K,
             COMMON_SAMPLER_TYPE_TOP_P,

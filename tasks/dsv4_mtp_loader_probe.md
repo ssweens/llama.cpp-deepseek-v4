@@ -3,25 +3,34 @@
 Branch: `work/dsv4-mtp-loader-probe`
 Date: 2026-05-09
 
+## Current status update (2026-05-09)
+
+- MTP runtime is no longer probe-only: `--spec-type mtp --model-draft <MTP-support.gguf>` loads the MTP draft GGUF, routes drafting through `common/speculative.cpp`, and uses the existing server verifier/accept loop.
+- `DSV4_MTP_PROBE=1` is diagnostics-only. Normal MTP runtime works without it; diagnostics mode keeps the full HC/raw handoff copies and detailed preview logging.
+- Code organization was reset to mirror existing patterns: speculative orchestration lives in `common/speculative.cpp` / server verifier flow, DeepSeek4 MTP metadata/tensor validation lives behind `src/models/deepseek4.*`, and the server no longer calls a `src/models/models.h` MTP hook.
+- Boundary cleanup: generic server/speculative code no longer contains DS4/MTP env names, timing probes, or DS4 MTP log/comment text; `llama_context` uses generic model/memory hooks for MTP draft validation, raw-window policy, and recurrent-state replay instead of direct DS4 references.
+- Docker mounted-code validation shows real accepted drafts and correct visible content on smoke prompts, but speedup is not achieved yet. Standard IQ2_XXS benchmark: target-only `tg=30.56±0.62`, integrated MTP draft-1 `tg=9.07±1.76`, integrated depth-2 `tg≈7.7-7.9`.
+- Remaining blocker: target-graph-integrated MTP pays the MTP block/output-head cost in the target decode graph. Upstream Qwen MTP PR #22673 and local `../ds4/` both point to a sidecar/MTP-only graph/context fed by target hidden state; the next fix should replace integrated target graph MTP with that shape.
+
 ## Implemented in this branch
 
 - Added DeepSeek4 MTP validation/probe plumbing behind the existing speculative interface:
   - `--spec-type mtp` selects MTP;
   - existing `--model-draft FNAME` carries the DeepSeek4 MTP support GGUF path;
   - existing `--draft-max N` / `common_params_speculative::n_max` carries the future draft cap.
-- Added server startup validation for DeepSeek4 MTP sidecar GGUFs.
+- Added MTP draft/support GGUF validation behind `llama_model` dispatch; DeepSeek4-specific tensor/schema checks live in `src/models/deepseek4.*`.
 - Added a default-off MTP state output hook for one-token decode graphs; DeepSeek4 currently supplies final HC state as that opaque handoff tensor.
 - Added a host-side copy buffer for that MTP handoff state in `llama_context` for the next draft-one probe step.
-- Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
-- Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
-- Extended the probe to run a one-token MTP transformer block using sidecar attention, FFN, HC, and output-head tensors before logging draft top-1 vs target argmax. The block now consumes a private host-backed raw-window cache on continuation steps; it still does not mutate target KV/cache state or commit draft tokens.
+- Added MTP draft GGUF tensor data loading into a persistent backend weight buffer using existing draft placement knobs such as `--device-draft`.
+- Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through MTP draft `enorm/e_proj`, `hnorm/h_proj`, HC head/norm, and base output, then logs projection top-1 vs target argmax.
+- Extended the probe/runtime graph to run a one-token MTP transformer block using MTP draft attention, FFN, HC, and output-head tensors before logging draft top-1 vs target argmax. The block now consumes a private host-backed raw-window cache on continuation steps.
 - Fixed CPU-only DeepSeek4 reserve/probe issues found by the real IQ1_M target run: BF16 activation inputs are cast back to F32 for non-BF16 weight matmuls so CPU supports the op, and disconnected probe top-1 tensors are explicitly expanded into the graph before decode copies them.
-- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables state/block-probe plumbing. Server slot initialization intentionally skips `common_speculative_init()` for MTP until the full runtime drafter is wired.
+- Runtime MTP drafting now uses `common_speculative_init()` and the existing server speculative verifier/accept loop. Accepted-token private raw commit exists for the integrated probe path, but the viable speed path still requires a sidecar/MTP-only graph instead of target-graph-integrated MTP blocks.
 - Documented the new server flags in `tools/server/README.md`.
 
-## Staged sidecar
+## Staged MTP draft/support GGUF
 
-Downloaded sidecar:
+Downloaded MTP draft/support GGUF:
 
 ```text
 /mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
@@ -41,20 +50,20 @@ tensors = 32
 
 ## Validation behavior
 
-The server validator is metadata/tensor-directory only in default startup mode. It does not load sidecar tensor data unless `DSV4_MTP_PROBE=1` is also set. Probe mode loads the already-validated sidecar tensors into a persistent backend weight buffer and runs a one-token MTP block probe with private host-backed raw-window state, but still does not maintain compressed/indexer MTP state or alter emitted tokens.
+The context loader validates metadata/tensor-directory shape and loads MTP draft tensor data during normal MTP runtime. `DSV4_MTP_PROBE=1` enables additional diagnostics copies/logging; it is not required for runtime drafting. Accepted-token private raw/HC commit is still incomplete.
 
 Validation requires:
 
 - target model architecture is `LLM_ARCH_DEEPSEEK4`;
 - target model has token embedding and output tensors for MTP sharing;
-- sidecar file exists;
-- sidecar `general.architecture == deepseek4_mtp_support`;
-- sidecar `deepseek4.mtp_layer_count == 1`;
-- sidecar `deepseek4.nextn_predict_layers == 1`;
-- sidecar `deepseek4.expert_count` matches target `n_expert`;
+- MTP draft GGUF file exists;
+- MTP draft GGUF `general.architecture == deepseek4_mtp_support`;
+- MTP draft GGUF `deepseek4.mtp_layer_count == 1`;
+- MTP draft GGUF `deepseek4.nextn_predict_layers == 1`;
+- MTP draft GGUF `deepseek4.expert_count` matches target `n_expert`;
 - all 32 expected `mtp.0.*` tensors exist with exact hparams-derived shapes and accepted types.
 
-Accepted routed expert sidecar types mirror DS4 authority: `IQ2_XXS`, `Q2_K`, or `Q4_K`; the current downloaded sidecar uses `Q4_K`.
+Accepted routed expert MTP draft types mirror DS4 authority: `IQ2_XXS`, `Q2_K`, or `Q4_K`; the current downloaded GGUF uses `Q4_K`.
 
 ## Quality gates run
 
@@ -153,9 +162,9 @@ Note: whole-file `clang-format --dry-run` on `tools/server/server-context.cpp` r
 
 ## Not implemented yet
 
-- No private MTP compressed/indexer cache/state.
-- No draft token generation.
-- No speculative verification/commit.
+- No Qwen-PR-style sidecar/MTP-only graph or separate MTP context fed by target hidden state.
+- No deterministic token-level parity harness for target-only vs MTP.
+- No benchmark-proven speedup; current integrated MTP accepts tokens but is slower than target-only.
 
 ## HC-state probe plumbing
 
@@ -197,14 +206,9 @@ Important constraints for the next implementation:
 
 ## Next exact step
 
-Create a follow-up branch for draft-one probing, e.g.:
+Pivot from target-graph-integrated MTP to a sidecar/MTP-only graph, matching Qwen PR #22673 and `../ds4/`:
 
-```text
-work/dsv4-mtp-hc-probe
-```
-
-Recommended scope:
-
-1. Convert the probe-only verifier preview into a controlled target verifier path that can test draft tokens through existing checkpoint/rollback without committing them by default.
-2. Add accept/reject accounting and commit only after the verifier path proves target state rollback/commit is exact.
-3. Do not enable speculative commit until deterministic no-MTP vs probe token streams match exactly.
+1. Make the normal DeepSeek4 target graph expose/copy the last target HC row cheaply, without running MTP blocks in the target graph.
+2. Add an MTP-only graph/context path that consumes `(target_or_mtp_hc, token, pos, private raw cache)` and returns `(top1, next_hc, raw row)` using the loaded MTP GGUF tensors.
+3. Drive that graph from `common_speculative_state_mtp`, recurse up to `--draft-max`, and trim/commit private raw rows based on existing verifier accept counts.
+4. Re-run deterministic parity smoke and the standard IQ2_XXS resident `llama-benchy` benchmark before claiming progress.

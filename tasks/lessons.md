@@ -229,3 +229,32 @@ I sanitized newly added runbook docs and the regression script's local DS4 path,
 - Do not describe MTP/probe output as safe or unchanged just because the code path is intended to be non-mutating. If the text looks corrupt, immediately compare against a target-only run with the exact same prompt/settings and keep the artifact.
 - Prefer one meaningful parity run over repeated tiny health checks once a corruption signal appears.
 - For DeepSeek4 runtime parity, use the mounted-code Docker sidecar/resident workflow (`llamatrifecta_deepseekv4:latest` + `/src/build-dsv4-container/bin/llama-server`) instead of host CPU-only server runs; host builds are compile checks, not runtime validation.
+
+## 2026-05-09 — MTP done means real speedup
+- Do not describe MTP loader/probe/parity milestones as “done” without qualifying them. The user's definition of done is: MTP accepts/commits draft tokens, inference is faster than target-only, and validation shows no generation errors.
+- Report progress against that definition directly: loader/probe readiness, verifier/commit readiness, private-state commit readiness, parity, and measured speedup.
+
+## 2026-05-09 — Use standard sidecar/speculative paths before custom MTP plumbing
+- For MTP sidecar allocation/placement, first reuse existing speculative draft knobs (`--device-draft`, `--gpu-layers-draft`, draft cache/thread params where applicable) instead of inventing or hard-coding DS4-specific placement.
+- Keep DeepSeek4-specific metadata validation, tensor-name mapping, and graph construction in `src/models/deepseek4.cpp` or DS4-specific helpers where possible. Generic/server/context files should expose model-agnostic MTP hooks and pass existing params through.
+- If DS4-specific code must remain outside DS4 files temporarily, mark it as a boundary violation to remove, not as the final design.
+
+## 2026-05-09 — Mirror existing code organization before inventing MTP boundaries
+- When the user asks where MTP code belongs, inventory existing llama.cpp patterns first and follow them. Existing speculative implementations live in `common/speculative.*` plus the server verifier path; ngram helpers live under `common/ngram-*`; multimodal projector loading lives under `tools/mtmd`; model-specific graph/tensor logic lives under `src/models/*.cpp`.
+- Do not create new `src/llama-mtp.*` files, public MTP hooks, or `src/models/models.h` APIs just because they sound generic. Add a new boundary only after proving it matches an existing architectural pattern or is required by a specific implementation constraint.
+- `src/models/models.h` is not a dumping ground for runtime MTP validation hooks; keep it aligned with its existing role. If a temporary boundary violation is necessary while debugging, record it in `tasks/todo.md` as cleanup debt before continuing runtime work.
+- Use existing terminology where possible: `draft model`, `mmproj`/projector, `MTP draft GGUF`, or `MTP support GGUF`. Avoid promoting generic "sidecar" terminology in user-facing docs or final code unless the project already uses that term for the same concept.
+
+## 2026-05-09 — Use standard model and benchmark harness for MTP speed claims
+- Do not make MTP validation or speed claims from one-off `llama-server` timing logs on a non-standard quant. The standard DeepSeek4 MTP test model is `DeepSeek-V4-Flash-IQ2_XXS`; use the resident Docker/Corral-style server plus `llama-benchy` as documented in `tasks/dsv4_resident_bench_server.md`.
+- Avoid IQ1_M for MTP validation unless the user explicitly asks for a non-standard diagnostic. If any non-standard quick smoke is unavoidable, label it explicitly as smoke-only and report prompt length, quant, harness, and whether the number is prefill (`prompt eval`) or decode (`eval`).
+
+## 2026-05-09 — Triangulate MTP performance before changing more code
+- Do not run repeated MTP smoke tests as a substitute for diagnosis. Each run must test a named hypothesis and have an expected observable, e.g. raw-cache continuity should increase acceptance; removing replay rollback should isolate verifier overhead; sidecar-only dry-run should isolate MTP graph cost.
+- When MTP accepts drafts but remains slower, split timing into target decode calls avoided, MTP graph time, verifier/replay rollback time, and scheduler/server overhead before making another code change.
+- Keep a target-only baseline and a current-MTP smoke result side by side. If acceptance improves without speed, stop optimizing acceptance and identify the overhead source.
+
+## 2026-05-09 — Re-ground DeepSeek4 MTP fixes in references
+- When the user says to use the references, pause implementation and re-read the authoritative DeepSeek4 MTP loop in `/home/bigkahuna/src/ds4` plus the upstream speculative/MTP PR before changing behavior.
+- Do not infer DS4 MTP state transitions from current WIP logs alone. Map each proposed change to reference semantics: when the MTP hidden state/raw cache advances, when verification discards tail state, and which path owns rollback.
+- Keep DS4-reference semantics behind DS4-specific code boundaries. Do not add DS4 comments, env vars, or architecture-specific rollback assumptions to generic server/speculative orchestration; expose generic context hooks when generic code needs to call into architecture-specific behavior.

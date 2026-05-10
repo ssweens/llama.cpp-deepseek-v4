@@ -963,6 +963,16 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // [EXPERIMENTAL] Return current MTP draft tokens if the target context's
+    // model-native MTP graph can condition the draft on `sampled`.
+    LLAMA_API int32_t llama_mtp_draft_tokens(struct llama_context * ctx, llama_token sampled, llama_token * drafts, int32_t n_max);
+
+    // [EXPERIMENTAL] Return the first current MTP draft token, or LLAMA_TOKEN_NULL.
+    LLAMA_API llama_token llama_mtp_draft_token(struct llama_context * ctx, llama_token sampled);
+
+    // [EXPERIMENTAL] Notify a model-native MTP context how many speculative draft tokens were accepted.
+    LLAMA_API void llama_mtp_accept(struct llama_context * ctx, uint32_t n_accepted);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

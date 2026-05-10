@@ -34,6 +34,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -547,10 +548,12 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    bool                                                   mtp_probe     = false;
-    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors   = nullptr;
-    const std::vector<float> *                             mtp_raw_cache       = nullptr;
-    uint32_t                                               mtp_n_raw           = 0;
+    bool                                                   mtp_probe       = false;
+    bool                                                   mtp_diagnostics = false;
+    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors     = nullptr;
+    const std::vector<float> *                             mtp_raw_cache   = nullptr;
+    const std::vector<float> *                             mtp_hc_input    = nullptr;
+    uint32_t                                               mtp_n_raw       = 0;
     uint32_t                                               mtp_probe_draft_max = 1;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -633,8 +636,9 @@ struct llm_graph_params {
 
         return cparams.embeddings == other.cparams.embeddings && cparams.causal_attn == other.cparams.causal_attn &&
                arch == other.arch && gtype == other.gtype && cvec == other.cvec && loras == other.loras &&
-               cross == other.cross && mtp_probe == other.mtp_probe && mtp_tensors == other.mtp_tensors &&
-               mtp_raw_cache == other.mtp_raw_cache && mtp_n_raw == other.mtp_n_raw &&
+               cross == other.cross && mtp_probe == other.mtp_probe && mtp_diagnostics == other.mtp_diagnostics &&
+               mtp_tensors == other.mtp_tensors && mtp_raw_cache == other.mtp_raw_cache &&
+               mtp_hc_input == other.mtp_hc_input && mtp_n_raw == other.mtp_n_raw &&
                mtp_probe_draft_max == other.mtp_probe_draft_max;
     }
 };
@@ -657,13 +661,19 @@ public:
 
     ggml_tensor * get_mtp_next_state() const { return t_mtp_next_state; }
 
+    ggml_tensor * get_mtp_target_top1() const { return t_mtp_target_top1; }
+
     ggml_tensor * get_mtp_probe_top1() const { return t_mtp_probe_top1; }
 
     ggml_tensor * get_mtp_probe_top1_next() const { return t_mtp_probe_top1_next; }
 
+    ggml_tensor * get_mtp_probe_top1_third() const { return t_mtp_probe_top1_third; }
+
     ggml_tensor * get_mtp_raw_current() const { return t_mtp_raw_current; }
 
     ggml_tensor * get_mtp_raw_draft() const { return t_mtp_raw_draft; }
+
+    ggml_tensor * get_mtp_raw_draft_accept() const { return t_mtp_raw_draft_accept; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -685,6 +695,7 @@ public:
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void set_params(const llm_graph_params & params);
+    llm_graph_type get_gtype() const { return params.gtype; }
 
     // important graph nodes
     ggml_tensor * t_inp_tokens        = nullptr;
@@ -692,12 +703,15 @@ public:
     ggml_tensor * t_logits            = nullptr;
     ggml_tensor * t_embd              = nullptr;
     ggml_tensor * t_embd_pooled       = nullptr;
-    ggml_tensor * t_mtp_state         = nullptr;
+    ggml_tensor * t_mtp_state           = nullptr;
     ggml_tensor * t_mtp_next_state      = nullptr;
-    ggml_tensor * t_mtp_probe_top1      = nullptr;
-    ggml_tensor * t_mtp_probe_top1_next = nullptr;
-    ggml_tensor * t_mtp_raw_current     = nullptr;
-    ggml_tensor * t_mtp_raw_draft       = nullptr;
+    ggml_tensor * t_mtp_target_top1     = nullptr;
+    ggml_tensor * t_mtp_probe_top1        = nullptr;
+    ggml_tensor * t_mtp_probe_top1_next   = nullptr;
+    ggml_tensor * t_mtp_probe_top1_third  = nullptr;
+    ggml_tensor * t_mtp_raw_current       = nullptr;
+    ggml_tensor * t_mtp_raw_draft         = nullptr;
+    ggml_tensor * t_mtp_raw_draft_accept  = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -786,8 +800,10 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const bool                                             mtp_probe;
+    const bool                                             mtp_diagnostics;
     const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors;
     const std::vector<float> *                             mtp_raw_cache;
+    const std::vector<float> *                             mtp_hc_input;
     const uint32_t                                         mtp_n_raw;
     const uint32_t                                         mtp_probe_draft_max;
 

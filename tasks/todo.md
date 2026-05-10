@@ -252,6 +252,14 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 
 ## DeepSeek4 MTP loader/probe — `work/dsv4-mtp-loader-probe`
 
+### Definition of done
+- [ ] MTP accepts and commits draft tokens through the target verifier.
+- [ ] Accepted MTP private raw/HC state is committed correctly; rejected drafts leave no persistent state.
+- [ ] Docker runtime validation shows target-only vs MTP output parity on deterministic prompts.
+- [ ] Benchmarks show MTP is faster than target-only inference.
+- [ ] MTP runs without `DSV4_MTP_PROBE=1` for normal runtime; probe mode remains diagnostics-only.
+- [ ] Code organization mirrors existing llama.cpp patterns: speculative control/orchestration in `common/speculative.*` and the server verifier path, model-specific DeepSeek4 MTP tensor/graph details in DS4-specific implementation files, no ad hoc public MTP args, no arbitrary `src/llama-mtp.*`, and no MTP hook in `src/models/models.h` unless an existing project pattern justifies it.
+
 ### Immediate corruption triage
 - [x] Stop advancing verifier/commit work until generation corruption is explained.
 - [x] Compare real DeepSeek4 target-only output against `DSV4_MTP_PROBE=1 --spec-type mtp --model-draft ... --draft-max 2` for the exact same prompt/settings: both returned `"\n\t\t"` for raw `prompt="Hi"`, `n_predict=3`, `temperature=0`.
@@ -259,6 +267,48 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Since target-only also emits the same suspicious output for raw `"Hi"`, rerun through the expected chat/template path before calling the probe safe: Docker resident target-only and MTP-probe chat runs both returned content `"4"`, identical reasoning text, and identical token usage for `What is 2+2? Reply with only the number.`
 - [x] Use the resident Docker/mounted-code sidecar workflow from `../llama.cpp-deepseek-v4/tasks/dsv4_resident_bench_server.md` for DeepSeek4 runtime parity instead of host CPU-only ad hoc servers.
 - [x] Do not mark MTP probe safe based only on “emitted unchanged” claims without a target-only baseline artifact.
+
+### Current WIP quarantine
+- [x] Treat all uncommitted changes after `a8f11e424` as unstable until reviewed, built, and Docker-validated. Current dirty files include `src/llama-context.*`, `src/models/deepseek4.cpp`, `src/models/models.h`, `tools/server/server-*.cpp`, and task docs.
+- [x] Separate useful WIP from wrong-direction WIP before more runtime work:
+  - [x] Preserve useful findings only after validation: real MTP can reach verifier acceptance counts, `--device-draft CUDA2` places MTP tensors on CUDA2, and request parsing must not zero server speculative budget.
+  - [x] Remove/revert wrong-direction organization: no MTP validation hook in `src/models/models.h`, no model-specific server include path as final architecture, and no invented `src/llama-mtp.*` boundary unless existing llama.cpp patterns support it.
+  - [x] Rename/refactor public-facing terminology toward existing concepts (`draft model`, `MTP draft GGUF`, `MTP support GGUF`) instead of promoting generic "sidecar" terminology in active runtime paths.
+- [x] Restore a clean host `llama-server` build and `git diff --check` before any Docker runtime validation.
+
+### Required execution order from the base task
+1. [x] **Code organization first:** mirror existing llama.cpp patterns before touching real commit behavior. Keep speculative control in `common/speculative.*` / server verifier flow; keep DS4 MTP tensor validation, tensor-name mapping, and graph construction in DS4-specific code; keep generic context/server code model-agnostic and minimal.
+2. [x] **Standard draft placement:** keep MTP support GGUF allocation wired through existing speculative draft placement knobs (`--device-draft`, `--gpu-layers-draft`, draft cache/thread params where applicable). Do not hard-code DS4 device/layer placement.
+3. [x] **Request-path budget preservation:** cleanly fix the OpenAI/DeepSeek4 request path so per-request normalization does not zero the server's configured MTP speculative budget.
+4. [ ] **Verifier dry-run before commit:** decode proposed MTP draft tokens through the existing target verifier/checkpoint/rollback path while keeping emitted tokens target-only and always restoring target state.
+5. [ ] **Private drafter state design:** specify and implement exact accepted/rejected state transitions for MTP private HC/raw rows before calling any real commit path safe.
+6. [x] **Real accept/commit smoke path:** MTP token acceptance now goes through `common/speculative.cpp` and the existing server verifier/accept loop; Docker runs show accepted drafts are committed and final visible content is correct on short arithmetic and counting prompts.
+7. [ ] **Correctness validation:** use the mounted-code Docker resident workflow to compare target-only vs MTP on deterministic chat prompts; current arithmetic prompt is not exact-deterministic run-to-run in target-only reasoning text, so use content/finish plus a more stable token-level harness before declaring parity.
+8. [ ] **Performance validation last:** only benchmark after correctness passes. Use the standard IQ2_XXS model and `llama-benchy` resident-server harness (`pp2048`, `tg32`, runs >= 3) before making any speed conclusion. Prior IQ1_M one-off `llama-server` timing logs are smoke evidence only, not benchmark evidence.
+9. [x] **Normal runtime gate:** MTP works without `DSV4_MTP_PROBE=1`; that env var remains diagnostics-only.
+
+### Current triangulation checkpoint — accepted drafts are no longer the main blocker
+- [x] Raw-cache continuity fix increased IQ2_XXS smoke acceptance from low/unstable acceptance to `23/31 = 0.742` accepted drafts on the counting prompt; `n_raw` now grows instead of staying pinned at 2.
+- [x] Explain why high-acceptance MTP smoke is still slower before making more speculative state changes: server-level speculative tail cleanup (`llama_memory_seq_rm`) costs ~111 ms per speculative batch on DS4, and DS4 replay rollback is still expensive on rejected drafts.
+- [ ] Re-ground the next fix in `/home/bigkahuna/src/ds4` and PR #22673 before changing behavior again: identify exactly which component owns draft-state advance, rejection discard, and target verifier rollback.
+- [ ] Boundary cleanup before more MTP tuning: remove DS4-specific reference logic/comments/env handling from generic server/speculative/context code paths, and expose architecture-specific behavior through DS4-specific model/memory helpers or generic hooks.
+  - [x] Removed DS4/MTP env names, comments, and timing probes from generic server/speculative code.
+  - [x] Replaced context-level DS4 memory downcast for MTP replay with a generic recurrent-state memory hook implemented by hybrid-iSWA memory.
+  - [x] Moved MTP draft validation and MTP raw-window policy out of generic context behind `llama_model` dispatch methods.
+- [ ] Separate overhead with one hypothesis per run: sidecar graph cost, target verifier batching cost, DeepSeek4 replay rollback cost, and scheduler/server synchronization cost.
+- [ ] Only after the reference-backed owner of rollback/tail cleanup is identified, implement the smallest targeted fix and re-run the same smoke.
+
+### Next checkpoint — Qwen/DS4-aligned MTP runtime fix
+- [x] Clean the current wrong-direction architecture changes first, especially the `src/models/models.h` MTP hook.
+- [x] Re-establish the minimal model-agnostic server/context interface needed by existing speculative flow, not a new public MTP API.
+- [x] Re-read and mirror the relevant shape of upstream PR `ggml-org/llama.cpp#22673`: MTP drafting is driven from `common/speculative.cpp`, uses existing draft placement/config, streams target hidden rows into a private MTP context/graph, recursively drafts from the actual sampled token, and trims drafter state on accept/reject.
+- [x] Re-read and mirror `/home/bigkahuna/src/ds4`: normal target decode builds one MTP row for the committed token, recursive MTP drafts from the accepted sampled token, and MTP raw state is private to the drafter while target verifier state is handled by checkpoint/rollback.
+- [x] Replace the current DeepSeek4 integrated draft-2 gating (`draft[0] must equal sampled before any draft is returned`) with sampled-token-conditioned drafting so the speculative path can propose a real next token after every greedy sampled token.
+- [x] Implement explicit private MTP raw-state commit/discard plumbing for the current integrated probe path: committed sampled rows are appended once, accepted speculative draft rows are committed or dropped, and verifier batches do not clear unrelated private MTP state.
+- [x] Keep emitted tokens target-verified through the existing server speculative verifier path; do not bypass target sampling or checkpoint/rollback.
+- [ ] Replace target-graph-integrated MTP blocks with a Qwen-PR-style sidecar/MTP-only graph. Finding: integrated MTP in the target graph accepts drafts but cannot be a speed path; even a continuous verifier-batch experiment generated/accepted more drafts (`47/47` accepted in IQ1_M smoke) yet slowed decode to `14.97 tok/s` because every target graph paid MTP block/output-head cost.
+- [ ] Validate Docker mounted-code parity target-only vs MTP on deterministic token-level prompts, then rerun the standard IQ2_XXS resident-server `llama-benchy` path (`pp2048`, `tg32`, runs >= 3).
+- [ ] Resolve the speed blocker using the standard benchmark path: IQ2_XXS resident Docker server + `llama-benchy` (`pp2048`, `tg32`, runs 3) currently shows target-only `pp=382.60±3.22`, `tg=30.56±0.62`; current integrated MTP `pp=383.50±0.43`, `tg=9.07±1.76`, and depth-2 integrated MTP remained slower (`tg≈7.7-7.9`). The prior IQ1_M short-prompt server-log numbers are superseded and are smoke-only.
 
 ### Plan
 - [x] Download/stage `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` locally without modifying the target GGUFs: `/mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` (`3,807,602,400` bytes).

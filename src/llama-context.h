@@ -75,8 +75,10 @@ struct llama_context {
     const std::vector<float> & get_mtp_next_state() const;
     const std::vector<float> & get_mtp_raw_draft() const;
     const ggml_tensor *        get_mtp_tensor(const char * name) const;
+    llama_token                get_mtp_target_top1() const;
     llama_token                get_mtp_probe_top1() const;
     llama_token                get_mtp_probe_top1_next() const;
+    llama_token                get_mtp_probe_top1_third() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -103,9 +105,22 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
-    void set_mtp_probe(bool value, uint32_t draft_max = 1);
+    void set_mtp_probe(bool value, uint32_t draft_max = 1, bool diagnostics = false);
     void clear_mtp_probe_state();
-    bool load_dsv4_mtp_sidecar(const std::string & path, std::string & err);
+    void append_mtp_raw_row(const std::vector<float> & row);
+    bool eval_mtp_sidecar_one(llama_token token, llama_pos pos, const std::vector<float> & hc,
+                              llama_token & top, std::vector<float> & next_hc, std::vector<float> & raw);
+    int32_t draft_mtp_sidecar_tokens(llama_token sampled, llama_token * drafts, int32_t n_max);
+    bool save_mtp_replay_snapshot(llama_token sampled);
+    bool replay_mtp_accepted_prefix(uint32_t n_accepted);
+    void commit_mtp_sampled_raw_row();
+    void set_mtp_last_draft_tokens(uint32_t n_draft);
+    void commit_mtp_accepted_raw_rows(uint32_t n_accepted);
+    void discard_mtp_sampled_raw_row();
+    bool load_mtp_draft(const std::string &                     path,
+                        const std::vector<ggml_backend_dev_t> & draft_devices,
+                        int32_t                                 draft_n_gpu_layers,
+                        std::string &                           err);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -300,26 +315,46 @@ private:
     // optional MTP probe state copied from model-specific handoff tensors for the last single-token decode graph
     std::vector<float> mtp_state;
     std::vector<float> mtp_next_state;
+    std::vector<float> mtp_graph_hc_input;
+    std::vector<float> mtp_raw_current_pending;
     std::vector<float> mtp_raw_draft;
-    llama_token        mtp_probe_top1      = LLAMA_TOKEN_NULL;
-    llama_token        mtp_probe_top1_next = LLAMA_TOKEN_NULL;
+    std::vector<float> mtp_raw_draft_accept;
+    llama_token        mtp_target_top1       = LLAMA_TOKEN_NULL;
+    llama_token        mtp_probe_top1        = LLAMA_TOKEN_NULL;
+    llama_token        mtp_probe_top1_next   = LLAMA_TOKEN_NULL;
+    llama_token        mtp_probe_top1_third  = LLAMA_TOKEN_NULL;
+    uint32_t           mtp_last_draft_tokens = 0;
 
     uint32_t mtp_probe_draft_max = 1;
 
     // private MTP probe raw-window cache, intentionally separate from target KV/cache state
     std::vector<float> mtp_raw_cache;
     uint32_t           mtp_n_raw        = 0;
-    llama_seq_id       mtp_raw_seq_id   = -1;
-    llama_pos          mtp_raw_last_pos = -1;
+    llama_seq_id       mtp_raw_seq_id       = -1;
+    llama_pos          mtp_raw_last_pos     = -1;
+    llama_seq_id       mtp_last_target_seq  = -1;
+    llama_pos          mtp_last_target_pos  = -1;
+    llama_token        mtp_last_target_token = LLAMA_TOKEN_NULL;
 
-    struct dsv4_mtp_sidecar_data {
+    std::vector<uint8_t> mtp_replay_snapshot;
+    llama_seq_id         mtp_replay_seq_id       = -1;
+    llama_pos            mtp_replay_start_pos    = -1;
+    llama_token          mtp_replay_sampled      = LLAMA_TOKEN_NULL;
+    llama_token          mtp_replay_drafts[2]    = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
+    uint32_t             mtp_replay_n_drafts     = 0;
+    uint32_t             mtp_replay_raw_keep     = 0;
+    uint32_t             mtp_replay_raw_extra    = 0;
+    llama_pos            mtp_replay_raw_keep_pos = -1;
+    bool                 mtp_replay_suppress_raw_append = false;
+
+    struct mtp_draft_data {
         gguf_context_ptr                               ctx_gguf;
         ggml_context_ptr                               ctx;
         ggml_backend_buffer_ptr                        buf;
         std::unordered_map<std::string, ggml_tensor *> tensors;
     };
 
-    std::unique_ptr<dsv4_mtp_sidecar_data> dsv4_mtp_sidecar;
+    std::unique_ptr<mtp_draft_data> mtp_draft;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
@@ -339,6 +374,7 @@ private:
 
     bool sched_need_reserve = true;
     bool mtp_probe          = false;
+    bool mtp_diagnostics    = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

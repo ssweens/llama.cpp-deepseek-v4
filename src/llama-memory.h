@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -117,6 +118,20 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Optional lightweight recurrent-state snapshot hooks for architecture-specific
+    // speculative rollback. Memory implementations that do not need this return false.
+    virtual bool recurrent_state_save(llama_seq_id seq_id, std::vector<uint8_t> & data) const {
+        (void) seq_id;
+        data.clear();
+        return false;
+    }
+
+    virtual bool recurrent_state_restore(llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+        (void) seq_id;
+        (void) data;
+        return false;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

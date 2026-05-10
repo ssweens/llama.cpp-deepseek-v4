@@ -1127,9 +1127,7 @@ json oaicompat_chat_params_parse(
         // DeepSeek4 compressed KV cannot be position-shifted, so disable
         // non-contiguous chunk reuse. Keep cache_prompt at the server/request
         // default so contiguous-prefix prompt reuse and checkpoint restore work.
-        llama_params["n_cache_reuse"] = 0;
-        llama_params["speculative.n_min"] = 0;
-        llama_params["speculative.n_max"] = 0;
+        llama_params["n_cache_reuse"]      = 0;
     } else {
         llama_params["prompt"] = chat_params.prompt;
     }

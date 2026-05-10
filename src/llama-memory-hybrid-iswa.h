@@ -75,6 +75,9 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    bool recurrent_state_save(llama_seq_id seq_id, std::vector<uint8_t> & data) const override;
+    bool recurrent_state_restore(llama_seq_id seq_id, const std::vector<uint8_t> & data) override;
+
     //
     // llama_memory_hybrid_iswa specific API
     //
@@ -83,6 +86,8 @@ public:
     llama_memory_recurrent * get_mem_recr() const;
 
     bool has_dsv4_compressed_kv() const;
+    bool dsv4_recurrent_state_save(llama_seq_id seq_id, std::vector<uint8_t> & data) const;
+    bool dsv4_recurrent_state_restore(llama_seq_id seq_id, const std::vector<uint8_t> & data);
     uint32_t get_dsv4_n_comp(int32_t il) const;
     ggml_tensor * get_dsv4_attn_k (ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;
     ggml_tensor * get_dsv4_index_k(ggml_context * ctx, int32_t il, llama_seq_id seq_id) const;

@@ -15,6 +15,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "models/models.h"
+#include "models/deepseek4.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -8608,6 +8609,25 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     }
 
     return layers[il].rope_short;
+}
+
+bool llama_model::validate_mtp_draft_gguf(const std::string & path, std::string & err) const {
+    switch (arch) {
+        case LLM_ARCH_DEEPSEEK4:
+            return llama_deepseek4_validate_mtp_draft_gguf(path, this, err);
+        default:
+            err = "MTP draft GGUF is not supported by this model architecture";
+            return false;
+    }
+}
+
+uint32_t llama_model::mtp_raw_window(uint32_t fallback) const {
+    switch (arch) {
+        case LLM_ARCH_DEEPSEEK4:
+            return hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : fallback;
+        default:
+            return fallback;
+    }
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {

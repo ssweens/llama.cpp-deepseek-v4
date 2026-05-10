@@ -1,15 +1,22 @@
-#include "models.h"
+#include "deepseek4.h"
+
 #include "../llama-impl.h"
 #include "../llama-kv-cache.h"
 #include "../llama-memory-hybrid-iswa.h"
+#include "gguf.h"
+#include "models.h"
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <initializer_list>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -235,12 +242,23 @@ private:
 
 class dsv4_mtp_pos_offset_input : public llm_graph_input_i {
   public:
-    dsv4_mtp_pos_offset_input(ggml_tensor * tensor, int32_t offset) : tensor(tensor), offset(offset) {}
+    dsv4_mtp_pos_offset_input(ggml_tensor * tensor, int32_t offset, bool last_only = false) :
+        tensor(tensor),
+        offset(offset),
+        last_only(last_only) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(tensor != nullptr);
         GGML_ASSERT(ubatch != nullptr && ubatch->pos != nullptr);
         GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+
+        if (last_only) {
+            GGML_ASSERT(tensor->ne[0] == 1);
+            const int32_t pos = (int32_t) (ubatch->pos[ubatch->n_tokens - 1] + offset);
+            ggml_backend_tensor_set(tensor, &pos, 0, sizeof(pos));
+            return;
+        }
+
         GGML_ASSERT(tensor->ne[0] == (int64_t) ubatch->n_tokens);
 
         std::vector<int32_t> pos(ubatch->n_tokens);
@@ -251,12 +269,39 @@ class dsv4_mtp_pos_offset_input : public llm_graph_input_i {
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        return tensor != nullptr && tensor->ne[0] == (int64_t) params.ubatch.n_tokens;
+        return tensor != nullptr && tensor->ne[0] == (last_only ? 1 : (int64_t) params.ubatch.n_tokens);
     }
 
   private:
     ggml_tensor * tensor;
     int32_t       offset;
+    bool          last_only;
+};
+
+class dsv4_mtp_hc_input : public llm_graph_input_i {
+  public:
+    dsv4_mtp_hc_input(ggml_tensor * tensor, const std::vector<float> * state, size_t expected_size) :
+        tensor(tensor),
+        state(state),
+        expected_size(expected_size) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(state != nullptr);
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+        GGML_ASSERT(state->size() == expected_size);
+        ggml_backend_tensor_set(tensor, state->data(), 0, expected_size * sizeof(float));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return tensor != nullptr && state == params.mtp_hc_input && (size_t) ggml_nelements(tensor) == expected_size;
+    }
+
+  private:
+    ggml_tensor *              tensor;
+    const std::vector<float> * state;
+    size_t                     expected_size;
 };
 
 class dsv4_mtp_raw_cache_input : public llm_graph_input_i {
@@ -681,6 +726,238 @@ static dsv4_state_pair dsv4_build_compressor_prefill_state(
 }
 } // namespace
 
+static bool llama_deepseek4_mtp_get_u32(const gguf_context * ctx, const char * key, uint32_t & out, std::string & err) {
+    const int64_t kid = gguf_find_key(ctx, key);
+    if (kid < 0) {
+        err = format("missing required metadata key '%s'", key);
+        return false;
+    }
+
+    const enum gguf_type type = gguf_get_kv_type(ctx, kid);
+    switch (type) {
+        case GGUF_TYPE_UINT32:
+            out = gguf_get_val_u32(ctx, kid);
+            return true;
+        case GGUF_TYPE_UINT64:
+            {
+                const uint64_t v = gguf_get_val_u64(ctx, kid);
+                if (v > std::numeric_limits<uint32_t>::max()) {
+                    err = format("metadata key '%s' is too large: %" PRIu64, key, v);
+                    return false;
+                }
+                out = (uint32_t) v;
+                return true;
+            }
+        case GGUF_TYPE_INT32:
+            {
+                const int32_t v = gguf_get_val_i32(ctx, kid);
+                if (v < 0) {
+                    err = format("metadata key '%s' is negative: %d", key, v);
+                    return false;
+                }
+                out = (uint32_t) v;
+                return true;
+            }
+        default:
+            err = format("metadata key '%s' has type %s, expected integer", key, gguf_type_name(type));
+            return false;
+    }
+}
+
+static std::string llama_deepseek4_mtp_type_names(std::initializer_list<ggml_type> types) {
+    std::string out;
+    for (const enum ggml_type type : types) {
+        if (!out.empty()) {
+            out += "/";
+        }
+        out += ggml_type_name(type);
+    }
+    return out;
+}
+
+static bool llama_deepseek4_mtp_check_tensor(ggml_context *                   ctx_meta,
+                                             const char *                     name,
+                                             std::initializer_list<int64_t>   ne,
+                                             std::initializer_list<ggml_type> types,
+                                             std::string &                    err) {
+    const ggml_tensor * t = ggml_get_tensor(ctx_meta, name);
+    if (t == nullptr) {
+        err = format("missing required MTP tensor '%s'", name);
+        return false;
+    }
+
+    if (ggml_n_dims(t) != (int) ne.size()) {
+        err = format("MTP tensor '%s' has %d dims, expected %zu", name, ggml_n_dims(t), ne.size());
+        return false;
+    }
+
+    int i = 0;
+    for (const int64_t dim : ne) {
+        if (t->ne[i] != dim) {
+            err = format("MTP tensor '%s' dim[%d]=%" PRId64 ", expected %" PRId64, name, i, t->ne[i], dim);
+            return false;
+        }
+        ++i;
+    }
+
+    bool type_ok = false;
+    for (const enum ggml_type type : types) {
+        if (t->type == type) {
+            type_ok = true;
+            break;
+        }
+    }
+    if (!type_ok) {
+        err = format("MTP tensor '%s' has type %s, expected %s", name, ggml_type_name(t->type),
+                     llama_deepseek4_mtp_type_names(types).c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_deepseek4_validate_mtp_draft_gguf(const std::string & path, const llama_model * model, std::string & err) {
+    if (model == nullptr || model->arch != LLM_ARCH_DEEPSEEK4) {
+        err = "MTP speculative decoding is only supported with DeepSeek4 target models in this build";
+        return false;
+    }
+    if (model->tok_embd == nullptr || model->output == nullptr) {
+        err = "DeepSeek4 MTP requires target token embedding and output tensors";
+        return false;
+    }
+    if (!std::filesystem::exists(path)) {
+        err = format("MTP draft GGUF file does not exist: %s", path.c_str());
+        return false;
+    }
+
+    ggml_context *          ctx_meta_raw = nullptr;
+    struct gguf_init_params params       = {
+        /*.no_alloc =*/true,
+        /*.ctx      =*/&ctx_meta_raw,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx_gguf(gguf_init_from_file(path.c_str(), params), gguf_free);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_meta(ctx_meta_raw, ggml_free);
+    if (ctx_gguf == nullptr || ctx_meta == nullptr) {
+        err = format("failed to read MTP draft GGUF metadata: %s", path.c_str());
+        return false;
+    }
+
+    const int64_t arch_kid = gguf_find_key(ctx_gguf.get(), "general.architecture");
+    if (arch_kid < 0 || gguf_get_kv_type(ctx_gguf.get(), arch_kid) != GGUF_TYPE_STRING) {
+        err = "MTP draft GGUF missing string metadata key 'general.architecture'";
+        return false;
+    }
+    const std::string arch = gguf_get_val_str(ctx_gguf.get(), arch_kid);
+    if (arch != "deepseek4_mtp_support") {
+        err = format("MTP draft GGUF architecture is '%s', expected 'deepseek4_mtp_support'", arch.c_str());
+        return false;
+    }
+
+    uint32_t mtp_layer_count      = 0;
+    uint32_t nextn_predict_layers = 0;
+    uint32_t expert_count         = 0;
+    if (!llama_deepseek4_mtp_get_u32(ctx_gguf.get(), "deepseek4.mtp_layer_count", mtp_layer_count, err) ||
+        !llama_deepseek4_mtp_get_u32(ctx_gguf.get(), "deepseek4.nextn_predict_layers", nextn_predict_layers, err) ||
+        !llama_deepseek4_mtp_get_u32(ctx_gguf.get(), "deepseek4.expert_count", expert_count, err)) {
+        return false;
+    }
+    if (mtp_layer_count != 1 || nextn_predict_layers != 1) {
+        err = format("MTP draft GGUF supports mtp_layer_count=%u nextn_predict_layers=%u, expected 1/1",
+                     mtp_layer_count, nextn_predict_layers);
+        return false;
+    }
+
+    const llama_hparams & hparams = model->hparams;
+    if (expert_count != hparams.n_expert) {
+        err =
+            format("MTP draft GGUF expert_count=%u does not match target n_expert=%u", expert_count, hparams.n_expert);
+        return false;
+    }
+    if (hparams.n_hc == 0 || hparams.n_lora_q == 0 || hparams.n_lora_o == 0 || hparams.n_o_groups == 0 ||
+        hparams.n_ff_exp == 0 || hparams.n_expert == 0) {
+        err = "DeepSeek4 target hparams are incomplete for MTP validation";
+        return false;
+    }
+
+    const int64_t n_embd     = hparams.n_embd;
+    const int64_t n_hc       = hparams.n_hc;
+    const int64_t n_hc_state = n_embd * n_hc;
+    const int64_t n_hc_mix   = (2 + n_hc) * n_hc;
+    const int64_t n_lora_q   = hparams.n_lora_q;
+    const int64_t n_lora_o   = hparams.n_lora_o;
+    const int64_t n_o_groups = hparams.n_o_groups;
+    const int64_t n_head     = hparams.n_head(0);
+    const int64_t n_head_dim = hparams.n_embd_head_k(0);
+    const int64_t n_ff_exp   = hparams.n_ff_exp;
+    const int64_t n_ff_shexp = hparams.n_ff_shexp > 0 ? hparams.n_ff_shexp : hparams.n_ff_exp * hparams.n_expert_shared;
+    const int64_t n_expert   = hparams.n_expert;
+    const int64_t q_dim      = n_head * n_head_dim;
+    const int64_t out_low_dim = n_lora_o * n_o_groups;
+    if (n_head % n_o_groups != 0) {
+        err = format("DeepSeek4 target n_head=%" PRId64 " is not divisible by n_o_groups=%" PRId64, n_head, n_o_groups);
+        return false;
+    }
+    const int64_t attn_o_a_dim = n_head_dim * (n_head / n_o_groups);
+
+    const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+    if (n_tensors != 32) {
+        err = format("MTP draft GGUF has %" PRId64 " tensors, expected 32", n_tensors);
+        return false;
+    }
+
+    auto check = [&](const char * name, std::initializer_list<int64_t> ne, std::initializer_list<ggml_type> types) {
+        return llama_deepseek4_mtp_check_tensor(ctx_meta.get(), name, ne, types, err);
+    };
+    const std::initializer_list<ggml_type> plain  = { GGML_TYPE_F32, GGML_TYPE_F16 };
+    const std::initializer_list<ggml_type> routed = { GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K };
+
+    if (!check("mtp.0.hc_head_base.weight", { n_hc }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_head_fn.weight", { n_hc_state, n_hc }, plain) ||
+        !check("mtp.0.hc_head_scale.weight", { 1 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.e_proj.weight", { n_embd, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.h_proj.weight", { n_embd, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.enorm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hnorm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_attn_fn.weight", { n_hc_state, n_hc_mix }, plain) ||
+        !check("mtp.0.hc_attn_scale.weight", { 3 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_attn_base.weight", { n_hc_mix }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_q_a.weight", { n_embd, n_lora_q }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_q_a_norm.weight", { n_lora_q }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_q_b.weight", { n_lora_q, q_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_kv.weight", { n_embd, n_head_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_kv_a_norm.weight", { n_head_dim }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_sinks.weight", { n_head }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_output_a.weight", { attn_o_a_dim, out_low_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_output_b.weight", { out_low_dim, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.hc_ffn_fn.weight", { n_hc_state, n_hc_mix }, plain) ||
+        !check("mtp.0.hc_ffn_scale.weight", { 3 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_ffn_base.weight", { n_hc_mix }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_gate_inp.weight", { n_embd, n_expert }, plain) ||
+        !check("mtp.0.exp_probs_b.bias", { n_expert }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_gate_exps.weight", { n_embd, n_ff_exp, n_expert }, routed) ||
+        !check("mtp.0.ffn_up_exps.weight", { n_embd, n_ff_exp, n_expert }, routed) ||
+        !check("mtp.0.ffn_down_exps.weight", { n_ff_exp, n_embd, n_expert }, routed) ||
+        !check("mtp.0.ffn_gate_shexp.weight", { n_embd, n_ff_shexp }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.ffn_up_shexp.weight", { n_embd, n_ff_shexp }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.ffn_down_shexp.weight", { n_ff_shexp, n_embd }, { GGML_TYPE_Q8_0 })) {
+        return false;
+    }
+
+    const ggml_tensor * gate_exps = ggml_get_tensor(ctx_meta.get(), "mtp.0.ffn_gate_exps.weight");
+    const ggml_tensor * up_exps   = ggml_get_tensor(ctx_meta.get(), "mtp.0.ffn_up_exps.weight");
+    if (gate_exps != nullptr && up_exps != nullptr && gate_exps->type != up_exps->type) {
+        err = format("MTP routed gate/up expert types differ: %s vs %s", ggml_type_name(gate_exps->type),
+                     ggml_type_name(up_exps->type));
+        return false;
+    }
+
+    return true;
+}
+
 llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_k();
@@ -771,23 +1048,24 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     // hc_pre: uses ggml_dsv4_hc_split_sinkhorn (proper op, CUDA-accelerated)
     auto hc_pre = [&](ggml_tensor * x_hc, ggml_tensor * hc_fn, ggml_tensor * hc_base, ggml_tensor * hc_scale, const char * tag, int il_cur) -> hc_pre_result {
         GGML_ASSERT(x_hc->ne[0] == n_embd && x_hc->ne[1] == n_hc);
-        const int64_t hc_dim = n_embd * n_hc;
-        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
+        const int64_t n_hc_tokens = x_hc->ne[2];
+        const int64_t hc_dim      = n_embd * n_hc;
+        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_hc_tokens));
         flat = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
-        ggml_tensor * mixes = mul_mat_checked(hc_fn, flat, "hc.fn"); // [(2+n_hc)*n_hc, n_tokens]
+        ggml_tensor * mixes = mul_mat_checked(hc_fn, flat, "hc.fn"); // [(2+n_hc)*n_hc, n_hc_tokens]
         cb(mixes, std::string(tag).append("_mixes").c_str(), il_cur);
 
         // ggml_dsv4_hc_split_sinkhorn: computes pre/post/comb in one fused op
         ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx0, mixes, hc_scale, hc_base, (int)n_hc, (int)hparams.n_hc_sinkhorn_iters, hparams.f_hc_eps);
-        ggml_tensor * pre  = ggml_view_2d(ctx0, split, n_hc, n_tokens, split->nb[1], 0);
-        ggml_tensor * post = ggml_view_2d(ctx0, split, n_hc, n_tokens, split->nb[1], n_hc * split->nb[0]);
-        ggml_tensor * comb = ggml_view_2d(ctx0, split, n_hc * n_hc, n_tokens, split->nb[1], 2 * n_hc * split->nb[0]);
-        if (n_tokens != 1) {
+        ggml_tensor * pre  = ggml_view_2d(ctx0, split, n_hc, n_hc_tokens, split->nb[1], 0);
+        ggml_tensor * post = ggml_view_2d(ctx0, split, n_hc, n_hc_tokens, split->nb[1], n_hc * split->nb[0]);
+        ggml_tensor * comb = ggml_view_2d(ctx0, split, n_hc * n_hc, n_hc_tokens, split->nb[1], 2 * n_hc * split->nb[0]);
+        if (n_hc_tokens != 1) {
             pre  = cont_if_needed(ctx0, pre);
             post = cont_if_needed(ctx0, post);
             comb = cont_if_needed(ctx0, comb);
         }
-        comb = ggml_reshape_3d(ctx0, comb, n_hc, n_hc, n_tokens); // [src_hc, dst_hc, n_tokens]
+        comb = ggml_reshape_3d(ctx0, comb, n_hc, n_hc, n_hc_tokens); // [src_hc, dst_hc, n_hc_tokens]
 
         // ggml_dsv4_hc_weighted_sum: sum_{hc} pre[hc,t] * x[embd,hc,t]
         // Result is F32 (matches antirez — do not cast to BF16, the proper op already produces F32)
@@ -808,20 +1086,22 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     auto hc_head = [&](ggml_tensor * x_hc, ggml_tensor * hc_fn, ggml_tensor * hc_base, ggml_tensor * hc_scale, const char * tag) -> ggml_tensor * {
         GGML_ASSERT(x_hc->ne[0] == n_embd && x_hc->ne[1] == n_hc);
 
+        const int64_t n_hc_tokens = x_hc->ne[2];
+
         if (hc_fn == nullptr || hc_base == nullptr || hc_scale == nullptr) {
             // fallback: simple mean across HC copies
             ggml_tensor * mean = nullptr;
             for (int64_t i = 0; i < n_hc; ++i) {
-                ggml_tensor * x_i = as_f32(ggml_view_2d(ctx0, x_hc, n_embd, n_tokens, x_hc->nb[2], i * x_hc->nb[1]));
+                ggml_tensor * x_i = as_f32(ggml_view_2d(ctx0, x_hc, n_embd, n_hc_tokens, x_hc->nb[2], i * x_hc->nb[1]));
                 mean = mean == nullptr ? x_i : ggml_add(ctx0, mean, x_i);
             }
             return ggml_scale(ctx0, mean, 1.0f / (float)n_hc);
         }
 
         const int64_t hc_dim = n_embd * n_hc;
-        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_tokens));
+        ggml_tensor * flat = cont_if_needed(ctx0, ggml_reshape_2d(ctx0, x_hc, hc_dim, n_hc_tokens));
         flat = ggml_rms_norm(ctx0, flat, hparams.f_norm_rms_eps);
-        ggml_tensor * pre = mul_mat_checked(hc_fn, flat, "hc.head.fn"); // [n_hc, n_tokens]
+        ggml_tensor * pre = mul_mat_checked(hc_fn, flat, "hc.head.fn"); // [n_hc, n_hc_tokens]
         pre = ggml_mul(ctx0, pre, ggml_view_1d(ctx0, hc_scale, 1, 0));
         pre = ggml_add(ctx0, pre, hc_base);
         pre = ggml_add(ctx0, ggml_sigmoid(ctx0, pre), ggml_fill(ctx0, pre, hparams.f_hc_eps));
@@ -986,8 +1266,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return pool;
     };
 
-    res->add_input(std::make_unique<dsv4_position_graph_guard>(ubatch));
-    ggml_tensor * inp_pos = build_inp_pos();
+    if (params.gtype != LLM_GRAPH_TYPE_MTP) {
+        res->add_input(std::make_unique<dsv4_position_graph_guard>(ubatch));
+    }
+    ggml_tensor * inp_pos = params.gtype == LLM_GRAPH_TYPE_MTP ? nullptr : build_inp_pos();
     llm_graph_input_mem_hybrid_iswa * inp_mem = nullptr;
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
     llm_graph_input_attn_kv * inp_attn_kv = nullptr;
@@ -995,15 +1277,17 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     const llama_memory_hybrid_iswa_context * mctx_dsv4 = nullptr;
     const bool has_hybrid_iswa = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx) != nullptr;
 
-    if (has_hybrid_iswa) {
-        inp_mem = build_inp_mem_hybrid_iswa();
-        inp_attn_iswa = inp_mem->get_attn();
-        inp_rs = inp_mem->get_recr();
-        mctx_dsv4 = inp_mem->mctx;
-    } else {
-        inp_attn_kv = build_attn_inp_kv();
+    if (params.gtype != LLM_GRAPH_TYPE_MTP) {
+        if (has_hybrid_iswa) {
+            inp_mem = build_inp_mem_hybrid_iswa();
+            inp_attn_iswa = inp_mem->get_attn();
+            inp_rs = inp_mem->get_recr();
+            mctx_dsv4 = inp_mem->mctx;
+        } else {
+            inp_attn_kv = build_attn_inp_kv();
+        }
     }
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = params.gtype == LLM_GRAPH_TYPE_MTP ? nullptr : build_inp_out_ids();
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -1294,6 +1578,231 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             kv_comp,
         };
     };
+
+    if (params.gtype == LLM_GRAPH_TYPE_MTP) {
+        GGML_ASSERT(n_tokens == 1);
+        GGML_ASSERT(n_outputs == 1);
+        GGML_ASSERT(mtp_tensors != nullptr);
+        GGML_ASSERT(mtp_hc_input != nullptr);
+
+        constexpr int64_t n_mtp_tokens = 1;
+        const size_t      hc_size      = (size_t) n_embd * (size_t) n_hc;
+        GGML_ASSERT(mtp_hc_input->size() == hc_size);
+
+        auto mtp_tensor = [&](const char * name) -> ggml_tensor * {
+            const auto it = mtp_tensors->find(name);
+            return it == mtp_tensors->end() ? nullptr : it->second;
+        };
+
+        auto mtp_required = [&](const char * name) -> ggml_tensor * {
+            ggml_tensor * t = mtp_tensor(name);
+            GGML_ASSERT(t != nullptr);
+            return t;
+        };
+
+        ggml_tensor * mtp_e_proj        = mtp_required("mtp.0.e_proj.weight");
+        ggml_tensor * mtp_h_proj        = mtp_required("mtp.0.h_proj.weight");
+        ggml_tensor * mtp_enorm         = mtp_required("mtp.0.enorm.weight");
+        ggml_tensor * mtp_hnorm         = mtp_required("mtp.0.hnorm.weight");
+        ggml_tensor * mtp_norm          = mtp_required("mtp.0.norm.weight");
+        ggml_tensor * mtp_hc_head_fn    = mtp_required("mtp.0.hc_head_fn.weight");
+        ggml_tensor * mtp_hc_head_base  = mtp_required("mtp.0.hc_head_base.weight");
+        ggml_tensor * mtp_hc_head_scale = mtp_required("mtp.0.hc_head_scale.weight");
+
+        ggml_tensor * mtp_hc_attn_fn    = mtp_required("mtp.0.hc_attn_fn.weight");
+        ggml_tensor * mtp_hc_attn_scale = mtp_required("mtp.0.hc_attn_scale.weight");
+        ggml_tensor * mtp_hc_attn_base  = mtp_required("mtp.0.hc_attn_base.weight");
+        ggml_tensor * mtp_attn_norm     = mtp_required("mtp.0.attn_norm.weight");
+        ggml_tensor * mtp_attn_q_a      = mtp_required("mtp.0.attn_q_a.weight");
+        ggml_tensor * mtp_attn_q_a_norm = mtp_required("mtp.0.attn_q_a_norm.weight");
+        ggml_tensor * mtp_attn_q_b      = mtp_required("mtp.0.attn_q_b.weight");
+        ggml_tensor * mtp_attn_kv       = mtp_required("mtp.0.attn_kv.weight");
+        ggml_tensor * mtp_attn_kv_norm  = mtp_required("mtp.0.attn_kv_a_norm.weight");
+        ggml_tensor * mtp_attn_sinks    = mtp_required("mtp.0.attn_sinks.weight");
+        ggml_tensor * mtp_attn_out_a    = mtp_required("mtp.0.attn_output_a.weight");
+        ggml_tensor * mtp_attn_out_b    = mtp_required("mtp.0.attn_output_b.weight");
+
+        ggml_tensor * mtp_hc_ffn_fn      = mtp_required("mtp.0.hc_ffn_fn.weight");
+        ggml_tensor * mtp_hc_ffn_scale   = mtp_required("mtp.0.hc_ffn_scale.weight");
+        ggml_tensor * mtp_hc_ffn_base    = mtp_required("mtp.0.hc_ffn_base.weight");
+        ggml_tensor * mtp_ffn_norm       = mtp_required("mtp.0.ffn_norm.weight");
+        ggml_tensor * mtp_ffn_gate_inp   = mtp_required("mtp.0.ffn_gate_inp.weight");
+        ggml_tensor * mtp_exp_probs_b    = mtp_required("mtp.0.exp_probs_b.bias");
+        ggml_tensor * mtp_ffn_gate_exps  = mtp_required("mtp.0.ffn_gate_exps.weight");
+        ggml_tensor * mtp_ffn_up_exps    = mtp_required("mtp.0.ffn_up_exps.weight");
+        ggml_tensor * mtp_ffn_down_exps  = mtp_required("mtp.0.ffn_down_exps.weight");
+        ggml_tensor * mtp_ffn_gate_shexp = mtp_required("mtp.0.ffn_gate_shexp.weight");
+        ggml_tensor * mtp_ffn_up_shexp   = mtp_required("mtp.0.ffn_up_shexp.weight");
+        ggml_tensor * mtp_ffn_down_shexp = mtp_required("mtp.0.ffn_down_shexp.weight");
+
+        ggml_tensor * mtp_embed = build_inp_embd(model.tok_embd);
+        mtp_embed               = as_f32(mtp_embed);
+        cb(mtp_embed, "dsv4_mtp_only_embed", -1);
+
+        ggml_tensor * mtp_hc_state = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, n_hc, n_mtp_tokens);
+        ggml_set_input(mtp_hc_state);
+        ggml_set_name(mtp_hc_state, "dsv4_mtp_only_hc_input");
+        res->add_input(std::make_unique<dsv4_mtp_hc_input>(mtp_hc_state, mtp_hc_input, hc_size));
+        cb(mtp_hc_state, "dsv4_mtp_only_hc_input", -1);
+        res->t_mtp_state = mtp_hc_state;
+
+        ggml_tensor * mtp_pos_cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_mtp_tokens);
+        ggml_set_input(mtp_pos_cur);
+        ggml_set_name(mtp_pos_cur, "dsv4_mtp_only_pos");
+        res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_cur, 0, true));
+
+        ggml_tensor * mtp_grouped_out_ids = nullptr;
+        {
+            const int64_t n_groups = hparams.n_o_groups;
+            if (n_groups > 0) {
+                ggml_tensor * ids = ggml_arange(ctx0, 0.0f, (float) n_groups, 1.0f);
+                ids = ggml_cast(ctx0, ids, GGML_TYPE_I32);
+                mtp_grouped_out_ids = ggml_repeat_4d(ctx0, ids, n_groups, n_mtp_tokens, 1, 1);
+                cb(mtp_grouped_out_ids, "dsv4_mtp_only_grouped_out_ids", -1);
+            }
+        }
+
+        ggml_tensor * mtp_e = build_norm(mtp_embed, mtp_enorm, nullptr, LLM_NORM_RMS, -1);
+        mtp_e               = mul_mat_checked(mtp_e_proj, mtp_e, "mtp_only.e_proj");
+        mtp_e               = make_hc_state(mtp_e);
+        cb(mtp_e, "dsv4_mtp_only_e_proj_hc", -1);
+
+        ggml_tensor * mtp_h = build_norm(mtp_hc_state, mtp_hnorm, nullptr, LLM_NORM_RMS, -1);
+        mtp_h               = mul_mat_checked(mtp_h_proj, mtp_h, "mtp_only.h_proj");
+        cb(mtp_h, "dsv4_mtp_only_h_proj_hc", -1);
+
+        ggml_tensor * mtp_block_hc = ggml_add(ctx0, mtp_e, mtp_h);
+        cb(mtp_block_hc, "dsv4_mtp_only_input_hc", -1);
+
+        const uint32_t mtp_logical_il     = 1;
+        const uint32_t mtp_compress_ratio = hparams.deepseek4_compress_ratios[mtp_logical_il];
+        GGML_ASSERT(mtp_compress_ratio == 0);
+        const auto mtp_rope_cfg = get_rope_cfg(mtp_compress_ratio);
+
+        hc_pre_result mtp_attn_mix =
+            hc_pre(mtp_block_hc, mtp_hc_attn_fn, mtp_hc_attn_base, mtp_hc_attn_scale, "dsv4_mtp_only_attn_hc_pre", -1);
+        ggml_tensor * mtp_attn_inp =
+            build_norm(as_f32(mtp_attn_mix.collapsed), mtp_attn_norm, nullptr, LLM_NORM_RMS, -1);
+        mtp_attn_inp = as_f32(mtp_attn_inp);
+        cb(mtp_attn_inp, "dsv4_mtp_only_attn_norm", -1);
+
+        ggml_tensor * mtp_q_residual = mul_mat_checked(mtp_attn_q_a, mtp_attn_inp, "mtp_only.attn_q_a");
+        mtp_q_residual               = as_f32(mtp_q_residual);
+        mtp_q_residual               = build_norm(mtp_q_residual, mtp_attn_q_a_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(mtp_q_residual, "dsv4_mtp_only_attn_q_a_norm", -1);
+
+        ggml_tensor * mtp_Qcur = mul_mat_checked(mtp_attn_q_b, mtp_q_residual, "mtp_only.attn_q_b");
+        mtp_Qcur               = as_f32(mtp_Qcur);
+        mtp_Qcur               = ggml_reshape_3d(ctx0, mtp_Qcur, n_embd_head, n_head, n_mtp_tokens);
+        mtp_Qcur               = ggml_rms_norm(ctx0, mtp_Qcur, hparams.f_norm_rms_eps);
+        mtp_Qcur = apply_partial_rope_with_pos(mtp_Qcur, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/false);
+        cb(mtp_Qcur, "dsv4_mtp_only_attn_q_roped", -1);
+
+        ggml_tensor * mtp_Kcur = mul_mat_checked(mtp_attn_kv, mtp_attn_inp, "mtp_only.attn_kv");
+        mtp_Kcur               = as_f32(mtp_Kcur);
+        mtp_Kcur               = build_norm(mtp_Kcur, mtp_attn_kv_norm, nullptr, LLM_NORM_RMS, -1);
+        mtp_Kcur               = ggml_reshape_3d(ctx0, mtp_Kcur, n_embd_head, 1, n_mtp_tokens);
+        mtp_Kcur = apply_partial_rope_with_pos(mtp_Kcur, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/false);
+        mtp_Kcur = as_f32(mtp_Kcur);
+        mtp_Kcur = apply_fp8_qat_nope_2d(mtp_Kcur, "dsv4_mtp_only_attn_kv_qat", -1);
+        cb(mtp_Kcur, "dsv4_mtp_only_attn_kv", -1);
+        res->t_mtp_raw_current = mtp_Kcur;
+
+        ggml_tensor * mtp_raw_kv = mtp_Kcur;
+        if (mtp_n_raw > 0) {
+            GGML_ASSERT(mtp_raw_cache != nullptr);
+            ggml_tensor * mtp_raw_prev = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head, 1, mtp_n_raw);
+            ggml_set_input(mtp_raw_prev);
+            ggml_set_name(mtp_raw_prev, "dsv4_mtp_only_raw_cache");
+            res->add_input(
+                std::make_unique<dsv4_mtp_raw_cache_input>(mtp_raw_prev, mtp_raw_cache, mtp_n_raw, n_embd_head));
+            mtp_raw_kv = ggml_concat(ctx0, mtp_raw_prev, mtp_Kcur, 2);
+            cb(mtp_raw_kv, "dsv4_mtp_only_raw_kv", -1);
+        }
+
+        ggml_tensor * mtp_attn_out = build_attn_mha(mtp_Qcur, mtp_raw_kv, mtp_raw_kv, nullptr, nullptr,
+                                                    mtp_attn_sinks, nullptr, kq_scale, -1,
+                                                    /*force_no_flash_attn=*/true);
+        mtp_attn_out = as_f32(mtp_attn_out);
+        cb(mtp_attn_out, "dsv4_mtp_only_attn_out_raw", -1);
+
+        mtp_attn_out = ggml_reshape_3d(ctx0, mtp_attn_out, n_embd_head, n_head, n_mtp_tokens);
+        mtp_attn_out = apply_partial_rope_with_pos(mtp_attn_out, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/true);
+        cb(mtp_attn_out, "dsv4_mtp_only_attn_out_unrope", -1);
+
+        {
+            const int64_t n_groups    = hparams.n_o_groups;
+            const int64_t group_dim   = n_embd_head * (n_head / n_groups);
+            const int64_t o_lora_rank = mtp_attn_out_a->ne[1] / n_groups;
+            GGML_ASSERT(n_head % n_groups == 0);
+            GGML_ASSERT(mtp_attn_out_a->ne[0] == group_dim);
+            GGML_ASSERT(mtp_attn_out_a->ne[1] == o_lora_rank * n_groups);
+            GGML_ASSERT(mtp_grouped_out_ids != nullptr);
+
+            ggml_tensor * o      = cont_if_needed(ctx0, mtp_attn_out);
+            o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_mtp_tokens);
+            ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, mtp_attn_out_a, group_dim, o_lora_rank, n_groups);
+            mtp_attn_out         = ggml_mul_mat_id(ctx0, wo_a_g, o, mtp_grouped_out_ids);
+            mtp_attn_out         = ggml_reshape_2d(ctx0, mtp_attn_out, o_lora_rank * n_groups, n_mtp_tokens);
+        }
+        mtp_attn_out = as_f32(mtp_attn_out);
+        cb(mtp_attn_out, "dsv4_mtp_only_attn_o_a", -1);
+
+        mtp_attn_out = mul_mat_checked(mtp_attn_out_b, mtp_attn_out, "mtp_only.attn_o_b");
+        mtp_attn_out = as_f32(mtp_attn_out);
+        cb(mtp_attn_out, "dsv4_mtp_only_attn_o_b", -1);
+
+        ggml_tensor * mtp_attn_state =
+            hc_post(mtp_attn_out, mtp_block_hc, mtp_attn_mix.post, mtp_attn_mix.comb, "dsv4_mtp_only_attn_hc_post", -1);
+
+        hc_pre_result mtp_ffn_mix =
+            hc_pre(mtp_attn_state, mtp_hc_ffn_fn, mtp_hc_ffn_base, mtp_hc_ffn_scale, "dsv4_mtp_only_ffn_hc_pre", -1);
+        ggml_tensor * mtp_ffn_inp =
+            build_norm(as_f32(mtp_ffn_mix.collapsed), mtp_ffn_norm, nullptr, LLM_NORM_RMS, -1);
+        mtp_ffn_inp = as_f32(mtp_ffn_inp);
+        cb(mtp_ffn_inp, "dsv4_mtp_only_ffn_norm", -1);
+
+        ggml_tensor * mtp_moe_out = build_moe_ffn(
+            mtp_ffn_inp, mtp_ffn_gate_inp, mtp_ffn_up_exps, mtp_ffn_gate_exps, mtp_ffn_down_exps, mtp_exp_probs_b,
+            n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
+        mtp_moe_out = as_f32(mtp_moe_out);
+        cb(mtp_moe_out, "dsv4_mtp_only_ffn_moe_out", -1);
+
+        ggml_tensor * mtp_shexp_out =
+            build_ffn(mtp_ffn_inp, mtp_ffn_up_shexp, nullptr, nullptr, mtp_ffn_gate_shexp, nullptr, nullptr,
+                      mtp_ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
+        mtp_shexp_out = as_f32(mtp_shexp_out);
+        cb(mtp_shexp_out, "dsv4_mtp_only_ffn_shexp_out", -1);
+
+        ggml_tensor * mtp_ffn_out = ggml_add(ctx0, mtp_moe_out, mtp_shexp_out);
+        mtp_ffn_out               = as_f32(mtp_ffn_out);
+        cb(mtp_ffn_out, "dsv4_mtp_only_ffn_out", -1);
+
+        ggml_tensor * mtp_next_hc =
+            hc_post(mtp_ffn_out, mtp_attn_state, mtp_ffn_mix.post, mtp_ffn_mix.comb, "dsv4_mtp_only_ffn_hc_post", -1);
+        mtp_next_hc = cont_if_needed(ctx0, mtp_next_hc);
+        cb(mtp_next_hc, "dsv4_mtp_only_block_hc", -1);
+        res->t_mtp_next_state = mtp_next_hc;
+
+        ggml_tensor * mtp_embd = hc_head(mtp_next_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale,
+                                         "dsv4_mtp_only_block_hc_head");
+        mtp_embd               = build_norm(mtp_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
+        mtp_embd               = as_f32(mtp_embd);
+        cb(mtp_embd, "dsv4_mtp_only_block_norm", -1);
+
+        ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_embd);
+        cb(mtp_logits, "dsv4_mtp_only_block_logits", -1);
+
+        ggml_tensor * mtp_top1 = ggml_argmax(ctx0, mtp_logits);
+        cb(mtp_top1, "dsv4_mtp_only_block_top1", -1);
+        res->t_mtp_probe_top1_next = mtp_top1;
+
+        ggml_build_forward_expand(gf, mtp_top1);
+        ggml_build_forward_expand(gf, mtp_next_hc);
+        ggml_build_forward_expand(gf, mtp_Kcur);
+        return;
+    }
 
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     ggml_tensor * hc_state = make_hc_state(inpL);
@@ -2183,10 +2692,65 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(hc_state, "l_out_hc", il);
     }
 
-    if (mtp_probe && n_tokens == 1 && n_outputs == 1) {
-        ggml_tensor * mtp_hc_state = as_f32(hc_state);
+    ggml_tensor * result_embd = hc_head(hc_state, model.hc_head_fn, model.hc_head_base, model.hc_head_scale, "hc_head_out");
+    if (inp_out_ids) {
+        result_embd = ggml_get_rows(ctx0, result_embd, inp_out_ids);
+    }
+
+    result_embd = build_norm(result_embd, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    result_embd = as_f32(result_embd);
+    cb(result_embd, "result_norm", -1);
+    res->t_embd = result_embd;
+
+    ggml_tensor * result_logits = build_lora_mm(model.output, result_embd);
+    cb(result_logits, "result_output", -1);
+    res->t_logits = result_logits;
+
+    ggml_tensor * mtp_target_top1 = nullptr;
+    const bool    mtp_can_draft   = mtp_probe && n_outputs > 0;
+    if (mtp_can_draft && std::getenv("DSV4_MTP_SPEC_LOG") != nullptr) {
+        LLAMA_LOG_WARN("deepseek4 mtp graph: gtype=%d draft_max=%u diagnostics=%d tensors=%d n_raw=%u\n",
+                       (int) params.gtype, mtp_probe_draft_max, (int) mtp_diagnostics,
+                       mtp_tensors != nullptr ? 1 : 0, mtp_n_raw);
+    }
+    if (mtp_can_draft) {
+        constexpr int64_t n_mtp_tokens = 1;
+
+        ggml_tensor * mtp_target_logits = result_logits;
+        if (n_outputs > 1) {
+            mtp_target_logits = ggml_view_2d(ctx0, result_logits, result_logits->ne[0], 1, result_logits->nb[1],
+                                             result_logits->nb[1] * (n_outputs - 1));
+            cb(mtp_target_logits, "dsv4_mtp_target_logits_last", -1);
+        }
+
+        mtp_target_top1 = ggml_argmax(ctx0, mtp_target_logits);
+        cb(mtp_target_top1, "dsv4_mtp_target_top1", -1);
+        res->t_mtp_target_top1 = mtp_target_top1;
+
+        ggml_tensor * mtp_hc_state = hc_state;
+        ggml_tensor * mtp_inp_tokens = res->t_inp_tokens;
+        if (n_tokens > 1) {
+            mtp_hc_state = ggml_view_2d(ctx0, mtp_hc_state, mtp_hc_state->ne[0], mtp_hc_state->ne[1],
+                                        mtp_hc_state->nb[1], mtp_hc_state->nb[2] * (n_tokens - 1));
+            cb(mtp_hc_state, "dsv4_mtp_hc_state_last", -1);
+            mtp_inp_tokens = ggml_view_1d(ctx0, res->t_inp_tokens, 1,
+                                          ggml_element_size(res->t_inp_tokens) * (n_tokens - 1));
+            cb(mtp_inp_tokens, "dsv4_mtp_token_last", -1);
+        }
+        mtp_hc_state = cont_if_needed(ctx0, as_f32(mtp_hc_state));
         cb(mtp_hc_state, "dsv4_mtp_hc_state", -1);
         res->t_mtp_state = mtp_hc_state;
+
+        ggml_tensor * mtp_grouped_out_ids = nullptr;
+        {
+            const int64_t n_groups = hparams.n_o_groups;
+            if (n_groups > 0) {
+                ggml_tensor * ids = ggml_arange(ctx0, 0.0f, (float) n_groups, 1.0f);
+                ids = ggml_cast(ctx0, ids, GGML_TYPE_I32);
+                mtp_grouped_out_ids = ggml_repeat_4d(ctx0, ids, n_groups, n_mtp_tokens, 1, 1);
+                cb(mtp_grouped_out_ids, "dsv4_mtp_grouped_out_ids", -1);
+            }
+        }
 
         auto mtp_tensor = [&](const char * name) -> ggml_tensor * {
             if (mtp_tensors == nullptr) {
@@ -2202,7 +2766,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             return t;
         };
 
-        if (res->t_inp_tokens != nullptr && mtp_tensors != nullptr) {
+        if (mtp_diagnostics && res->t_inp_tokens != nullptr && mtp_tensors != nullptr) {
             ggml_tensor * mtp_e_proj        = mtp_required("mtp.0.e_proj.weight");
             ggml_tensor * mtp_h_proj        = mtp_required("mtp.0.h_proj.weight");
             ggml_tensor * mtp_enorm         = mtp_required("mtp.0.enorm.weight");
@@ -2238,7 +2802,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * mtp_ffn_up_shexp   = mtp_required("mtp.0.ffn_up_shexp.weight");
             ggml_tensor * mtp_ffn_down_shexp = mtp_required("mtp.0.ffn_down_shexp.weight");
 
-            ggml_tensor * mtp_embed = ggml_get_rows(ctx0, model.tok_embd, res->t_inp_tokens);
+            ggml_tensor * mtp_embed = ggml_get_rows(ctx0, model.tok_embd, mtp_inp_tokens);
             mtp_embed               = as_f32(mtp_embed);
             cb(mtp_embed, "dsv4_mtp_embed", -1);
 
@@ -2254,14 +2818,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * mtp_block_hc = ggml_add(ctx0, mtp_e, mtp_h);
             cb(mtp_block_hc, "dsv4_mtp_input_hc", -1);
 
-            // DS4 calls the single MTP sidecar block with logical layer id 1. For DeepSeek4
-            // this is a dense/raw-only attention layer (compress_ratio == 0), so the sidecar
+            // DS4 calls the single MTP draft block with logical layer id 1. For DeepSeek4
+            // this is a dense/raw-only attention layer (compress_ratio == 0), so the MTP draft
             // drafter needs private raw-window state but no private compressed/indexer state.
             // Target verifier compressed/indexer frontier rollback is a separate commit path.
             const uint32_t mtp_logical_il     = 1;
             const uint32_t mtp_compress_ratio = hparams.deepseek4_compress_ratios[mtp_logical_il];
             GGML_ASSERT(mtp_compress_ratio == 0);
             const auto mtp_rope_cfg = get_rope_cfg(mtp_compress_ratio);
+
+            ggml_tensor * mtp_pos_cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_mtp_tokens);
+            ggml_set_input(mtp_pos_cur);
+            ggml_set_name(mtp_pos_cur, "dsv4_mtp_pos_current");
+            res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_cur, 0, true));
 
             hc_pre_result mtp_attn_mix =
                 hc_pre(mtp_block_hc, mtp_hc_attn_fn, mtp_hc_attn_base, mtp_hc_attn_scale, "dsv4_mtp_attn_hc_pre", -1);
@@ -2277,16 +2846,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
             ggml_tensor * mtp_Qcur = mul_mat_checked(mtp_attn_q_b, mtp_q_residual, "mtp.attn_q_b");
             mtp_Qcur               = as_f32(mtp_Qcur);
-            mtp_Qcur               = ggml_reshape_3d(ctx0, mtp_Qcur, n_embd_head, n_head, n_tokens);
+            mtp_Qcur               = ggml_reshape_3d(ctx0, mtp_Qcur, n_embd_head, n_head, n_mtp_tokens);
             mtp_Qcur               = ggml_rms_norm(ctx0, mtp_Qcur, hparams.f_norm_rms_eps);
-            mtp_Qcur               = apply_partial_rope(mtp_Qcur, mtp_rope_cfg, /*inverse=*/false);
+            mtp_Qcur = apply_partial_rope_with_pos(mtp_Qcur, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/false);
             cb(mtp_Qcur, "dsv4_mtp_attn_q_roped", -1);
 
             ggml_tensor * mtp_Kcur = mul_mat_checked(mtp_attn_kv, mtp_attn_inp, "mtp.attn_kv");
             mtp_Kcur               = as_f32(mtp_Kcur);
             mtp_Kcur               = build_norm(mtp_Kcur, mtp_attn_kv_norm, nullptr, LLM_NORM_RMS, -1);
-            mtp_Kcur               = ggml_reshape_3d(ctx0, mtp_Kcur, n_embd_head, 1, n_tokens);
-            mtp_Kcur               = apply_partial_rope(mtp_Kcur, mtp_rope_cfg, /*inverse=*/false);
+            mtp_Kcur               = ggml_reshape_3d(ctx0, mtp_Kcur, n_embd_head, 1, n_mtp_tokens);
+            mtp_Kcur = apply_partial_rope_with_pos(mtp_Kcur, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/false);
             mtp_Kcur               = as_f32(mtp_Kcur);
             mtp_Kcur               = apply_fp8_qat_nope_2d(mtp_Kcur, "dsv4_mtp_attn_kv_qat", -1);
             cb(mtp_Kcur, "dsv4_mtp_attn_kv", -1);
@@ -2310,8 +2879,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             mtp_attn_out = as_f32(mtp_attn_out);
             cb(mtp_attn_out, "dsv4_mtp_attn_out_raw", -1);
 
-            mtp_attn_out = ggml_reshape_3d(ctx0, mtp_attn_out, n_embd_head, n_head, n_tokens);
-            mtp_attn_out = apply_partial_rope(mtp_attn_out, mtp_rope_cfg, /*inverse=*/true);
+            mtp_attn_out = ggml_reshape_3d(ctx0, mtp_attn_out, n_embd_head, n_head, n_mtp_tokens);
+            mtp_attn_out = apply_partial_rope_with_pos(mtp_attn_out, mtp_pos_cur, mtp_rope_cfg, /*inverse=*/true);
             cb(mtp_attn_out, "dsv4_mtp_attn_out_unrope", -1);
 
             {
@@ -2321,13 +2890,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 GGML_ASSERT(n_head % n_groups == 0);
                 GGML_ASSERT(mtp_attn_out_a->ne[0] == group_dim);
                 GGML_ASSERT(mtp_attn_out_a->ne[1] == o_lora_rank * n_groups);
-                GGML_ASSERT(grouped_out_ids != nullptr);
+                GGML_ASSERT(mtp_grouped_out_ids != nullptr);
 
                 ggml_tensor * o      = cont_if_needed(ctx0, mtp_attn_out);
-                o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_tokens);
+                o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_mtp_tokens);
                 ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, mtp_attn_out_a, group_dim, o_lora_rank, n_groups);
-                mtp_attn_out         = ggml_mul_mat_id(ctx0, wo_a_g, o, grouped_out_ids);
-                mtp_attn_out         = ggml_reshape_2d(ctx0, mtp_attn_out, o_lora_rank * n_groups, n_tokens);
+                mtp_attn_out         = ggml_mul_mat_id(ctx0, wo_a_g, o, mtp_grouped_out_ids);
+                mtp_attn_out         = ggml_reshape_2d(ctx0, mtp_attn_out, o_lora_rank * n_groups, n_mtp_tokens);
             }
             mtp_attn_out = as_f32(mtp_attn_out);
             cb(mtp_attn_out, "dsv4_mtp_attn_o_a", -1);
@@ -2365,31 +2934,33 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
             ggml_tensor * mtp_next_hc =
                 hc_post(mtp_ffn_out, mtp_attn_state, mtp_ffn_mix.post, mtp_ffn_mix.comb, "dsv4_mtp_ffn_hc_post", -1);
+            mtp_next_hc = cont_if_needed(ctx0, mtp_next_hc);
             cb(mtp_next_hc, "dsv4_mtp_block_hc", -1);
             res->t_mtp_next_state = mtp_next_hc;
 
-            ggml_tensor * mtp_embd =
-                hc_head(mtp_next_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale, "dsv4_mtp_block_hc_head");
-            mtp_embd               = build_norm(mtp_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
-            mtp_embd               = as_f32(mtp_embd);
-            cb(mtp_embd, "dsv4_mtp_block_norm", -1);
+            ggml_tensor * mtp_top1 = nullptr;
+            if (mtp_diagnostics) {
+                ggml_tensor * mtp_embd =
+                    hc_head(mtp_next_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale, "dsv4_mtp_block_hc_head");
+                mtp_embd               = build_norm(mtp_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
+                mtp_embd               = as_f32(mtp_embd);
+                cb(mtp_embd, "dsv4_mtp_block_norm", -1);
 
-            ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_embd);
-            cb(mtp_logits, "dsv4_mtp_block_logits", -1);
+                ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_embd);
+                cb(mtp_logits, "dsv4_mtp_block_logits", -1);
 
-            // Use argmax for recursive draft token IDs. argsort_top_k(k=1) is fine as a disconnected probe output,
-            // but feeding it into get_rows perturbs the copied first top-1 on CPU in this graph shape.
-            ggml_tensor * mtp_top1 = ggml_argmax(ctx0, mtp_logits);
-            cb(mtp_top1, "dsv4_mtp_block_top1", -1);
-            res->t_mtp_probe_top1 = mtp_top1;
+                mtp_top1 = ggml_argmax(ctx0, mtp_logits);
+                cb(mtp_top1, "dsv4_mtp_block_top1", -1);
+                res->t_mtp_probe_top1 = mtp_top1;
+            }
 
-            if (mtp_probe_draft_max > 1) {
-                ggml_tensor * mtp_pos_next = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            if (mtp_probe_draft_max > 0) {
+                ggml_tensor * mtp_pos_next = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_mtp_tokens);
                 ggml_set_input(mtp_pos_next);
                 ggml_set_name(mtp_pos_next, "dsv4_mtp_pos_next");
-                res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_next, 1));
+                res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_next, 1, true));
 
-                ggml_tensor * mtp2_embed = ggml_get_rows(ctx0, model.tok_embd, mtp_top1);
+                ggml_tensor * mtp2_embed = ggml_get_rows(ctx0, model.tok_embd, mtp_target_top1);
                 mtp2_embed               = as_f32(mtp2_embed);
                 cb(mtp2_embed, "dsv4_mtp2_embed", -1);
 
@@ -2419,7 +2990,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                 ggml_tensor * mtp2_Qcur = mul_mat_checked(mtp_attn_q_b, mtp2_q_residual, "mtp2.attn_q_b");
                 mtp2_Qcur               = as_f32(mtp2_Qcur);
-                mtp2_Qcur               = ggml_reshape_3d(ctx0, mtp2_Qcur, n_embd_head, n_head, n_tokens);
+                mtp2_Qcur               = ggml_reshape_3d(ctx0, mtp2_Qcur, n_embd_head, n_head, n_mtp_tokens);
                 mtp2_Qcur               = ggml_rms_norm(ctx0, mtp2_Qcur, hparams.f_norm_rms_eps);
                 mtp2_Qcur = apply_partial_rope_with_pos(mtp2_Qcur, mtp_pos_next, mtp_rope_cfg, /*inverse=*/false);
                 cb(mtp2_Qcur, "dsv4_mtp2_attn_q_roped", -1);
@@ -2427,12 +2998,15 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_tensor * mtp2_Kcur = mul_mat_checked(mtp_attn_kv, mtp2_attn_inp, "mtp2.attn_kv");
                 mtp2_Kcur               = as_f32(mtp2_Kcur);
                 mtp2_Kcur               = build_norm(mtp2_Kcur, mtp_attn_kv_norm, nullptr, LLM_NORM_RMS, -1);
-                mtp2_Kcur               = ggml_reshape_3d(ctx0, mtp2_Kcur, n_embd_head, 1, n_tokens);
+                mtp2_Kcur               = ggml_reshape_3d(ctx0, mtp2_Kcur, n_embd_head, 1, n_mtp_tokens);
                 mtp2_Kcur = apply_partial_rope_with_pos(mtp2_Kcur, mtp_pos_next, mtp_rope_cfg, /*inverse=*/false);
                 mtp2_Kcur = as_f32(mtp2_Kcur);
                 mtp2_Kcur = apply_fp8_qat_nope_2d(mtp2_Kcur, "dsv4_mtp2_attn_kv_qat", -1);
                 cb(mtp2_Kcur, "dsv4_mtp2_attn_kv", -1);
                 res->t_mtp_raw_draft = mtp2_Kcur;
+                if (std::getenv("DSV4_MTP_SPEC_LOG") != nullptr) {
+                    LLAMA_LOG_WARN("deepseek4 mtp graph: assigned raw_draft\n");
+                }
 
                 ggml_tensor * mtp2_raw_kv = ggml_concat(ctx0, mtp_raw_kv, mtp2_Kcur, 2);
                 cb(mtp2_raw_kv, "dsv4_mtp2_raw_kv", -1);
@@ -2443,7 +3017,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 mtp2_attn_out               = as_f32(mtp2_attn_out);
                 cb(mtp2_attn_out, "dsv4_mtp2_attn_out_raw", -1);
 
-                mtp2_attn_out = ggml_reshape_3d(ctx0, mtp2_attn_out, n_embd_head, n_head, n_tokens);
+                mtp2_attn_out = ggml_reshape_3d(ctx0, mtp2_attn_out, n_embd_head, n_head, n_mtp_tokens);
                 mtp2_attn_out = apply_partial_rope_with_pos(mtp2_attn_out, mtp_pos_next, mtp_rope_cfg,
                                                             /*inverse=*/true);
                 cb(mtp2_attn_out, "dsv4_mtp2_attn_out_unrope", -1);
@@ -2453,13 +3027,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     const int64_t group_dim   = n_embd_head * (n_head / n_groups);
                     const int64_t o_lora_rank = mtp_attn_out_a->ne[1] / n_groups;
                     GGML_ASSERT(n_head % n_groups == 0);
-                    GGML_ASSERT(grouped_out_ids != nullptr);
+                    GGML_ASSERT(mtp_grouped_out_ids != nullptr);
 
                     ggml_tensor * o      = cont_if_needed(ctx0, mtp2_attn_out);
-                    o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_tokens);
+                    o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_mtp_tokens);
                     ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, mtp_attn_out_a, group_dim, o_lora_rank, n_groups);
-                    mtp2_attn_out        = ggml_mul_mat_id(ctx0, wo_a_g, o, grouped_out_ids);
-                    mtp2_attn_out        = ggml_reshape_2d(ctx0, mtp2_attn_out, o_lora_rank * n_groups, n_tokens);
+                    mtp2_attn_out        = ggml_mul_mat_id(ctx0, wo_a_g, o, mtp_grouped_out_ids);
+                    mtp2_attn_out        = ggml_reshape_2d(ctx0, mtp2_attn_out, o_lora_rank * n_groups, n_mtp_tokens);
                 }
                 mtp2_attn_out = as_f32(mtp2_attn_out);
                 cb(mtp2_attn_out, "dsv4_mtp2_attn_o_a", -1);
@@ -2511,26 +3085,157 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_tensor * mtp2_top1 = ggml_argmax(ctx0, mtp2_logits);
                 cb(mtp2_top1, "dsv4_mtp2_block_top1", -1);
                 res->t_mtp_probe_top1_next = mtp2_top1;
+                if (std::getenv("DSV4_MTP_SPEC_LOG") != nullptr) {
+                    LLAMA_LOG_WARN("deepseek4 mtp graph: assigned top1_next\n");
+                }
+                ggml_build_forward_expand(gf, mtp2_top1);
+
+                if (mtp_probe_draft_max > 1) {
+                    ggml_tensor * mtp_pos_next2 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_mtp_tokens);
+                    ggml_set_input(mtp_pos_next2);
+                    ggml_set_name(mtp_pos_next2, "dsv4_mtp_pos_next2");
+                    res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_next2, 2, true));
+
+                    ggml_tensor * mtp3_embed = ggml_get_rows(ctx0, model.tok_embd, mtp2_top1);
+                    mtp3_embed               = as_f32(mtp3_embed);
+                    cb(mtp3_embed, "dsv4_mtp3_embed", -1);
+
+                    ggml_tensor * mtp3_e = build_norm(mtp3_embed, mtp_enorm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_e               = mul_mat_checked(mtp_e_proj, mtp3_e, "mtp3.e_proj");
+                    mtp3_e               = make_hc_state(mtp3_e);
+                    cb(mtp3_e, "dsv4_mtp3_e_proj_hc", -1);
+
+                    ggml_tensor * mtp3_h = build_norm(mtp2_next_hc, mtp_hnorm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_h               = mul_mat_checked(mtp_h_proj, mtp3_h, "mtp3.h_proj");
+                    cb(mtp3_h, "dsv4_mtp3_h_proj_hc", -1);
+
+                    ggml_tensor * mtp3_block_hc = ggml_add(ctx0, mtp3_e, mtp3_h);
+                    cb(mtp3_block_hc, "dsv4_mtp3_input_hc", -1);
+
+                    hc_pre_result mtp3_attn_mix = hc_pre(mtp3_block_hc, mtp_hc_attn_fn, mtp_hc_attn_base,
+                                                         mtp_hc_attn_scale, "dsv4_mtp3_attn_hc_pre", -1);
+                    ggml_tensor * mtp3_attn_inp =
+                        build_norm(as_f32(mtp3_attn_mix.collapsed), mtp_attn_norm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_attn_inp = as_f32(mtp3_attn_inp);
+                    cb(mtp3_attn_inp, "dsv4_mtp3_attn_norm", -1);
+
+                    ggml_tensor * mtp3_q_residual = mul_mat_checked(mtp_attn_q_a, mtp3_attn_inp, "mtp3.attn_q_a");
+                    mtp3_q_residual               = as_f32(mtp3_q_residual);
+                    mtp3_q_residual = build_norm(mtp3_q_residual, mtp_attn_q_a_norm, nullptr, LLM_NORM_RMS, -1);
+                    cb(mtp3_q_residual, "dsv4_mtp3_attn_q_a_norm", -1);
+
+                    ggml_tensor * mtp3_Qcur = mul_mat_checked(mtp_attn_q_b, mtp3_q_residual, "mtp3.attn_q_b");
+                    mtp3_Qcur               = as_f32(mtp3_Qcur);
+                    mtp3_Qcur               = ggml_reshape_3d(ctx0, mtp3_Qcur, n_embd_head, n_head, n_mtp_tokens);
+                    mtp3_Qcur               = ggml_rms_norm(ctx0, mtp3_Qcur, hparams.f_norm_rms_eps);
+                    mtp3_Qcur = apply_partial_rope_with_pos(mtp3_Qcur, mtp_pos_next2, mtp_rope_cfg, /*inverse=*/false);
+                    cb(mtp3_Qcur, "dsv4_mtp3_attn_q_roped", -1);
+
+                    ggml_tensor * mtp3_Kcur = mul_mat_checked(mtp_attn_kv, mtp3_attn_inp, "mtp3.attn_kv");
+                    mtp3_Kcur               = as_f32(mtp3_Kcur);
+                    mtp3_Kcur               = build_norm(mtp3_Kcur, mtp_attn_kv_norm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_Kcur               = ggml_reshape_3d(ctx0, mtp3_Kcur, n_embd_head, 1, n_mtp_tokens);
+                    mtp3_Kcur = apply_partial_rope_with_pos(mtp3_Kcur, mtp_pos_next2, mtp_rope_cfg, /*inverse=*/false);
+                    mtp3_Kcur = as_f32(mtp3_Kcur);
+                    mtp3_Kcur = apply_fp8_qat_nope_2d(mtp3_Kcur, "dsv4_mtp3_attn_kv_qat", -1);
+                    cb(mtp3_Kcur, "dsv4_mtp3_attn_kv", -1);
+                    res->t_mtp_raw_draft_accept = mtp3_Kcur;
+
+                    ggml_tensor * mtp3_raw_kv = ggml_concat(ctx0, mtp2_raw_kv, mtp3_Kcur, 2);
+                    cb(mtp3_raw_kv, "dsv4_mtp3_raw_kv", -1);
+
+                    ggml_tensor * mtp3_attn_out = build_attn_mha(mtp3_Qcur, mtp3_raw_kv, mtp3_raw_kv, nullptr,
+                                                                 nullptr, mtp_attn_sinks, nullptr, kq_scale, -1,
+                                                                 /*force_no_flash_attn=*/true);
+                    mtp3_attn_out               = as_f32(mtp3_attn_out);
+                    cb(mtp3_attn_out, "dsv4_mtp3_attn_out_raw", -1);
+
+                    mtp3_attn_out = ggml_reshape_3d(ctx0, mtp3_attn_out, n_embd_head, n_head, n_mtp_tokens);
+                    mtp3_attn_out = apply_partial_rope_with_pos(mtp3_attn_out, mtp_pos_next2, mtp_rope_cfg,
+                                                                /*inverse=*/true);
+                    cb(mtp3_attn_out, "dsv4_mtp3_attn_out_unrope", -1);
+
+                    {
+                        const int64_t n_groups    = hparams.n_o_groups;
+                        const int64_t group_dim   = n_embd_head * (n_head / n_groups);
+                        const int64_t o_lora_rank = mtp_attn_out_a->ne[1] / n_groups;
+                        GGML_ASSERT(n_head % n_groups == 0);
+                        GGML_ASSERT(mtp_grouped_out_ids != nullptr);
+
+                        ggml_tensor * o      = cont_if_needed(ctx0, mtp3_attn_out);
+                        o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_mtp_tokens);
+                        ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, mtp_attn_out_a, group_dim, o_lora_rank, n_groups);
+                        mtp3_attn_out        = ggml_mul_mat_id(ctx0, wo_a_g, o, mtp_grouped_out_ids);
+                        mtp3_attn_out        = ggml_reshape_2d(ctx0, mtp3_attn_out, o_lora_rank * n_groups, n_mtp_tokens);
+                    }
+                    mtp3_attn_out = as_f32(mtp3_attn_out);
+                    cb(mtp3_attn_out, "dsv4_mtp3_attn_o_a", -1);
+
+                    mtp3_attn_out = mul_mat_checked(mtp_attn_out_b, mtp3_attn_out, "mtp3.attn_o_b");
+                    mtp3_attn_out = as_f32(mtp3_attn_out);
+                    cb(mtp3_attn_out, "dsv4_mtp3_attn_o_b", -1);
+
+                    ggml_tensor * mtp3_attn_state = hc_post(mtp3_attn_out, mtp3_block_hc, mtp3_attn_mix.post,
+                                                            mtp3_attn_mix.comb, "dsv4_mtp3_attn_hc_post", -1);
+
+                    hc_pre_result mtp3_ffn_mix = hc_pre(mtp3_attn_state, mtp_hc_ffn_fn, mtp_hc_ffn_base,
+                                                        mtp_hc_ffn_scale, "dsv4_mtp3_ffn_hc_pre", -1);
+                    ggml_tensor * mtp3_ffn_inp =
+                        build_norm(as_f32(mtp3_ffn_mix.collapsed), mtp_ffn_norm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_ffn_inp = as_f32(mtp3_ffn_inp);
+                    cb(mtp3_ffn_inp, "dsv4_mtp3_ffn_norm", -1);
+
+                    ggml_tensor * mtp3_moe_out = build_moe_ffn(
+                        mtp3_ffn_inp, mtp_ffn_gate_inp, mtp_ffn_up_exps, mtp_ffn_gate_exps, mtp_ffn_down_exps,
+                        mtp_exp_probs_b, n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm,
+                        hparams.expert_weights_scale, (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
+                    mtp3_moe_out = as_f32(mtp3_moe_out);
+                    cb(mtp3_moe_out, "dsv4_mtp3_ffn_moe_out", -1);
+
+                    ggml_tensor * mtp3_shexp_out = build_ffn(
+                        mtp3_ffn_inp, mtp_ffn_up_shexp, nullptr, nullptr, mtp_ffn_gate_shexp, nullptr, nullptr,
+                        mtp_ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
+                    mtp3_shexp_out = as_f32(mtp3_shexp_out);
+                    cb(mtp3_shexp_out, "dsv4_mtp3_ffn_shexp_out", -1);
+
+                    ggml_tensor * mtp3_ffn_out = ggml_add(ctx0, mtp3_moe_out, mtp3_shexp_out);
+                    mtp3_ffn_out               = as_f32(mtp3_ffn_out);
+                    cb(mtp3_ffn_out, "dsv4_mtp3_ffn_out", -1);
+
+                    ggml_tensor * mtp3_next_hc = hc_post(mtp3_ffn_out, mtp3_attn_state, mtp3_ffn_mix.post,
+                                                         mtp3_ffn_mix.comb, "dsv4_mtp3_ffn_hc_post", -1);
+                    cb(mtp3_next_hc, "dsv4_mtp3_block_hc", -1);
+
+                    ggml_tensor * mtp3_embd = hc_head(mtp3_next_hc, mtp_hc_head_fn, mtp_hc_head_base,
+                                                      mtp_hc_head_scale, "dsv4_mtp3_block_hc_head");
+                    mtp3_embd               = build_norm(mtp3_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
+                    mtp3_embd               = as_f32(mtp3_embd);
+                    cb(mtp3_embd, "dsv4_mtp3_block_norm", -1);
+
+                    ggml_tensor * mtp3_logits = build_lora_mm(model.output, mtp3_embd);
+                    cb(mtp3_logits, "dsv4_mtp3_block_logits", -1);
+
+                    ggml_tensor * mtp3_top1 = ggml_argmax(ctx0, mtp3_logits);
+                    cb(mtp3_top1, "dsv4_mtp3_block_top1", -1);
+                    res->t_mtp_probe_top1_third = mtp3_top1;
+                    ggml_build_forward_expand(gf, mtp3_top1);
+                    ggml_build_forward_expand(gf, mtp3_top1);
+                }
+
                 ggml_build_forward_expand(gf, mtp2_top1);
             }
 
-            ggml_build_forward_expand(gf, mtp_top1);
+            if (mtp_top1 != nullptr) {
+                ggml_build_forward_expand(gf, mtp_top1);
+            }
         }
     }
 
-    cur = hc_head(hc_state, model.hc_head_fn, model.hc_head_base, model.hc_head_scale, "hc_head_out");
-    if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (res->t_mtp_state != nullptr) {
+        ggml_build_forward_expand(gf, res->t_mtp_state);
     }
-
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-    cur = as_f32(cur);
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    cur = build_lora_mm(model.output, cur);
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
+    if (mtp_target_top1 != nullptr) {
+        ggml_build_forward_expand(gf, mtp_target_top1);
+    }
+    ggml_build_forward_expand(gf, result_logits);
 }
