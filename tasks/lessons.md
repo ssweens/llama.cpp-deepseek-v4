@@ -224,3 +224,8 @@ I sanitized newly added runbook docs and the regression script's local DS4 path,
 
 ## 2026-05-09 — Avoid new speculative params when existing ones fit
 - Do not add new public speculative params/args/types for MTP unless the existing speculative interface cannot represent the need. Prefer existing draft/model/speculative params and keep architecture-specific MTP details internal to the implementation.
+
+## 2026-05-09 — Suspicious generation needs a target-only baseline
+- Do not describe MTP/probe output as safe or unchanged just because the code path is intended to be non-mutating. If the text looks corrupt, immediately compare against a target-only run with the exact same prompt/settings and keep the artifact.
+- Prefer one meaningful parity run over repeated tiny health checks once a corruption signal appears.
+- For DeepSeek4 runtime parity, use the mounted-code Docker sidecar/resident workflow (`llamatrifecta_deepseekv4:latest` + `/src/build-dsv4-container/bin/llama-server`) instead of host CPU-only server runs; host builds are compile checks, not runtime validation.

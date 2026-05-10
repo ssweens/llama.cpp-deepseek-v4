@@ -439,6 +439,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         ctx->clear_mtp_probe_state();
+        mtp_probe_preview_reset();
         prompt.tokens.clear();
     }
 
@@ -466,6 +467,24 @@ struct server_slot {
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+
+    // Probe-only DeepSeek4 MTP verifier preview. These counters do not affect sampling,
+    // target memory, private MTP raw cache, or emitted tokens.
+    llama_token mtp_probe_pending_draft1          = LLAMA_TOKEN_NULL;
+    llama_token mtp_probe_pending_draft2          = LLAMA_TOKEN_NULL;
+    int32_t     mtp_probe_preview_total           = 0;
+    int32_t     mtp_probe_preview_draft1_hits     = 0;
+    int32_t     mtp_probe_preview_draft2_eligible = 0;
+    int32_t     mtp_probe_preview_draft2_hits     = 0;
+
+    void mtp_probe_preview_reset() {
+        mtp_probe_pending_draft1          = LLAMA_TOKEN_NULL;
+        mtp_probe_pending_draft2          = LLAMA_TOKEN_NULL;
+        mtp_probe_preview_total           = 0;
+        mtp_probe_preview_draft1_hits     = 0;
+        mtp_probe_preview_draft2_eligible = 0;
+        mtp_probe_preview_draft2_hits     = 0;
+    }
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -500,6 +519,7 @@ struct server_slot {
 
         llama_set_sampler(ctx, id, nullptr);
         ctx->clear_mtp_probe_state();
+        mtp_probe_preview_reset();
 
         // clear alora start
         alora_invocation_start = -1;
@@ -748,6 +768,12 @@ struct server_slot {
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
+            }
+
+            if (mtp_probe_preview_total > 0) {
+                SLT_INF(*this, "dsv4 mtp verifier preview: draft1_hits=%d/%d draft2_hits=%d/%d\n",
+                        mtp_probe_preview_draft1_hits, mtp_probe_preview_total, mtp_probe_preview_draft2_hits,
+                        mtp_probe_preview_draft2_eligible);
             }
 
             reset();
@@ -3381,13 +3407,45 @@ private:
                     const llama_token target_argmax =
                         dsv4_force_greedy_tool_call ? id : sample_argmax_token(slot.ctx, tok_idx);
                     const llama_token mtp_probe_top1_next = slot.ctx->get_mtp_probe_top1_next();
+                    const bool        draft1_match        = target_argmax == mtp_probe_top1;
+
+                    bool prev_draft2_eligible = false;
+                    bool prev_draft2_match    = false;
+                    if (slot.mtp_probe_pending_draft1 != LLAMA_TOKEN_NULL &&
+                        slot.mtp_probe_pending_draft2 != LLAMA_TOKEN_NULL) {
+                        // The previous draft[2] is meaningful only if previous draft[1]
+                        // equals the actual token that entered this target decode step.
+                        prev_draft2_eligible = slot.mtp_probe_pending_draft1 == slot.sampled;
+                        prev_draft2_match    = prev_draft2_eligible && slot.mtp_probe_pending_draft2 == target_argmax;
+                    }
+
+                    slot.mtp_probe_preview_total++;
+                    if (draft1_match) {
+                        slot.mtp_probe_preview_draft1_hits++;
+                    }
+                    if (prev_draft2_eligible) {
+                        slot.mtp_probe_preview_draft2_eligible++;
+                        if (prev_draft2_match) {
+                            slot.mtp_probe_preview_draft2_hits++;
+                        }
+                    }
+
                     if (mtp_probe_top1_next != LLAMA_TOKEN_NULL) {
-                        SLT_INF(slot, "dsv4 mtp block probe: target_argmax=%d draft_top1=%d draft2_top1=%d match=%d\n",
-                                target_argmax, mtp_probe_top1, mtp_probe_top1_next, target_argmax == mtp_probe_top1);
+                        SLT_INF(slot,
+                                "dsv4 mtp block probe: target_argmax=%d draft_top1=%d draft2_top1=%d match=%d "
+                                "prev_draft2_eligible=%d prev_draft2_match=%d\n",
+                                target_argmax, mtp_probe_top1, mtp_probe_top1_next, draft1_match, prev_draft2_eligible,
+                                prev_draft2_match);
                     } else {
                         SLT_INF(slot, "dsv4 mtp block probe: target_argmax=%d draft_top1=%d match=%d\n", target_argmax,
-                                mtp_probe_top1, target_argmax == mtp_probe_top1);
+                                mtp_probe_top1, draft1_match);
                     }
+
+                    slot.mtp_probe_pending_draft1 = mtp_probe_top1;
+                    slot.mtp_probe_pending_draft2 = mtp_probe_top1_next;
+                } else {
+                    slot.mtp_probe_pending_draft1 = LLAMA_TOKEN_NULL;
+                    slot.mtp_probe_pending_draft2 = LLAMA_TOKEN_NULL;
                 }
 
                 slot.i_batch = -1;

@@ -252,6 +252,14 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 
 ## DeepSeek4 MTP loader/probe — `work/dsv4-mtp-loader-probe`
 
+### Immediate corruption triage
+- [x] Stop advancing verifier/commit work until generation corruption is explained.
+- [x] Compare real DeepSeek4 target-only output against `DSV4_MTP_PROBE=1 --spec-type mtp --model-draft ... --draft-max 2` for the exact same prompt/settings: both returned `"\n\t\t"` for raw `prompt="Hi"`, `n_predict=3`, `temperature=0`.
+- [x] If target-only is clean but MTP-probe is corrupt, disable MTP probe graph pieces in order (sidecar load only, HC/raw capture only, draft graph) to isolate the mutation. Not needed for the reported raw `"Hi"` signal because target-only matched the MTP-probe output.
+- [x] Since target-only also emits the same suspicious output for raw `"Hi"`, rerun through the expected chat/template path before calling the probe safe: Docker resident target-only and MTP-probe chat runs both returned content `"4"`, identical reasoning text, and identical token usage for `What is 2+2? Reply with only the number.`
+- [x] Use the resident Docker/mounted-code sidecar workflow from `../llama.cpp-deepseek-v4/tasks/dsv4_resident_bench_server.md` for DeepSeek4 runtime parity instead of host CPU-only ad hoc servers.
+- [x] Do not mark MTP probe safe based only on “emitted unchanged” claims without a target-only baseline artifact.
+
 ### Plan
 - [x] Download/stage `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` locally without modifying the target GGUFs: `/mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` (`3,807,602,400` bytes).
 - [x] Add default-off DeepSeek4 MTP validation/probe plumbing behind existing speculative flags: `--spec-type mtp`, `--model-draft <MTP.gguf>`, and `--draft-max`.
@@ -271,6 +279,7 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - [x] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
   - [x] Add an MTP-only recursive draft-2 probe that consumes target HC for draft[0], then sidecar HC plus draft[0] token for draft[1], without running target layers or changing emitted tokens.
   - [x] Capture recursive draft raw-row candidates as a host handoff for future accepted-token private raw-cache commit.
+  - [x] Add probe-only verifier preview accounting: compare draft[1] with current target argmax, and compare the previous step's draft[2] with current target argmax only when previous draft[1] matched the actual token that entered this step.
   - [ ] Generalize the recursive MTP probe beyond draft-2 if future validation shows value beyond DS4's production depth-two path.
   - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
@@ -286,5 +295,9 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Real DeepSeek4 IQ1_M + private raw-cache probe reached health after 94 seconds on an `n_predict=2` run and logged two probe rows, including continuation step `target_argmax=200 draft_top1=5 match=0` after consuming one private MTP raw-cache row.
 - Private MTP raw cache now stores prior rows only and caps at `raw_window - 1`, matching the graph's separate current-row concatenation and avoiding a future long-context `raw_window + 1` attention span.
 - Real DeepSeek4 IQ1_M + recursive MTP draft-2 probe (`--draft-max 2`) reached health after 80 seconds, returned `"\n\t"`, and logged `draft2_top1` without changing emitted tokens: first row `target_argmax=201 draft_top1=2390 draft2_top1=42`, continuation row `target_argmax=200 draft_top1=5 draft2_top1=23166`.
+- Real DeepSeek4 IQ1_M target-only baseline (`n_predict=3`, raw `prompt="Hi"`, `temperature=0`) returned `"\n\t\t"`, matching the verifier-preview MTP probe output exactly; this shows the suspicious raw-prompt output was not introduced by MTP, but also proves raw `"Hi"` is a poor safety prompt.
+- Real DeepSeek4 IQ1_M + verifier-preview probe (`--draft-max 2`, `n_predict=3`) reached health after 90 seconds, returned `"\n\t\t"`, and logged preview accounting summary `draft1_hits=0/3 draft2_hits=0/0` with no emitted-token changes relative to that raw-prompt target-only baseline.
+- Docker mounted-code runtime validation now uses `llamatrifecta_deepseekv4:latest` with `/home/bigkahuna/src/llama.cpp-dsv4-mtp-loader-probe:/src` and `build-dsv4-container/bin/llama-server`, matching the resident sidecar workflow instead of host CPU-only runtime checks.
+- Container target-only chat baseline (`/tmp/dsv4_mtp_docker_target_chat_resp.json`) and MTP-probe chat run (`/tmp/dsv4_mtp_docker_probe_chat_resp.json`) matched exactly on assistant content, reasoning text, finish reason, and usage. MTP probe log showed sidecar tensors loaded into `CUDA_Host` and preview accounting `draft1_hits=9/30 draft2_hits=1/10`.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.

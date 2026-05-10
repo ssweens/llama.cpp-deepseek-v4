@@ -170,6 +170,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - decode now copies both the target HC handoff and the sidecar block's output HC handoff, preparing recursive MTP draft probing;
 - when `--draft-max > 1`, the probe unrolls a second sidecar block in the same graph: draft[0] comes from target HC + current token, draft[1] comes from sidecar HC + draft[0] token, with no target-layer execution and no emitted-token changes;
 - the recursive block's raw K row is copied to host as a draft raw-row candidate for future accept-time private raw-cache commit; it is not appended to persistent raw state yet;
+- server logging keeps probe-only verifier-preview counters: draft[1] is compared with the current target argmax, while the previous step's draft[2] is compared with the current target argmax only if previous draft[1] matched the actual token that entered this target decode step;
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute; the host cache stores at most `raw_window - 1` prior rows because the graph concatenates the current row separately;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
@@ -204,6 +205,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Wire the draft-2 probe into the existing speculative verifier/checkpoint path while preserving deterministic no-MTP vs probe token streams.
+1. Convert the probe-only verifier preview into a controlled target verifier path that can test draft tokens through existing checkpoint/rollback without committing them by default.
 2. Add accept/reject accounting and commit only after the verifier path proves target state rollback/commit is exact.
 3. Do not enable speculative commit until deterministic no-MTP vs probe token streams match exactly.
