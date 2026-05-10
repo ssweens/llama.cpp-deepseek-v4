@@ -269,7 +269,8 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - [x] Trace DS4 authority MTP cache/state tensors and map them to llama.cpp DeepSeek4 graph tensors: the sidecar calls logical layer id 1, where `deepseek4_compress_ratios[1] == 0`, so private compressed/indexer drafter state is not required for the MTP block.
   - [x] Capture the MTP sidecar output HC state as a graph/context handoff for recursive draft probing.
   - [x] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
-  - [ ] Add an MTP-only recursive draft probe that consumes target HC for draft[0], then sidecar HC for draft[1..N], without running target layers or changing emitted tokens.
+  - [x] Add an MTP-only recursive draft-2 probe that consumes target HC for draft[0], then sidecar HC plus draft[0] token for draft[1], without running target layers or changing emitted tokens.
+  - [ ] Generalize the recursive MTP probe beyond draft-2 if future validation shows value beyond DS4's production depth-two path.
   - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
 - [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.
@@ -283,5 +284,6 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Real DeepSeek4 IQ1_M + raw-current MTP block probe reached health after 88 seconds and logged `dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0` on a one-token completion without changing emitted-token behavior.
 - Real DeepSeek4 IQ1_M + private raw-cache probe reached health after 94 seconds on an `n_predict=2` run and logged two probe rows, including continuation step `target_argmax=200 draft_top1=5 match=0` after consuming one private MTP raw-cache row.
 - Private MTP raw cache now stores prior rows only and caps at `raw_window - 1`, matching the graph's separate current-row concatenation and avoiding a future long-context `raw_window + 1` attention span.
+- Real DeepSeek4 IQ1_M + recursive MTP draft-2 probe (`--draft-max 2`) reached health after 80 seconds, returned `"\n\t"`, and logged `draft2_top1` without changing emitted tokens: first row `target_argmax=201 draft_top1=2390 draft2_top1=42`, continuation row `target_argmax=200 draft_top1=5 draft2_top1=23166`.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.

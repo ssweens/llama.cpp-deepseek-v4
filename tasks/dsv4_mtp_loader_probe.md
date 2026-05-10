@@ -132,6 +132,13 @@ dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0
 dsv4 mtp block probe: target_argmax=200 draft_top1=5 match=0
 ```
 
+After the recursive draft-2 probe was added and switched to `ggml_argmax` for stable graph-internal greedy token IDs, a `--draft-max 2` run reached health after 80 seconds, returned the same `"\n\t"`, and logged:
+
+```text
+dsv4 mtp block probe: target_argmax=201 draft_top1=2390 draft2_top1=42 match=0
+dsv4 mtp block probe: target_argmax=200 draft_top1=5 draft2_top1=23166 match=0
+```
+
 The smaller `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` target was rejected as corrupted/incomplete before MTP validation (`blk.4.ffn_down_exps.weight` out of file bounds), so the real probe used the valid IQ1_M target.
 
 Whitespaces:
@@ -161,6 +168,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
 - the graph computes a one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax;
 - decode now copies both the target HC handoff and the sidecar block's output HC handoff, preparing recursive MTP draft probing;
+- when `--draft-max > 1`, the probe unrolls a second sidecar block in the same graph: draft[0] comes from target HC + current token, draft[1] comes from sidecar HC + draft[0] token, with no target-layer execution and no emitted-token changes;
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute; the host cache stores at most `raw_window - 1` prior rows because the graph concatenates the current row separately;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
@@ -182,7 +190,8 @@ Important constraints for the next implementation:
 
 - The MTP block must not reuse or mutate target model KV/cache state. It now has a private host-backed raw-window cache analogous to DS4 authority's `mtp_raw_cache` / `mtp_n_raw`. The sidecar block is logical layer 1 and dense (`compress_ratio == 0`), so compressed/indexer state belongs to the target verifier checkpoint/rollback path, not the MTP drafter block.
 - The DS4 authority calls the MTP block with logical layer id `1`; the llama.cpp graph preserves that schedule for the current raw-one block probe.
-- The current block probe uses private raw-window attention only. Its top-1 log validates sidecar tensor loading, target HC handoff, sidecar attention/FFN graph wiring, private raw-cache handoff, graph outputs, and server logging, but it is not yet a complete speculative draft-quality metric.
+- The current block probe uses private raw-window attention only. Its top-1 log validates sidecar tensor loading, target HC handoff, sidecar attention/FFN graph wiring, private raw-cache handoff, recursive sidecar-HC handoff for draft-2, graph outputs, and server logging, but it is not yet a complete speculative draft-quality metric.
+- `ggml_argsort_top_k(k=1)` is fine as a disconnected probe output, but feeding it into a recursive MTP block perturbed the copied first top-1 on CPU. The recursive probe uses `ggml_argmax` instead, matching greedy backend sampling and preserving the draft[0] value seen in non-recursive probe mode.
 
 ## Next exact step
 
@@ -194,6 +203,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Add an MTP-only recursive draft probe that feeds draft[0] from target HC and draft[1..N] from captured sidecar HC state without running target layers or changing emitted tokens.
-2. Wire that probe into the existing speculative verifier/checkpoint path while preserving deterministic no-MTP vs probe token streams.
-3. Do not implement speculative commit until deterministic no-MTP vs probe token streams match exactly.
+1. Wire the draft-2 probe into the existing speculative verifier/checkpoint path while preserving deterministic no-MTP vs probe token streams.
+2. Add accept/reject accounting and commit only after the verifier path proves target state rollback/commit is exact.
+3. Do not enable speculative commit until deterministic no-MTP vs probe token streams match exactly.

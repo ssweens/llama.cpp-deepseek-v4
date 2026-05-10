@@ -808,9 +808,10 @@ void llm_graph_result::reset() {
     t_embd           = nullptr;
     t_embd_pooled     = nullptr;
     t_mtp_state       = nullptr;
-    t_mtp_next_state  = nullptr;
-    t_mtp_probe_top1  = nullptr;
-    t_mtp_raw_current = nullptr;
+    t_mtp_next_state      = nullptr;
+    t_mtp_probe_top1      = nullptr;
+    t_mtp_probe_top1_next = nullptr;
+    t_mtp_raw_current     = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -862,6 +863,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_mtp_probe_top1 != nullptr) {
         ggml_set_output(t_mtp_probe_top1);
+    }
+    if (t_mtp_probe_top1_next != nullptr) {
+        ggml_set_output(t_mtp_probe_top1_next);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -970,6 +974,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_tensors(params.mtp_tensors),
     mtp_raw_cache(params.mtp_raw_cache),
     mtp_n_raw(params.mtp_n_raw),
+    mtp_probe_draft_max(params.mtp_probe_draft_max),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),

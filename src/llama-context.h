@@ -75,6 +75,7 @@ struct llama_context {
     const std::vector<float> & get_mtp_next_state() const;
     const ggml_tensor *        get_mtp_tensor(const char * name) const;
     llama_token                get_mtp_probe_top1() const;
+    llama_token                get_mtp_probe_top1_next() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -101,7 +102,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
-    void set_mtp_probe(bool value);
+    void set_mtp_probe(bool value, uint32_t draft_max = 1);
     void clear_mtp_probe_state();
     bool load_dsv4_mtp_sidecar(const std::string & path, std::string & err);
 
@@ -298,7 +299,10 @@ private:
     // optional MTP probe state copied from model-specific handoff tensors for the last single-token decode graph
     std::vector<float> mtp_state;
     std::vector<float> mtp_next_state;
-    llama_token        mtp_probe_top1 = LLAMA_TOKEN_NULL;
+    llama_token        mtp_probe_top1      = LLAMA_TOKEN_NULL;
+    llama_token        mtp_probe_top1_next = LLAMA_TOKEN_NULL;
+
+    uint32_t mtp_probe_draft_max = 1;
 
     // private MTP probe raw-window cache, intentionally separate from target KV/cache state
     std::vector<float> mtp_raw_cache;

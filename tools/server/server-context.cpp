@@ -1111,7 +1111,7 @@ private:
             SRV_INF("validated DeepSeek4 MTP sidecar '%s' (draft=%d)\n", sidecar_model.c_str(),
                     params_base.speculative.n_max);
             const bool mtp_probe = server_env_truthy("DSV4_MTP_PROBE");
-            ctx->set_mtp_probe(mtp_probe);
+            ctx->set_mtp_probe(mtp_probe, (uint32_t) params_base.speculative.n_max);
             if (mtp_probe) {
                 std::string mtp_load_err;
                 if (!ctx->load_dsv4_mtp_sidecar(sidecar_model, mtp_load_err)) {
@@ -3380,8 +3380,14 @@ private:
                 if (mtp_probe_top1 != LLAMA_TOKEN_NULL) {
                     const llama_token target_argmax =
                         dsv4_force_greedy_tool_call ? id : sample_argmax_token(slot.ctx, tok_idx);
-                    SLT_INF(slot, "dsv4 mtp block probe: target_argmax=%d draft_top1=%d match=%d\n", target_argmax,
-                            mtp_probe_top1, target_argmax == mtp_probe_top1);
+                    const llama_token mtp_probe_top1_next = slot.ctx->get_mtp_probe_top1_next();
+                    if (mtp_probe_top1_next != LLAMA_TOKEN_NULL) {
+                        SLT_INF(slot, "dsv4 mtp block probe: target_argmax=%d draft_top1=%d draft2_top1=%d match=%d\n",
+                                target_argmax, mtp_probe_top1, mtp_probe_top1_next, target_argmax == mtp_probe_top1);
+                    } else {
+                        SLT_INF(slot, "dsv4 mtp block probe: target_argmax=%d draft_top1=%d match=%d\n", target_argmax,
+                                mtp_probe_top1, target_argmax == mtp_probe_top1);
+                    }
                 }
 
                 slot.i_batch = -1;

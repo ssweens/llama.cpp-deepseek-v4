@@ -233,6 +233,32 @@ private:
     std::vector<int32_t> values;
 };
 
+class dsv4_mtp_pos_offset_input : public llm_graph_input_i {
+  public:
+    dsv4_mtp_pos_offset_input(ggml_tensor * tensor, int32_t offset) : tensor(tensor), offset(offset) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(ubatch != nullptr && ubatch->pos != nullptr);
+        GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+        GGML_ASSERT(tensor->ne[0] == (int64_t) ubatch->n_tokens);
+
+        std::vector<int32_t> pos(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            pos[i] = (int32_t) (ubatch->pos[i] + offset);
+        }
+        ggml_backend_tensor_set(tensor, pos.data(), 0, pos.size() * ggml_element_size(tensor));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return tensor != nullptr && tensor->ne[0] == (int64_t) params.ubatch.n_tokens;
+    }
+
+  private:
+    ggml_tensor * tensor;
+    int32_t       offset;
+};
+
 class dsv4_mtp_raw_cache_input : public llm_graph_input_i {
   public:
     dsv4_mtp_raw_cache_input(ggml_tensor * tensor, const std::vector<float> * cache, uint32_t n_raw, int64_t row_size) :
@@ -2351,9 +2377,142 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_embd);
             cb(mtp_logits, "dsv4_mtp_block_logits", -1);
 
-            ggml_tensor * mtp_top1 = ggml_argsort_top_k(ctx0, mtp_logits, 1);
+            // Use argmax for recursive draft token IDs. argsort_top_k(k=1) is fine as a disconnected probe output,
+            // but feeding it into get_rows perturbs the copied first top-1 on CPU in this graph shape.
+            ggml_tensor * mtp_top1 = ggml_argmax(ctx0, mtp_logits);
             cb(mtp_top1, "dsv4_mtp_block_top1", -1);
             res->t_mtp_probe_top1 = mtp_top1;
+
+            if (mtp_probe_draft_max > 1) {
+                ggml_tensor * mtp_pos_next = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+                ggml_set_input(mtp_pos_next);
+                ggml_set_name(mtp_pos_next, "dsv4_mtp_pos_next");
+                res->add_input(std::make_unique<dsv4_mtp_pos_offset_input>(mtp_pos_next, 1));
+
+                ggml_tensor * mtp2_embed = ggml_get_rows(ctx0, model.tok_embd, mtp_top1);
+                mtp2_embed               = as_f32(mtp2_embed);
+                cb(mtp2_embed, "dsv4_mtp2_embed", -1);
+
+                ggml_tensor * mtp2_e = build_norm(mtp2_embed, mtp_enorm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_e               = mul_mat_checked(mtp_e_proj, mtp2_e, "mtp2.e_proj");
+                mtp2_e               = make_hc_state(mtp2_e);
+                cb(mtp2_e, "dsv4_mtp2_e_proj_hc", -1);
+
+                ggml_tensor * mtp2_h = build_norm(mtp_next_hc, mtp_hnorm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_h               = mul_mat_checked(mtp_h_proj, mtp2_h, "mtp2.h_proj");
+                cb(mtp2_h, "dsv4_mtp2_h_proj_hc", -1);
+
+                ggml_tensor * mtp2_block_hc = ggml_add(ctx0, mtp2_e, mtp2_h);
+                cb(mtp2_block_hc, "dsv4_mtp2_input_hc", -1);
+
+                hc_pre_result mtp2_attn_mix = hc_pre(mtp2_block_hc, mtp_hc_attn_fn, mtp_hc_attn_base, mtp_hc_attn_scale,
+                                                     "dsv4_mtp2_attn_hc_pre", -1);
+                ggml_tensor * mtp2_attn_inp =
+                    build_norm(as_f32(mtp2_attn_mix.collapsed), mtp_attn_norm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_attn_inp = as_f32(mtp2_attn_inp);
+                cb(mtp2_attn_inp, "dsv4_mtp2_attn_norm", -1);
+
+                ggml_tensor * mtp2_q_residual = mul_mat_checked(mtp_attn_q_a, mtp2_attn_inp, "mtp2.attn_q_a");
+                mtp2_q_residual               = as_f32(mtp2_q_residual);
+                mtp2_q_residual = build_norm(mtp2_q_residual, mtp_attn_q_a_norm, nullptr, LLM_NORM_RMS, -1);
+                cb(mtp2_q_residual, "dsv4_mtp2_attn_q_a_norm", -1);
+
+                ggml_tensor * mtp2_Qcur = mul_mat_checked(mtp_attn_q_b, mtp2_q_residual, "mtp2.attn_q_b");
+                mtp2_Qcur               = as_f32(mtp2_Qcur);
+                mtp2_Qcur               = ggml_reshape_3d(ctx0, mtp2_Qcur, n_embd_head, n_head, n_tokens);
+                mtp2_Qcur               = ggml_rms_norm(ctx0, mtp2_Qcur, hparams.f_norm_rms_eps);
+                mtp2_Qcur = apply_partial_rope_with_pos(mtp2_Qcur, mtp_pos_next, mtp_rope_cfg, /*inverse=*/false);
+                cb(mtp2_Qcur, "dsv4_mtp2_attn_q_roped", -1);
+
+                ggml_tensor * mtp2_Kcur = mul_mat_checked(mtp_attn_kv, mtp2_attn_inp, "mtp2.attn_kv");
+                mtp2_Kcur               = as_f32(mtp2_Kcur);
+                mtp2_Kcur               = build_norm(mtp2_Kcur, mtp_attn_kv_norm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_Kcur               = ggml_reshape_3d(ctx0, mtp2_Kcur, n_embd_head, 1, n_tokens);
+                mtp2_Kcur = apply_partial_rope_with_pos(mtp2_Kcur, mtp_pos_next, mtp_rope_cfg, /*inverse=*/false);
+                mtp2_Kcur = as_f32(mtp2_Kcur);
+                mtp2_Kcur = apply_fp8_qat_nope_2d(mtp2_Kcur, "dsv4_mtp2_attn_kv_qat", -1);
+                cb(mtp2_Kcur, "dsv4_mtp2_attn_kv", -1);
+
+                ggml_tensor * mtp2_raw_kv = ggml_concat(ctx0, mtp_raw_kv, mtp2_Kcur, 2);
+                cb(mtp2_raw_kv, "dsv4_mtp2_raw_kv", -1);
+
+                ggml_tensor * mtp2_attn_out = build_attn_mha(mtp2_Qcur, mtp2_raw_kv, mtp2_raw_kv, nullptr, nullptr,
+                                                             mtp_attn_sinks, nullptr, kq_scale, -1,
+                                                             /*force_no_flash_attn=*/true);
+                mtp2_attn_out               = as_f32(mtp2_attn_out);
+                cb(mtp2_attn_out, "dsv4_mtp2_attn_out_raw", -1);
+
+                mtp2_attn_out = ggml_reshape_3d(ctx0, mtp2_attn_out, n_embd_head, n_head, n_tokens);
+                mtp2_attn_out = apply_partial_rope_with_pos(mtp2_attn_out, mtp_pos_next, mtp_rope_cfg,
+                                                            /*inverse=*/true);
+                cb(mtp2_attn_out, "dsv4_mtp2_attn_out_unrope", -1);
+
+                {
+                    const int64_t n_groups    = hparams.n_o_groups;
+                    const int64_t group_dim   = n_embd_head * (n_head / n_groups);
+                    const int64_t o_lora_rank = mtp_attn_out_a->ne[1] / n_groups;
+                    GGML_ASSERT(n_head % n_groups == 0);
+                    GGML_ASSERT(grouped_out_ids != nullptr);
+
+                    ggml_tensor * o      = cont_if_needed(ctx0, mtp2_attn_out);
+                    o                    = ggml_reshape_3d(ctx0, o, group_dim, n_groups, n_tokens);
+                    ggml_tensor * wo_a_g = ggml_reshape_3d(ctx0, mtp_attn_out_a, group_dim, o_lora_rank, n_groups);
+                    mtp2_attn_out        = ggml_mul_mat_id(ctx0, wo_a_g, o, grouped_out_ids);
+                    mtp2_attn_out        = ggml_reshape_2d(ctx0, mtp2_attn_out, o_lora_rank * n_groups, n_tokens);
+                }
+                mtp2_attn_out = as_f32(mtp2_attn_out);
+                cb(mtp2_attn_out, "dsv4_mtp2_attn_o_a", -1);
+
+                mtp2_attn_out = mul_mat_checked(mtp_attn_out_b, mtp2_attn_out, "mtp2.attn_o_b");
+                mtp2_attn_out = as_f32(mtp2_attn_out);
+                cb(mtp2_attn_out, "dsv4_mtp2_attn_o_b", -1);
+
+                ggml_tensor * mtp2_attn_state = hc_post(mtp2_attn_out, mtp2_block_hc, mtp2_attn_mix.post,
+                                                        mtp2_attn_mix.comb, "dsv4_mtp2_attn_hc_post", -1);
+
+                hc_pre_result mtp2_ffn_mix = hc_pre(mtp2_attn_state, mtp_hc_ffn_fn, mtp_hc_ffn_base, mtp_hc_ffn_scale,
+                                                    "dsv4_mtp2_ffn_hc_pre", -1);
+                ggml_tensor * mtp2_ffn_inp =
+                    build_norm(as_f32(mtp2_ffn_mix.collapsed), mtp_ffn_norm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_ffn_inp = as_f32(mtp2_ffn_inp);
+                cb(mtp2_ffn_inp, "dsv4_mtp2_ffn_norm", -1);
+
+                ggml_tensor * mtp2_moe_out = build_moe_ffn(
+                    mtp2_ffn_inp, mtp_ffn_gate_inp, mtp_ffn_up_exps, mtp_ffn_gate_exps, mtp_ffn_down_exps,
+                    mtp_exp_probs_b, n_expert, n_expert_used, LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale, (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
+                mtp2_moe_out = as_f32(mtp2_moe_out);
+                cb(mtp2_moe_out, "dsv4_mtp2_ffn_moe_out", -1);
+
+                ggml_tensor * mtp2_shexp_out =
+                    build_ffn(mtp2_ffn_inp, mtp_ffn_up_shexp, nullptr, nullptr, mtp_ffn_gate_shexp, nullptr, nullptr,
+                              mtp_ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
+                mtp2_shexp_out = as_f32(mtp2_shexp_out);
+                cb(mtp2_shexp_out, "dsv4_mtp2_ffn_shexp_out", -1);
+
+                ggml_tensor * mtp2_ffn_out = ggml_add(ctx0, mtp2_moe_out, mtp2_shexp_out);
+                mtp2_ffn_out               = as_f32(mtp2_ffn_out);
+                cb(mtp2_ffn_out, "dsv4_mtp2_ffn_out", -1);
+
+                ggml_tensor * mtp2_next_hc = hc_post(mtp2_ffn_out, mtp2_attn_state, mtp2_ffn_mix.post,
+                                                     mtp2_ffn_mix.comb, "dsv4_mtp2_ffn_hc_post", -1);
+                cb(mtp2_next_hc, "dsv4_mtp2_block_hc", -1);
+
+                ggml_tensor * mtp2_embd = hc_head(mtp2_next_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale,
+                                                  "dsv4_mtp2_block_hc_head");
+                mtp2_embd               = build_norm(mtp2_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
+                mtp2_embd               = as_f32(mtp2_embd);
+                cb(mtp2_embd, "dsv4_mtp2_block_norm", -1);
+
+                ggml_tensor * mtp2_logits = build_lora_mm(model.output, mtp2_embd);
+                cb(mtp2_logits, "dsv4_mtp2_block_logits", -1);
+
+                ggml_tensor * mtp2_top1 = ggml_argmax(ctx0, mtp2_logits);
+                cb(mtp2_top1, "dsv4_mtp2_block_top1", -1);
+                res->t_mtp_probe_top1_next = mtp2_top1;
+                ggml_build_forward_expand(gf, mtp2_top1);
+            }
+
             ggml_build_forward_expand(gf, mtp_top1);
         }
     }

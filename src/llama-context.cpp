@@ -847,6 +847,10 @@ llama_token llama_context::get_mtp_probe_top1() const {
     return mtp_probe_top1;
 }
 
+llama_token llama_context::get_mtp_probe_top1_next() const {
+    return mtp_probe_top1_next;
+}
+
 llama_token * llama_context::get_sampled_tokens()  const{
     return sampling.sampled.data;
 }
@@ -1086,14 +1090,16 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
-void llama_context::set_mtp_probe(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+void llama_context::set_mtp_probe(bool value, uint32_t draft_max) {
+    draft_max = std::max<uint32_t>(1, draft_max);
+    LLAMA_LOG_DEBUG("%s: value = %d, draft_max = %u\n", __func__, value, draft_max);
 
-    if (mtp_probe == value) {
+    if (mtp_probe == value && mtp_probe_draft_max == draft_max) {
         return;
     }
 
-    mtp_probe = value;
+    mtp_probe           = value;
+    mtp_probe_draft_max = draft_max;
     clear_mtp_probe_state();
     sched_need_reserve = true;
 }
@@ -1105,7 +1111,8 @@ void llama_context::clear_mtp_probe_state() {
     mtp_raw_cache.clear();
     mtp_state.clear();
     mtp_next_state.clear();
-    mtp_probe_top1 = LLAMA_TOKEN_NULL;
+    mtp_probe_top1      = LLAMA_TOKEN_NULL;
+    mtp_probe_top1_next = LLAMA_TOKEN_NULL;
 }
 
 bool llama_context::load_dsv4_mtp_sidecar(const std::string & path, std::string & err) {
@@ -1980,6 +1987,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             mtp_probe_top1 = LLAMA_TOKEN_NULL;
         }
 
+        if (auto * t_mtp_top1_next = res->get_mtp_probe_top1_next()) {
+            GGML_ASSERT(t_mtp_top1_next->type == GGML_TYPE_I32);
+            ggml_backend_t backend_top1_next = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_top1_next);
+            GGML_ASSERT(backend_top1_next != nullptr);
+
+            mtp_probe_top1_next = LLAMA_TOKEN_NULL;
+            ggml_backend_tensor_get_async(backend_top1_next, t_mtp_top1_next, &mtp_probe_top1_next, 0,
+                                          sizeof(mtp_probe_top1_next));
+        } else {
+            mtp_probe_top1_next = LLAMA_TOKEN_NULL;
+        }
+
         if (auto * t_mtp_raw_current = res->get_mtp_raw_current()) {
             GGML_ASSERT(t_mtp_raw_current->type == GGML_TYPE_F32);
             GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.n_seq_id[0] == 1 && ubatch.pos != nullptr &&
@@ -2376,10 +2395,11 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
-        /*.mtp_probe     =*/mtp_probe,
-        /*.mtp_tensors   =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
-        /*.mtp_raw_cache =*/&mtp_raw_cache,
-        /*.mtp_n_raw     =*/mtp_n_raw,
+        /*.mtp_probe           =*/mtp_probe,
+        /*.mtp_tensors         =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
+        /*.mtp_raw_cache       =*/&mtp_raw_cache,
+        /*.mtp_n_raw           =*/mtp_n_raw,
+        /*.mtp_probe_draft_max =*/mtp_probe_draft_max,
         /*.samplers      =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
