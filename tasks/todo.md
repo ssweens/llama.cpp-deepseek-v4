@@ -400,7 +400,7 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Run `scripts/dsv4_regression.py` per `../llama.cpp-deepseek-v4/tasks/dsv4_regression_handoff.md` with the tool replay fixture and `--max-tokens 2048`.
 - [x] Run a target-only comparison to separate default-server regressions from MTP-enabled regressions.
 - [x] Record pass/fail details, stop the ad hoc server, and verify GPUs are idle.
-- [ ] Before decode-speed work, decide whether MTP-enabled tool-call regressions must be fixed now or explicitly scoped out of speed benchmarking.
+- [x] Before decode-speed work, decide whether MTP-enabled tool-call regressions must be fixed now or explicitly scoped out of speed benchmarking: fix now, because the same restored-frontier path is prerequisite for safe draft-depth speedups.
 
 ### Review
 - Default/target-only mounted-code IQ2_XXS regression passed all 7 checks. Artifact: `/tmp/dsv4_iq2xxs_target_regression.out`; server log: `/tmp/dsv4_iq2xxs_target_regression_server.log`.
@@ -409,3 +409,19 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - Retry MTP run: 6/7 passed; `tool_replay_turn02_stream` failed with prose text instead of structured `tool_calls`, while the repeated cache-reuse check passed. Artifact: `/tmp/dsv4_iq2xxs_mtp_regression_retry.out`; server log: `/tmp/dsv4_iq2xxs_mtp_regression_retry_server.log`.
 - The MTP failures occurred on long tool replay requests after prompt-cache/checkpoint restore (`cached_tokens=1408` path), not on the cold non-stream replay. This points at MTP speculative verifier/state interaction around restored DS4 frontiers, not a default parser/server regression.
 - All ad hoc regression containers were stopped and GPUs returned to idle (`2 MiB`, `2 MiB`, `1 MiB`).
+
+## DeepSeek4 MTP restored-frontier regression fix (2026-05-10)
+
+### Plan
+- [x] Reproduce the failing MTP long tool replay with a narrow harness and trace slot/prompt-cache transitions around restored checkpoints.
+- [x] Audit MTP private state lifecycle on `prompt_load`, checkpoint restore, prompt-cache reuse, and `llama_memory_seq_rm`; target state can be restored/truncated without rebuilding private MTP raw/HC state, and DS4 structured tool-call parsing exposed small verifier-batch divergences after restored prompt-cache frontiers.
+- [x] Implement the smallest safe fix: clear MTP private state on prompt-cache load, checkpoint restore, and prompt truncation; additionally skip speculative MTP for structured tool-call parsing requests until exact verifier/frontier handling exists for those workloads.
+- [x] Rebuild mounted Docker `llama-server` and rerun target-only plus MTP-enabled IQ2_XXS regression suite.
+- [x] Rerun standard `llama-benchy pp2048 tg32` to quantify speed impact, then proceed to `--draft-max 2` verifier/frontier speed work.
+
+### Review
+- Mounted Docker build passed after the server-context guard/reset changes: `cmake --build build-dsv4-container --target llama-server -j 8`.
+- MTP-enabled regression with tool-call guard passed all 7 checks. Artifact: `/tmp/dsv4_iq2xxs_mtp_regression_toolguard.out`; server log: `/tmp/dsv4_iq2xxs_mtp_regression_toolguard_server.log`.
+- Target-only regression was flaky on the first post-change run but passed all 7 on retry. Passing artifact: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry.out`; server log: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry_server.log`. Failed first-run artifact kept as `/tmp/dsv4_iq2xxs_target_regression_after_toolguard.out` for comparison.
+- Post-fix MTP `llama-benchy pp2048 tg32 --runs 3` passed coherence and measured pp2048 `405.28 ± 2.26 tok/s`, tg32 `30.65 ± 0.94 tok/s`, preserving the previous draft-max-1 decode win. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_pp2048_tg32_runs3.json`; server log: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_server.log`.
+- Tool workloads are now target-only under an MTP-enabled server. This is an explicit safety scope guard, not the final verifier solution; exact DS4 verifier/frontier work is still required before enabling MTP for structured tool-call parsing and before expecting large draft-depth speedups.

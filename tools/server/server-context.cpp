@@ -194,6 +194,8 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
+        ctx->clear_mtp_probe_state();
+        mtp_probe_preview_reset();
         return res;
     }
 
@@ -356,6 +358,16 @@ struct server_slot {
 
     bool can_speculate() const { return !!spec; }
 
+    bool can_speculate_for_task() const {
+        if (!can_speculate()) {
+            return false;
+        }
+        // DS4 structured tool-call parsing is state-sensitive and currently exposes
+        // small verifier-batch MTP divergences on restored prompt-cache frontiers.
+        // Keep tool workloads target-only until the exact DS4 verifier/frontier path is implemented.
+        return !(task && task->params.chat_parser_params.parse_tool_calls);
+    }
+
     void dsv4_update_tool_state(const std::string & piece) {
         if (piece.empty()) {
             return;
@@ -417,7 +429,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!can_speculate_for_task()) {
             return 0;
         }
 
@@ -445,7 +457,7 @@ struct server_slot {
     void update_batch(llama_batch & batch) {
         const int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0) {
-            GGML_ASSERT(can_speculate());
+            GGML_ASSERT(can_speculate_for_task());
 
             const auto & params_spec = task->params.speculative;
 
@@ -2710,6 +2722,8 @@ private:
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                             n_past = clamp_dsv4_n_past(n_past, "checkpoint restore");
                                             pos_next = slot.prompt.tokens.pos_next(n_past);
+                                            ctx->clear_mtp_probe_state();
+                                            slot.mtp_probe_preview_reset();
                                             SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
                                         }
                                     }
@@ -2776,6 +2790,9 @@ private:
 
                         // there is no common part left
                         slot.n_prompt_tokens_cache = 0;
+                    } else {
+                        ctx->clear_mtp_probe_state();
+                        slot.mtp_probe_preview_reset();
                     }
 
                     // If using an alora, there may be uncached tokens that come

@@ -257,6 +257,7 @@ I sanitized newly added runbook docs and the regression script's local DS4 path,
 ## 2026-05-10 — Scope performance corrections exactly
 - When the user says “prefill during MTP,” do not broaden it to general model prefill. Isolate the MTP path’s own setup/draft/prefill work and compare that against target decode cost before changing unrelated prompt-prefill code.
 - For DeepSeek4 MTP speed, separate three costs before changing behavior: sidecar draft graph cost, target verifier batch cost, and partial-accept replay cost. Accepted drafts can still slow decode if DS4 verifier batches (`n_tokens=2/3`) are slower per visible token than target-only one-token decode.
+- Treat prompt-cache/checkpoint restore as a target-state discontinuity for any private speculative sidecar state. If exact sidecar-state restoration is not implemented, clear private MTP raw/HC state at restore/truncation boundaries and keep structured tool-call workloads target-only until verifier exactness is proven.
 
 ## 2026-05-09 — Re-ground DeepSeek4 MTP fixes in references
 - When the user says to use the references, pause implementation and re-read the authoritative DeepSeek4 MTP loop in `/home/bigkahuna/src/ds4` plus the upstream speculative/MTP PR before changing behavior.
