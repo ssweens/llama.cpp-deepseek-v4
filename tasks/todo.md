@@ -263,10 +263,13 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Add an env-gated DeepSeek4 MTP projection/top-1 probe that feeds base token embedding + captured target HC state through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs probe top-1 vs target argmax without changing emitted tokens.
 - [x] Validate real DeepSeek4 target + MTP sidecar startup/projection probe on IQ1_M CPU-only target; fix CPU BF16 RHS matmul compatibility and explicitly connect probe top-1 graph outputs.
 - [x] Build a raw-current one-token MTP transformer block probe with sidecar attention/FFN/HC tensors and logical layer-1 RoPE, without mutating target KV/cache state.
-- [ ] Add persistent private MTP raw/compressed/indexer cache state before using block-probe output as a real speculative draft.
+- [ ] Add persistent private MTP drafter state and target verifier frontier handling before using block-probe output as a real speculative draft.
   - [x] Start with a private raw-window cache (`mtp_raw_cache`/`mtp_n_raw` equivalent) owned by `llama_context`, separate from target KV/cache.
   - [x] Feed the one-token MTP block from that private raw cache instead of current-token-only raw attention on continuation steps.
-  - [ ] Add private compressed/indexer cache state for long-context parity with DS4 authority.
+  - [x] Trace DS4 authority MTP cache/state tensors and map them to llama.cpp DeepSeek4 graph tensors: the sidecar calls logical layer id 1, where `deepseek4_compress_ratios[1] == 0`, so private compressed/indexer drafter state is not required for the MTP block.
+  - [x] Capture the MTP sidecar output HC state as a graph/context handoff for recursive draft probing.
+  - [ ] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
+  - [ ] Add an MTP-only recursive draft probe that consumes target HC for draft[0], then sidecar HC for draft[1..N], without running target layers or changing emitted tokens.
   - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
 - [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.

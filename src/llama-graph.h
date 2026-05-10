@@ -653,6 +653,8 @@ public:
 
     ggml_tensor * get_mtp_state() const { return t_mtp_state; }
 
+    ggml_tensor * get_mtp_next_state() const { return t_mtp_next_state; }
+
     ggml_tensor * get_mtp_probe_top1() const { return t_mtp_probe_top1; }
 
     ggml_tensor * get_mtp_raw_current() const { return t_mtp_raw_current; }
@@ -685,6 +687,7 @@ public:
     ggml_tensor * t_embd              = nullptr;
     ggml_tensor * t_embd_pooled       = nullptr;
     ggml_tensor * t_mtp_state         = nullptr;
+    ggml_tensor * t_mtp_next_state    = nullptr;
     ggml_tensor * t_mtp_probe_top1    = nullptr;
     ggml_tensor * t_mtp_raw_current   = nullptr;
 

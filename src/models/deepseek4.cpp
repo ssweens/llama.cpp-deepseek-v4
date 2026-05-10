@@ -2229,9 +2229,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(mtp_block_hc, "dsv4_mtp_input_hc", -1);
 
             // DS4 calls the single MTP sidecar block with logical layer id 1. For DeepSeek4
-            // this is a dense/raw-only attention layer (compress_ratio == 0), which lets this
-            // first full-block probe avoid mutating target KV/cache state. Private persistent
-            // MTP raw/compressed/indexer state is still required before speculative commit.
+            // this is a dense/raw-only attention layer (compress_ratio == 0), so the sidecar
+            // drafter needs private raw-window state but no private compressed/indexer state.
+            // Target verifier compressed/indexer frontier rollback is a separate commit path.
             const uint32_t mtp_logical_il     = 1;
             const uint32_t mtp_compress_ratio = hparams.deepseek4_compress_ratios[mtp_logical_il];
             GGML_ASSERT(mtp_compress_ratio == 0);
@@ -2340,6 +2340,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * mtp_next_hc =
                 hc_post(mtp_ffn_out, mtp_attn_state, mtp_ffn_mix.post, mtp_ffn_mix.comb, "dsv4_mtp_ffn_hc_post", -1);
             cb(mtp_next_hc, "dsv4_mtp_block_hc", -1);
+            res->t_mtp_next_state = mtp_next_hc;
 
             ggml_tensor * mtp_embd =
                 hc_head(mtp_next_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale, "dsv4_mtp_block_hc_head");

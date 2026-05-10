@@ -160,10 +160,11 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - DeepSeek4 marks the final per-token `hc_state` as generic MTP state output only for `n_tokens == 1 && n_outputs == 1` graphs, avoiding prompt-prefill HC output blowups;
 - decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
 - the graph computes a one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax;
+- decode now copies both the target HC handoff and the sidecar block's output HC handoff, preparing recursive MTP draft probing;
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
-This is intentionally still a handoff/probe surface. It does not alter emitted tokens. Private compressed/indexer state and speculative verification/commit are still required before this can become a real speculative drafter.
+This is intentionally still a handoff/probe surface. It does not alter emitted tokens. DS4 authority confirmed the MTP sidecar uses logical layer id 1, whose DeepSeek4 compression ratio is zero, so the sidecar drafter itself needs private raw-window and HC state, not private compressed/indexer state. Target compressed/indexer frontier rollback still has to be verified through existing hybrid-ISWA state checkpoints before speculative verification/commit can be enabled.
 
 ## Full-block design notes
 
@@ -179,7 +180,7 @@ The DS4 authority path (`metal_graph_eval_mtp_draft_from_hc`) shows the full MTP
 
 Important constraints for the next implementation:
 
-- The MTP block must not reuse or mutate target model KV/cache state. It now has a private host-backed raw-window cache analogous to DS4 authority's `mtp_raw_cache` / `mtp_n_raw`, and still needs private compressed/indexer state for later long-context parity.
+- The MTP block must not reuse or mutate target model KV/cache state. It now has a private host-backed raw-window cache analogous to DS4 authority's `mtp_raw_cache` / `mtp_n_raw`. The sidecar block is logical layer 1 and dense (`compress_ratio == 0`), so compressed/indexer state belongs to the target verifier checkpoint/rollback path, not the MTP drafter block.
 - The DS4 authority calls the MTP block with logical layer id `1`; the llama.cpp graph preserves that schedule for the current raw-one block probe.
 - The current block probe uses private raw-window attention only. Its top-1 log validates sidecar tensor loading, target HC handoff, sidecar attention/FFN graph wiring, private raw-cache handoff, graph outputs, and server logging, but it is not yet a complete speculative draft-quality metric.
 
@@ -193,6 +194,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Add private compressed/indexer cache/state handling for MTP long-context parity with the DS4 authority path.
-2. Under `DSV4_MTP_PROBE=1`, compare compressed/indexer-capable draft top-1 against the current raw-window block top-1 and target argmax without changing emitted tokens.
+1. Verify target verifier checkpoint/rollback covers DeepSeek4 compressed/indexer frontiers by exercising existing hybrid-ISWA state save/restore around speculative suffix probes.
+2. Add an MTP-only recursive draft probe that feeds draft[0] from target HC and draft[1..N] from captured sidecar HC state without running target layers or changing emitted tokens.
 3. Do not implement speculative commit until deterministic no-MTP vs probe token streams match exactly.

@@ -830,6 +830,10 @@ const std::vector<float> & llama_context::get_mtp_state() const {
     return mtp_state;
 }
 
+const std::vector<float> & llama_context::get_mtp_next_state() const {
+    return mtp_next_state;
+}
+
 const ggml_tensor * llama_context::get_mtp_tensor(const char * name) const {
     if (!dsv4_mtp_sidecar) {
         return nullptr;
@@ -1099,6 +1103,9 @@ void llama_context::clear_mtp_probe_state() {
     mtp_raw_seq_id   = -1;
     mtp_raw_last_pos = -1;
     mtp_raw_cache.clear();
+    mtp_state.clear();
+    mtp_next_state.clear();
+    mtp_probe_top1 = LLAMA_TOKEN_NULL;
 }
 
 bool llama_context::load_dsv4_mtp_sidecar(const std::string & path, std::string & err) {
@@ -1947,6 +1954,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                           ggml_nbytes(t_mtp_state));
         } else {
             mtp_state.clear();
+        }
+
+        if (auto * t_mtp_next_state = res->get_mtp_next_state()) {
+            GGML_ASSERT(t_mtp_next_state->type == GGML_TYPE_F32);
+            ggml_backend_t backend_mtp_next_state =
+                ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_next_state);
+            GGML_ASSERT(backend_mtp_next_state != nullptr);
+
+            mtp_next_state.resize(ggml_nelements(t_mtp_next_state));
+            ggml_backend_tensor_get_async(backend_mtp_next_state, t_mtp_next_state, mtp_next_state.data(), 0,
+                                          ggml_nbytes(t_mtp_next_state));
+        } else {
+            mtp_next_state.clear();
         }
 
         if (auto * t_mtp_top1 = res->get_mtp_probe_top1()) {

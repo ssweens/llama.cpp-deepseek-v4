@@ -806,8 +806,9 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits         = nullptr;
     t_embd           = nullptr;
-    t_embd_pooled    = nullptr;
+    t_embd_pooled     = nullptr;
     t_mtp_state       = nullptr;
+    t_mtp_next_state  = nullptr;
     t_mtp_probe_top1  = nullptr;
     t_mtp_raw_current = nullptr;
     t_sampled.clear();
@@ -855,6 +856,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_mtp_state != nullptr) {
         ggml_set_output(t_mtp_state);
+    }
+    if (t_mtp_next_state != nullptr) {
+        ggml_set_output(t_mtp_next_state);
     }
     if (t_mtp_probe_top1 != nullptr) {
         ggml_set_output(t_mtp_probe_top1);
