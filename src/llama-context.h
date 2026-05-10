@@ -73,6 +73,7 @@ struct llama_context {
 
     const std::vector<float> & get_dsv4_mtp_hc_state() const;
     const ggml_tensor *        get_dsv4_mtp_tensor(const char * name) const;
+    llama_token                get_dsv4_mtp_probe_top1() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -294,6 +295,7 @@ private:
 
     // optional DeepSeek4 MTP probe state copied from the final HC tensor for the last single-token decode graph
     std::vector<float> dsv4_mtp_hc_state;
+    llama_token        dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
 
     struct dsv4_mtp_sidecar_data {
         gguf_context_ptr                               ctx_gguf;

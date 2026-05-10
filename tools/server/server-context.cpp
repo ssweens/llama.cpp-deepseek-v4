@@ -3367,6 +3367,14 @@ private:
                     id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
                 }
 
+                const llama_token mtp_probe_top1 = slot.ctx->get_dsv4_mtp_probe_top1();
+                if (mtp_probe_top1 != LLAMA_TOKEN_NULL) {
+                    const llama_token target_argmax =
+                        dsv4_force_greedy_tool_call ? id : sample_argmax_token(slot.ctx, tok_idx);
+                    SLT_INF(slot, "dsv4 mtp projection probe: target_argmax=%d projection_top1=%d match=%d\n",
+                            target_argmax, mtp_probe_top1, target_argmax == mtp_probe_top1);
+                }
+
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);

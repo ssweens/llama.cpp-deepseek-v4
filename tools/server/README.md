@@ -238,7 +238,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `-ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `-md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_MODEL_DRAFT) |
-| `--mtp-model FNAME` | DeepSeek4 MTP support sidecar GGUF for future speculative decoding. Startup validates the sidecar only; `DSV4_MTP_PROBE=1` additionally loads tensor data and captures final HC state for probing. Runtime drafting remains disabled. (default: unused)<br/>(env: LLAMA_ARG_MTP_MODEL) |
+| `--mtp-model FNAME` | DeepSeek4 MTP support sidecar GGUF for future speculative decoding. Startup validates the sidecar only; `DSV4_MTP_PROBE=1` additionally loads tensor data, captures final HC state, and logs a projection-only top-1 probe. Runtime drafting remains disabled. (default: unused)<br/>(env: LLAMA_ARG_MTP_MODEL) |
 | `--mtp-draft N` | maximum DeepSeek4 MTP draft tokens per speculative step (default: 1)<br/>(env: LLAMA_ARG_MTP_DRAFT) |
 | `--spec-replace TARGET DRAFT` | translate the string in TARGET into DRAFT if the draft model and main model are not compatible |
 | `--spec-type [none\|ngram-cache\|ngram-simple\|ngram-map-k\|ngram-map-k4v\|ngram-mod]` | type of speculative decoding to use when no draft model is provided (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |

@@ -14,7 +14,8 @@ Date: 2026-05-09
 - Added a default-off DeepSeek4 final-HC output hook for one-token decode graphs.
 - Added a host-side copy buffer for that final HC state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
-- Kept runtime MTP drafting/speculative commit disabled. Passing `--mtp-model` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state capture plumbing.
+- Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
+- Kept runtime MTP drafting/speculative commit disabled. Passing `--mtp-model` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state/projection probe plumbing.
 - Documented the new server flags in `tools/server/README.md`.
 
 ## Staged sidecar
@@ -106,7 +107,7 @@ Note: whole-file `clang-format --dry-run` on `tools/server/server-context.cpp` r
 
 ## Not implemented yet
 
-- No MTP graph.
+- No full MTP transformer-block graph.
 - No draft token generation.
 - No speculative verification/commit.
 
@@ -118,9 +119,10 @@ When a valid DeepSeek4 target is loaded with `--mtp-model` and `DSV4_MTP_PROBE=1
 - server startup sets a private context probe flag;
 - graph reuse accounts for that flag;
 - DeepSeek4 marks the final per-token `hc_state` as an output only for `n_tokens == 1 && n_outputs == 1` graphs, avoiding prompt-prefill HC output blowups;
-- decode copies that F32 HC state into `llama_context::get_dsv4_mtp_hc_state()`.
+- decode copies that F32 HC state into `llama_context::get_dsv4_mtp_hc_state()`;
+- the graph computes a projection-only top-1 through the sidecar input projections and sidecar output head, and the server logs it against the target argmax.
 
-This is intentionally only a handoff/probe surface. It does not alter emitted tokens or run the MTP sidecar graph.
+This is intentionally only a handoff/probe surface. It does not alter emitted tokens and does not run the one-layer MTP transformer block yet, so the logged projection top-1 is not a speculative draft token.
 
 ## Next exact step
 
@@ -132,10 +134,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Build a one-token MTP graph that consumes:
-   - base token embedding;
-   - target final HC state;
-   - sidecar `enorm/e_proj`, `hnorm/h_proj`, one MTP block, sidecar `hc_head_*`, sidecar `norm`;
-   - base output projection.
-2. Under `DSV4_MTP_PROBE=1`, log draft top-1 and compare it against the next target argmax without changing emitted tokens.
+1. Build the missing one-token MTP transformer-block graph and its private cache/state handling between the now-working sidecar input projection and sidecar output head.
+2. Under `DSV4_MTP_PROBE=1`, log full draft top-1 and compare it against the target argmax without changing emitted tokens.
 3. Do not implement speculative commit until deterministic no-MTP vs probe token streams match exactly.

@@ -2125,6 +2125,59 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         ggml_tensor * mtp_hc_state = as_f32(hc_state);
         cb(mtp_hc_state, "dsv4_mtp_hc_state", -1);
         res->t_dsv4_mtp_hc_state = mtp_hc_state;
+
+        auto mtp_tensor = [&](const char * name) -> ggml_tensor * {
+            if (dsv4_mtp_tensors == nullptr) {
+                return nullptr;
+            }
+            const auto it = dsv4_mtp_tensors->find(name);
+            return it == dsv4_mtp_tensors->end() ? nullptr : it->second;
+        };
+
+        ggml_tensor * mtp_e_proj        = mtp_tensor("mtp.0.e_proj.weight");
+        ggml_tensor * mtp_h_proj        = mtp_tensor("mtp.0.h_proj.weight");
+        ggml_tensor * mtp_enorm         = mtp_tensor("mtp.0.enorm.weight");
+        ggml_tensor * mtp_hnorm         = mtp_tensor("mtp.0.hnorm.weight");
+        ggml_tensor * mtp_norm          = mtp_tensor("mtp.0.norm.weight");
+        ggml_tensor * mtp_hc_head_fn    = mtp_tensor("mtp.0.hc_head_fn.weight");
+        ggml_tensor * mtp_hc_head_base  = mtp_tensor("mtp.0.hc_head_base.weight");
+        ggml_tensor * mtp_hc_head_scale = mtp_tensor("mtp.0.hc_head_scale.weight");
+
+        if (res->t_inp_tokens != nullptr && mtp_e_proj != nullptr && mtp_h_proj != nullptr && mtp_enorm != nullptr &&
+            mtp_hnorm != nullptr && mtp_norm != nullptr && mtp_hc_head_fn != nullptr && mtp_hc_head_base != nullptr &&
+            mtp_hc_head_scale != nullptr) {
+            ggml_tensor * mtp_embed = ggml_get_rows(ctx0, model.tok_embd, res->t_inp_tokens);
+            mtp_embed               = as_f32(mtp_embed);
+            cb(mtp_embed, "dsv4_mtp_embed", -1);
+
+            ggml_tensor * mtp_e = build_norm(mtp_embed, mtp_enorm, nullptr, LLM_NORM_RMS, -1);
+            mtp_e               = mul_mat_checked(mtp_e_proj, mtp_e, "mtp.e_proj");
+            mtp_e               = make_hc_state(mtp_e);
+            cb(mtp_e, "dsv4_mtp_e_proj_hc", -1);
+
+            ggml_tensor * mtp_h = build_norm(mtp_hc_state, mtp_hnorm, nullptr, LLM_NORM_RMS, -1);
+            mtp_h               = mul_mat_checked(mtp_h_proj, mtp_h, "mtp.h_proj");
+            cb(mtp_h, "dsv4_mtp_h_proj_hc", -1);
+
+            // This is a projection/head plumbing probe only. The one-layer MTP
+            // transformer block and its private cache state are intentionally
+            // not wired here yet, so this top-1 is not a speculative draft.
+            ggml_tensor * mtp_proj_hc = ggml_add(ctx0, mtp_e, mtp_h);
+            cb(mtp_proj_hc, "dsv4_mtp_projection_hc", -1);
+
+            ggml_tensor * mtp_embd = hc_head(mtp_proj_hc, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale,
+                                             "dsv4_mtp_projection_hc_head");
+            mtp_embd               = build_norm(mtp_embd, mtp_norm, nullptr, LLM_NORM_RMS, -1);
+            mtp_embd               = as_f32(mtp_embd);
+            cb(mtp_embd, "dsv4_mtp_projection_norm", -1);
+
+            ggml_tensor * mtp_logits = build_lora_mm(model.output, mtp_embd);
+            cb(mtp_logits, "dsv4_mtp_projection_logits", -1);
+
+            ggml_tensor * mtp_top1 = ggml_argsort_top_k(ctx0, mtp_logits, 1);
+            cb(mtp_top1, "dsv4_mtp_projection_top1", -1);
+            res->t_dsv4_mtp_probe_top1 = mtp_top1;
+        }
     }
 
     cur = hc_head(hc_state, model.hc_head_fn, model.hc_head_base, model.hc_head_scale, "hc_head_out");

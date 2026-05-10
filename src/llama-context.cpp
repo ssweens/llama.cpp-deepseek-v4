@@ -839,6 +839,10 @@ const ggml_tensor * llama_context::get_dsv4_mtp_tensor(const char * name) const 
     return it == dsv4_mtp_sidecar->tensors.end() ? nullptr : it->second;
 }
 
+llama_token llama_context::get_dsv4_mtp_probe_top1() const {
+    return dsv4_mtp_probe_top1;
+}
+
 llama_token * llama_context::get_sampled_tokens()  const{
     return sampling.sampled.data;
 }
@@ -1916,6 +1920,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             dsv4_mtp_hc_state.clear();
         }
 
+        if (auto * t_mtp_top1 = res->get_dsv4_mtp_probe_top1()) {
+            GGML_ASSERT(t_mtp_top1->type == GGML_TYPE_I32);
+            ggml_backend_t backend_top1 = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_top1);
+            GGML_ASSERT(backend_top1 != nullptr);
+
+            dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
+            ggml_backend_tensor_get_async(backend_top1, t_mtp_top1, &dsv4_mtp_probe_top1, 0,
+                                          sizeof(dsv4_mtp_probe_top1));
+        } else {
+            dsv4_mtp_probe_top1 = LLAMA_TOKEN_NULL;
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2277,6 +2293,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
         /*.dsv4_mtp_probe =*/dsv4_mtp_probe,
+        /*.dsv4_mtp_tensors =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),

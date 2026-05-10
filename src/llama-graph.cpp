@@ -806,8 +806,9 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits            = nullptr;
     t_embd              = nullptr;
-    t_embd_pooled       = nullptr;
-    t_dsv4_mtp_hc_state = nullptr;
+    t_embd_pooled         = nullptr;
+    t_dsv4_mtp_hc_state   = nullptr;
+    t_dsv4_mtp_probe_top1 = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -853,6 +854,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_dsv4_mtp_hc_state != nullptr) {
         ggml_set_output(t_dsv4_mtp_hc_state);
+    }
+    if (t_dsv4_mtp_probe_top1 != nullptr) {
+        ggml_set_output(t_dsv4_mtp_probe_top1);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -958,6 +962,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx(params.mctx),
     cross(params.cross),
     dsv4_mtp_probe(params.dsv4_mtp_probe),
+    dsv4_mtp_tensors(params.dsv4_mtp_tensors),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),
