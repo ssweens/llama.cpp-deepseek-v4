@@ -11,6 +11,7 @@ Date: 2026-05-09
 - Boundary cleanup: generic server/speculative code no longer contains DS4/MTP env names, timing probes, or DS4 MTP log/comment text; `llama_context` uses generic model/memory hooks for MTP draft validation, raw-window policy, and recurrent-state replay instead of direct DS4 references.
 - Docker mounted-code validation shows real accepted drafts and correct visible content on smoke prompts. After sidecar depth-2 plus verifier full-accept cleanup skip, a raw deterministic ctx8192 prompt improved from target-only `46.94 tok/s` to MTP `52.12 tok/s` with matching visible text and `20/20` accepted/generated drafts.
 - Standard IQ2_XXS `llama-benchy pp2048/tg32` is still not solved: freecheck MTP generates 0-1 drafts on the natural bench prompt, so tg remains below the prior target-only baseline. This means the remaining blocker is MTP draft quality/alignment on long natural prompts, not verifier cleanup overhead.
+- Rejected hypotheses: moving the MTP draft to a 5090 via `--device-draft CUDA1` did not improve raw speed enough; sampled-token-conditioned drafting generated more natural-text drafts but caused partial-accept replay to dominate (`accept` hundreds of ms) and is not safe as-is; removing the raw-target-top1 pre-gate did not increase standard bench drafts; disabling repeat penalty did not increase standard bench drafts.
 
 ## Implemented in this branch
 
