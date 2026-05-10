@@ -392,3 +392,20 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Server draft stats by measured run: `4/6`, `5/8`, and `8/12` accepted/generated; adaptive cooldown avoided drafting on low-value steps instead of forcing sidecar work every token.
 - Target-only artifact saved to `/tmp/dsv4_iq2xxs_target_postrollback_benchy_pp2048_tg32_runs3.json`; server log saved to `/tmp/dsv4_iq2xxs_target_postrollback_server_runs3.log`.
 - Remaining caveat: draft depths above 1 still need cleanup; draft-max 2 has not yet shown a standard benchmark win and draft-max 4 remains correctness-unsafe.
+
+## DeepSeek4 MTP regression before decode tuning (2026-05-10)
+
+### Plan
+- [x] Start an ad hoc mounted-code IQ2_XXS server from this branch with MTP enabled (`--spec-type mtp --draft-max 1`) so the committed speculative path is under test.
+- [x] Run `scripts/dsv4_regression.py` per `../llama.cpp-deepseek-v4/tasks/dsv4_regression_handoff.md` with the tool replay fixture and `--max-tokens 2048`.
+- [x] Run a target-only comparison to separate default-server regressions from MTP-enabled regressions.
+- [x] Record pass/fail details, stop the ad hoc server, and verify GPUs are idle.
+- [ ] Before decode-speed work, decide whether MTP-enabled tool-call regressions must be fixed now or explicitly scoped out of speed benchmarking.
+
+### Review
+- Default/target-only mounted-code IQ2_XXS regression passed all 7 checks. Artifact: `/tmp/dsv4_iq2xxs_target_regression.out`; server log: `/tmp/dsv4_iq2xxs_target_regression_server.log`.
+- MTP-enabled `--draft-max 1` regression did **not** pass cleanly:
+  - First MTP run: 6/7 passed; `tool_replay_turn02_cache_reuse` failed because the first replay emitted prose/code-fence text instead of structured `tool_calls`. Artifact: `/tmp/dsv4_iq2xxs_mtp_regression.out`; server log: `/tmp/dsv4_iq2xxs_mtp_regression_server.log`.
+  - Retry MTP run: 6/7 passed; `tool_replay_turn02_stream` failed with prose text instead of structured `tool_calls`, while the repeated cache-reuse check passed. Artifact: `/tmp/dsv4_iq2xxs_mtp_regression_retry.out`; server log: `/tmp/dsv4_iq2xxs_mtp_regression_retry_server.log`.
+- The MTP failures occurred on long tool replay requests after prompt-cache/checkpoint restore (`cached_tokens=1408` path), not on the cold non-stream replay. This points at MTP speculative verifier/state interaction around restored DS4 frontiers, not a default parser/server regression.
+- All ad hoc regression containers were stopped and GPUs returned to idle (`2 MiB`, `2 MiB`, `1 MiB`).
