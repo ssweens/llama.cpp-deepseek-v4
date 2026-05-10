@@ -124,6 +124,24 @@ When a valid DeepSeek4 target is loaded with `--mtp-model` and `DSV4_MTP_PROBE=1
 
 This is intentionally only a handoff/probe surface. It does not alter emitted tokens and does not run the one-layer MTP transformer block yet, so the logged projection top-1 is not a speculative draft token.
 
+## Full-block design notes
+
+The DS4 authority path (`metal_graph_eval_mtp_draft_from_hc`) shows the full MTP draft is:
+
+1. base token embedding for the current token;
+2. sidecar `enorm/e_proj` projected and repeated across HC rows;
+3. target final HC state normalized row-wise by sidecar `hnorm` and projected by sidecar `h_proj`;
+4. sum of the two projections as the MTP block input HC state;
+5. one sidecar transformer block using sidecar attention/FFN/HC tensors;
+6. sidecar HC head + sidecar `norm`;
+7. base output projection.
+
+Important constraints for the next implementation:
+
+- The MTP block must not reuse or mutate target model KV/cache state. It needs private MTP raw-window/cache/state tensors analogous to DS4 authority's `mtp_raw_cache`, `mtp_n_raw`, and per-layer compressed/indexer state.
+- The DS4 authority calls the MTP block with logical layer id `1`; the llama.cpp graph should preserve the same DS4 rope/compression schedule instead of assuming logical layer `0` from the sidecar tensor prefix.
+- The current projection/top-1 probe intentionally stops before the transformer block. Its top-1 log validates sidecar tensor loading, target HC handoff, graph outputs, and server logging, but it is not a useful draft-quality metric.
+
 ## Next exact step
 
 Create a follow-up branch for draft-one probing, e.g.:
