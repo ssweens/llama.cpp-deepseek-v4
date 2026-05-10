@@ -268,7 +268,7 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - [x] Feed the one-token MTP block from that private raw cache instead of current-token-only raw attention on continuation steps.
   - [x] Trace DS4 authority MTP cache/state tensors and map them to llama.cpp DeepSeek4 graph tensors: the sidecar calls logical layer id 1, where `deepseek4_compress_ratios[1] == 0`, so private compressed/indexer drafter state is not required for the MTP block.
   - [x] Capture the MTP sidecar output HC state as a graph/context handoff for recursive draft probing.
-  - [ ] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
+  - [x] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
   - [ ] Add an MTP-only recursive draft probe that consumes target HC for draft[0], then sidecar HC for draft[1..N], without running target layers or changing emitted tokens.
   - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.

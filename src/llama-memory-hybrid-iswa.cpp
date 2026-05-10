@@ -459,13 +459,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    mem_attn->state_write(io, seq_id, flags);
+    mem_attn->state_write(io, seq_id, flags);  // PARTIAL_ONLY skips base KV inside llama_kv_cache_iswa.
+
+    // DeepSeek4 compressed-attention verifier rollback needs both pieces below:
+    // recurrent state holds compressor/indexer frontiers, while dsv4_state_write()
+    // holds the sequence-local compressed attention/indexer cache rows.
     mem_recr->state_write(io, seq_id, flags);
     dsv4_state_write(io, seq_id);
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    mem_attn->state_read(io, seq_id, flags);
+    mem_attn->state_read(io, seq_id, flags);  // PARTIAL_ONLY skips base KV inside llama_kv_cache_iswa.
+
+    // Restore the DeepSeek4 compressed-attention frontier/cache pair written above.
     mem_recr->state_read(io, seq_id, flags);
     dsv4_state_read(io, seq_id);
 }

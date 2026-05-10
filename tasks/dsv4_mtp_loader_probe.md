@@ -164,7 +164,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
-This is intentionally still a handoff/probe surface. It does not alter emitted tokens. DS4 authority confirmed the MTP sidecar uses logical layer id 1, whose DeepSeek4 compression ratio is zero, so the sidecar drafter itself needs private raw-window and HC state, not private compressed/indexer state. Target compressed/indexer frontier rollback still has to be verified through existing hybrid-ISWA state checkpoints before speculative verification/commit can be enabled.
+This is intentionally still a handoff/probe surface. It does not alter emitted tokens. DS4 authority confirmed the MTP sidecar uses logical layer id 1, whose DeepSeek4 compression ratio is zero, so the sidecar drafter itself needs private raw-window and HC state, not private compressed/indexer state. Target compressed/indexer frontier rollback is covered by existing hybrid-ISWA partial state checkpoints: `llama_kv_cache_iswa` handles SWA KV, `mem_recr` carries compressor/indexer frontiers, and `dsv4_state_write/read` carries sequence-local compressed attention/indexer cache rows.
 
 ## Full-block design notes
 
@@ -194,6 +194,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Verify target verifier checkpoint/rollback covers DeepSeek4 compressed/indexer frontiers by exercising existing hybrid-ISWA state save/restore around speculative suffix probes.
-2. Add an MTP-only recursive draft probe that feeds draft[0] from target HC and draft[1..N] from captured sidecar HC state without running target layers or changing emitted tokens.
+1. Add an MTP-only recursive draft probe that feeds draft[0] from target HC and draft[1..N] from captured sidecar HC state without running target layers or changing emitted tokens.
+2. Wire that probe into the existing speculative verifier/checkpoint path while preserving deterministic no-MTP vs probe token streams.
 3. Do not implement speculative commit until deterministic no-MTP vs probe token streams match exactly.
