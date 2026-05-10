@@ -425,3 +425,19 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Target-only regression was flaky on the first post-change run but passed all 7 on retry. Passing artifact: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry.out`; server log: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry_server.log`. Failed first-run artifact kept as `/tmp/dsv4_iq2xxs_target_regression_after_toolguard.out` for comparison.
 - Post-fix MTP `llama-benchy pp2048 tg32 --runs 3` passed coherence and measured pp2048 `405.28 ± 2.26 tok/s`, tg32 `30.65 ± 0.94 tok/s`, preserving the previous draft-max-1 decode win. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_pp2048_tg32_runs3.json`; server log: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_server.log`.
 - Tool workloads are now target-only under an MTP-enabled server. This is an explicit safety scope guard, not the final verifier solution; exact DS4 verifier/frontier work is still required before enabling MTP for structured tool-call parsing and before expecting large draft-depth speedups.
+
+## DeepSeek4 MTP draft-depth decode speed work (2026-05-10)
+
+### Plan
+- [x] Establish the current post-regression-guard `--draft-max 2` standard benchmark (`llama-benchy pp2048 tg32 --runs 3`) against the same target-only and draft-max-1 baselines.
+- [x] Capture server draft acceptance statistics and identify whether slowdown comes from partial accepts, verifier batch cost, or sidecar draft cost.
+- [x] Run a short `LLAMA_MTP_TRACE=1` diagnostic smoke to correlate accept patterns with rollback/restore behavior.
+- [x] Re-read the DS4 verifier/frontier authority functions before changing code: `spec_frontier_snapshot`, `spec_frontier_restore`, `spec_frontier_commit_prefix1`, `metal_graph_verify_suffix_tops`, and the exact `metal_graph_verify_decode2_exact` path.
+- [ ] Implement the smallest exact verifier/frontier change that can make 2-token verification cheap without compromising target-verified output.
+
+### Review
+- Post-regression-guard `--draft-max 2` standard run passed coherence but did not beat draft-max 1: pp2048 `406.60 ± 0.89 tok/s`, tg32 `30.24 ± 0.40 tok/s`. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolguard_draft2_benchy_pp2048_tg32_runs3.json`; server log: `/tmp/dsv4_iq2xxs_mtp_toolguard_draft2_benchy_server.log`.
+- Draft-max 2 is no longer catastrophically slow, but token acceptance remains low (`~0.33-0.38` in measured runs) and below draft-max 1 economics. The adaptive cooldown prevents a large regression, but it also means depth 2 is not contributing much.
+- Trace smoke (`pp2048 tg16 runs=1`, `LLAMA_MTP_TRACE=1`) showed partial accepts restore via prefix HC state (`partial accept restore=1`) and then often skip the next MTP draft because the raw target-top gate sees stale verifier-row top-1 after a correction token. Artifact: `/tmp/dsv4_iq2xxs_mtp_draft2_trace_tg16.json`; server log: `/tmp/dsv4_iq2xxs_mtp_draft2_trace_tg16_server.log`.
+- Tested and rejected a naive server-side update of `mtp_target_top1` to the verifier correction token after accept; it increased bad draft attempts and slowed draft-max 2 to tg32 `28.74 ± 0.85 tok/s`. Reverted the experiment. Artifact kept at `/tmp/dsv4_iq2xxs_mtp_targettopfix_draft2_benchy_pp2048_tg32_runs3.json`.
+- DS4 authority confirms two verifier modes: the fast `metal_graph_verify_suffix_tops` microbatch path can perturb greedy tokens, while `metal_graph_verify_decode2_exact` preserves exact target stream but is not a speed win as written. The next implementation target should be exact verifier/frontier semantics in llama.cpp, not more loose gating.
