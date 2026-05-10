@@ -233,6 +233,37 @@ private:
     std::vector<int32_t> values;
 };
 
+class dsv4_mtp_raw_cache_input : public llm_graph_input_i {
+  public:
+    dsv4_mtp_raw_cache_input(ggml_tensor * tensor, const std::vector<float> * cache, uint32_t n_raw, int64_t row_size) :
+        tensor(tensor),
+        cache(cache),
+        n_raw(n_raw),
+        row_size(row_size) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(cache != nullptr);
+        GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+        GGML_ASSERT(tensor->ne[0] == row_size);
+        GGML_ASSERT(tensor->ne[2] == (int64_t) n_raw);
+        GGML_ASSERT(cache->size() >= (size_t) n_raw * (size_t) row_size);
+        ggml_backend_tensor_set(tensor, cache->data(), 0, (size_t) n_raw * (size_t) row_size * sizeof(float));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return tensor != nullptr && cache == params.mtp_raw_cache && n_raw == params.mtp_n_raw &&
+               tensor->ne[0] == row_size && tensor->ne[2] == (int64_t) n_raw;
+    }
+
+  private:
+    ggml_tensor *              tensor;
+    const std::vector<float> * cache;
+    uint32_t                   n_raw;
+    int64_t                    row_size;
+};
+
 static bool dsv4_is_contiguous_single_seq(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     if (n_tokens <= 0) {
@@ -2233,10 +2264,23 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             mtp_Kcur               = as_f32(mtp_Kcur);
             mtp_Kcur               = apply_fp8_qat_nope_2d(mtp_Kcur, "dsv4_mtp_attn_kv_qat", -1);
             cb(mtp_Kcur, "dsv4_mtp_attn_kv", -1);
+            res->t_mtp_raw_current = mtp_Kcur;
 
-            ggml_tensor * mtp_attn_out =
-                build_attn_mha(mtp_Qcur, mtp_Kcur, mtp_Kcur, nullptr, nullptr, mtp_attn_sinks, nullptr, kq_scale, -1,
-                               /*force_no_flash_attn=*/true);
+            ggml_tensor * mtp_raw_kv = mtp_Kcur;
+            if (mtp_n_raw > 0) {
+                GGML_ASSERT(mtp_raw_cache != nullptr);
+                ggml_tensor * mtp_raw_prev = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head, 1, mtp_n_raw);
+                ggml_set_input(mtp_raw_prev);
+                ggml_set_name(mtp_raw_prev, "dsv4_mtp_raw_cache");
+                res->add_input(
+                    std::make_unique<dsv4_mtp_raw_cache_input>(mtp_raw_prev, mtp_raw_cache, mtp_n_raw, n_embd_head));
+                mtp_raw_kv = ggml_concat(ctx0, mtp_raw_prev, mtp_Kcur, 2);
+                cb(mtp_raw_kv, "dsv4_mtp_raw_kv", -1);
+            }
+
+            ggml_tensor * mtp_attn_out = build_attn_mha(mtp_Qcur, mtp_raw_kv, mtp_raw_kv, nullptr, nullptr,
+                                                        mtp_attn_sinks, nullptr, kq_scale, -1,
+                                                        /*force_no_flash_attn=*/true);
             mtp_attn_out = as_f32(mtp_attn_out);
             cb(mtp_attn_out, "dsv4_mtp_attn_out_raw", -1);
 

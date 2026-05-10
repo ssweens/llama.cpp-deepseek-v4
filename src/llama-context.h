@@ -297,6 +297,12 @@ private:
     std::vector<float> mtp_state;
     llama_token        mtp_probe_top1 = LLAMA_TOKEN_NULL;
 
+    // private MTP probe raw-window cache, intentionally separate from target KV/cache state
+    std::vector<float> mtp_raw_cache;
+    uint32_t           mtp_n_raw        = 0;
+    llama_seq_id       mtp_raw_seq_id   = -1;
+    llama_pos          mtp_raw_last_pos = -1;
+
     struct dsv4_mtp_sidecar_data {
         gguf_context_ptr                               ctx_gguf;
         ggml_context_ptr                               ctx;

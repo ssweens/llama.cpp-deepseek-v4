@@ -547,8 +547,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    bool                                                   mtp_probe   = false;
-    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors = nullptr;
+    bool                                                   mtp_probe     = false;
+    const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors   = nullptr;
+    const std::vector<float> *                             mtp_raw_cache = nullptr;
+    uint32_t                                               mtp_n_raw     = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -630,7 +632,8 @@ struct llm_graph_params {
 
         return cparams.embeddings == other.cparams.embeddings && cparams.causal_attn == other.cparams.causal_attn &&
                arch == other.arch && gtype == other.gtype && cvec == other.cvec && loras == other.loras &&
-               cross == other.cross && mtp_probe == other.mtp_probe && mtp_tensors == other.mtp_tensors;
+               cross == other.cross && mtp_probe == other.mtp_probe && mtp_tensors == other.mtp_tensors &&
+               mtp_raw_cache == other.mtp_raw_cache && mtp_n_raw == other.mtp_n_raw;
     }
 };
 
@@ -651,6 +654,8 @@ public:
     ggml_tensor * get_mtp_state() const { return t_mtp_state; }
 
     ggml_tensor * get_mtp_probe_top1() const { return t_mtp_probe_top1; }
+
+    ggml_tensor * get_mtp_raw_current() const { return t_mtp_raw_current; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -681,6 +686,7 @@ public:
     ggml_tensor * t_embd_pooled       = nullptr;
     ggml_tensor * t_mtp_state         = nullptr;
     ggml_tensor * t_mtp_probe_top1    = nullptr;
+    ggml_tensor * t_mtp_raw_current   = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -770,6 +776,8 @@ struct llm_graph_context {
 
     const bool                                             mtp_probe;
     const std::unordered_map<std::string, ggml_tensor *> * mtp_tensors;
+    const std::vector<float> *                             mtp_raw_cache;
+    const uint32_t                                         mtp_n_raw;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

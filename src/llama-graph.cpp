@@ -807,8 +807,9 @@ void llm_graph_result::reset() {
     t_logits         = nullptr;
     t_embd           = nullptr;
     t_embd_pooled    = nullptr;
-    t_mtp_state      = nullptr;
-    t_mtp_probe_top1 = nullptr;
+    t_mtp_state       = nullptr;
+    t_mtp_probe_top1  = nullptr;
+    t_mtp_raw_current = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -963,6 +964,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross(params.cross),
     mtp_probe(params.mtp_probe),
     mtp_tensors(params.mtp_tensors),
+    mtp_raw_cache(params.mtp_raw_cache),
+    mtp_n_raw(params.mtp_n_raw),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),

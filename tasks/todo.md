@@ -264,6 +264,10 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Validate real DeepSeek4 target + MTP sidecar startup/projection probe on IQ1_M CPU-only target; fix CPU BF16 RHS matmul compatibility and explicitly connect probe top-1 graph outputs.
 - [x] Build a raw-current one-token MTP transformer block probe with sidecar attention/FFN/HC tensors and logical layer-1 RoPE, without mutating target KV/cache state.
 - [ ] Add persistent private MTP raw/compressed/indexer cache state before using block-probe output as a real speculative draft.
+  - [x] Start with a private raw-window cache (`mtp_raw_cache`/`mtp_n_raw` equivalent) owned by `llama_context`, separate from target KV/cache.
+  - [x] Feed the one-token MTP block from that private raw cache instead of current-token-only raw attention on continuation steps.
+  - [ ] Add private compressed/indexer cache state for long-context parity with DS4 authority.
+  - [ ] Harden reset/slot lifecycle handling before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
 - [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.
 
@@ -274,5 +278,6 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Tiny no-MTP server health check returned `{"status":"ok"}` after 2 seconds.
 - Real DeepSeek4 IQ1_M + MTP sidecar projection probe reached health after 82 seconds and logged `dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0` on a one-token completion without changing emitted-token behavior.
 - Real DeepSeek4 IQ1_M + raw-current MTP block probe reached health after 88 seconds and logged `dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0` on a one-token completion without changing emitted-token behavior.
+- Real DeepSeek4 IQ1_M + private raw-cache probe reached health after 94 seconds on an `n_predict=2` run and logged two probe rows, including continuation step `target_argmax=200 draft_top1=5 match=0` after consuming one private MTP raw-cache row.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.

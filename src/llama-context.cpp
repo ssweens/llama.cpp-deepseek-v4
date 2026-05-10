@@ -1090,6 +1090,10 @@ void llama_context::set_mtp_probe(bool value) {
     }
 
     mtp_probe          = value;
+    mtp_n_raw          = 0;
+    mtp_raw_seq_id     = -1;
+    mtp_raw_last_pos   = -1;
+    mtp_raw_cache.clear();
     sched_need_reserve = true;
 }
 
@@ -1772,6 +1776,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        // The MTP probe's private raw cache is single-sequence and single-token only for now.
+        // Reset on discontinuities so probe state never aliases unrelated target KV/cache state.
+        const bool mtp_raw_can_continue = mtp_probe && dsv4_mtp_sidecar && ubatch.n_tokens == 1 &&
+                                          ubatch.n_seq_id[0] == 1 && ubatch.pos != nullptr && ubatch.seq_id != nullptr;
+        if (mtp_raw_can_continue) {
+            const llama_seq_id seq_id = ubatch.seq_id[0][0];
+            const llama_pos    pos    = ubatch.pos[0];
+            if (mtp_n_raw > 0 && (seq_id != mtp_raw_seq_id || pos != mtp_raw_last_pos + 1)) {
+                mtp_n_raw        = 0;
+                mtp_raw_seq_id   = -1;
+                mtp_raw_last_pos = -1;
+                mtp_raw_cache.clear();
+            }
+        } else if (mtp_n_raw > 0) {
+            mtp_n_raw        = 0;
+            mtp_raw_seq_id   = -1;
+            mtp_raw_last_pos = -1;
+            mtp_raw_cache.clear();
+        }
+
         // count the outputs in this ubatch
         {
             int32_t n_outputs_new = 0;
@@ -1930,6 +1954,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_tensor_get_async(backend_top1, t_mtp_top1, &mtp_probe_top1, 0, sizeof(mtp_probe_top1));
         } else {
             mtp_probe_top1 = LLAMA_TOKEN_NULL;
+        }
+
+        if (auto * t_mtp_raw_current = res->get_mtp_raw_current()) {
+            GGML_ASSERT(t_mtp_raw_current->type == GGML_TYPE_F32);
+            GGML_ASSERT(ubatch.n_tokens == 1 && ubatch.n_seq_id[0] == 1 && ubatch.pos != nullptr &&
+                        ubatch.seq_id != nullptr);
+
+            const size_t       row_size = ggml_nelements(t_mtp_raw_current);
+            std::vector<float> raw_current(row_size);
+            ggml_backend_tensor_get(t_mtp_raw_current, raw_current.data(), 0, ggml_nbytes(t_mtp_raw_current));
+
+            const uint32_t raw_window =
+                hparams.deepseek4_sliding_window > 0 ? hparams.deepseek4_sliding_window : cparams.n_ctx;
+            GGML_ASSERT(raw_window > 0);
+            if (mtp_raw_cache.size() != (size_t) mtp_n_raw * row_size) {
+                mtp_n_raw = 0;
+                mtp_raw_cache.clear();
+            }
+            if (mtp_n_raw < raw_window) {
+                mtp_raw_cache.resize((size_t) (mtp_n_raw + 1) * row_size);
+                std::memcpy(mtp_raw_cache.data() + (size_t) mtp_n_raw * row_size, raw_current.data(),
+                            row_size * sizeof(float));
+                mtp_n_raw++;
+            } else {
+                std::memmove(mtp_raw_cache.data(), mtp_raw_cache.data() + row_size,
+                             (size_t) (raw_window - 1) * row_size * sizeof(float));
+                std::memcpy(mtp_raw_cache.data() + (size_t) (raw_window - 1) * row_size, raw_current.data(),
+                            row_size * sizeof(float));
+                mtp_n_raw = raw_window;
+            }
+            mtp_raw_seq_id   = ubatch.seq_id[0][0];
+            mtp_raw_last_pos = ubatch.pos[0];
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -2292,9 +2348,11 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/loras.get(),
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
-        /*.mtp_probe   =*/mtp_probe,
-        /*.mtp_tensors =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
-        /*.samplers    =*/sampling.samplers,
+        /*.mtp_probe     =*/mtp_probe,
+        /*.mtp_tensors   =*/dsv4_mtp_sidecar ? &dsv4_mtp_sidecar->tensors : nullptr,
+        /*.mtp_raw_cache =*/&mtp_raw_cache,
+        /*.mtp_n_raw     =*/mtp_n_raw,
+        /*.samplers      =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
         /*.res         =*/res,
