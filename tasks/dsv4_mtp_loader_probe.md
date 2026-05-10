@@ -14,7 +14,7 @@ Date: 2026-05-09
 - Added a host-side copy buffer for that MTP handoff state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
-- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state/projection probe plumbing.
+- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables state/projection probe plumbing. Server slot initialization intentionally skips `common_speculative_init()` for MTP until the full runtime drafter is wired.
 - Documented the new server flags in `tools/server/README.md`.
 
 ## Staged sidecar

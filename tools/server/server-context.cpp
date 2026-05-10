@@ -1257,8 +1257,10 @@ private:
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
-            // try speculative decoding
-            if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            // try speculative decoding. DeepSeek4 MTP is validation/probe-only in this branch,
+            // so do not instantiate a common_speculative implementation until runtime drafting is wired.
+            if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO &&
+                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
 
                 if (slot.spec) {
