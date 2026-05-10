@@ -545,6 +545,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    bool dsv4_mtp_probe = false;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -623,14 +625,9 @@ struct llm_graph_params {
             }
         }
 
-        return
-            cparams.embeddings  == other.cparams.embeddings  &&
-            cparams.causal_attn == other.cparams.causal_attn &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+        return cparams.embeddings == other.cparams.embeddings && cparams.causal_attn == other.cparams.causal_attn &&
+               arch == other.arch && gtype == other.gtype && cvec == other.cvec && loras == other.loras &&
+               cross == other.cross && dsv4_mtp_probe == other.dsv4_mtp_probe;
     }
 };
 
@@ -640,10 +637,15 @@ public:
 
     virtual ~llm_graph_result() = default;
 
-    ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
-    ggml_tensor * get_logits()      const { return t_logits; }
-    ggml_tensor * get_embd()        const { return t_embd; }
+    ggml_tensor * get_inp_tokens() const { return t_inp_tokens; }
+
+    ggml_tensor * get_logits() const { return t_logits; }
+
+    ggml_tensor * get_embd() const { return t_embd; }
+
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+
+    ggml_tensor * get_dsv4_mtp_hc_state() const { return t_dsv4_mtp_hc_state; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -667,11 +669,12 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_inp_tokens        = nullptr;
+    ggml_tensor * t_inp_embd          = nullptr;  // [n_embd_inp, n_tokens]
+    ggml_tensor * t_logits            = nullptr;
+    ggml_tensor * t_embd              = nullptr;
+    ggml_tensor * t_embd_pooled       = nullptr;
+    ggml_tensor * t_dsv4_mtp_hc_state = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -758,6 +761,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    const bool dsv4_mtp_probe;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

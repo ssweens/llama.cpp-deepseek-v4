@@ -340,9 +340,14 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    bool has_dft() const {
-        return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
-    }
+    // DeepSeek4 MTP sidecar support model. This is not a standalone draft llama_model:
+    // it shares the target model's token embedding/output tensors and is validated separately.
+    std::string mtp_model;
+    int32_t     mtp_draft = 1;
+
+    bool has_dft() const { return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty(); }
+
+    bool has_mtp() const { return !mtp_model.empty(); }
 };
 
 struct common_params_vocoder {

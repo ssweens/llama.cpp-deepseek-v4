@@ -826,6 +826,19 @@ float * llama_context::get_embeddings() {
     return embd.data;
 }
 
+const std::vector<float> & llama_context::get_dsv4_mtp_hc_state() const {
+    return dsv4_mtp_hc_state;
+}
+
+const ggml_tensor * llama_context::get_dsv4_mtp_tensor(const char * name) const {
+    if (!dsv4_mtp_sidecar) {
+        return nullptr;
+    }
+
+    const auto it = dsv4_mtp_sidecar->tensors.find(name);
+    return it == dsv4_mtp_sidecar->tensors.end() ? nullptr : it->second;
+}
+
 llama_token * llama_context::get_sampled_tokens()  const{
     return sampling.sampled.data;
 }
@@ -1063,6 +1076,90 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_dsv4_mtp_probe(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (dsv4_mtp_probe == value) {
+        return;
+    }
+
+    dsv4_mtp_probe     = value;
+    sched_need_reserve = true;
+}
+
+bool llama_context::load_dsv4_mtp_sidecar(const std::string & path, std::string & err) {
+    err.clear();
+
+    if (model.arch != LLM_ARCH_DEEPSEEK4) {
+        err = "DeepSeek4 MTP sidecars can only be loaded for DeepSeek4 target models";
+        return false;
+    }
+
+    ggml_context *   ctx_init         = nullptr;
+    gguf_init_params meta_gguf_params = {
+        /*.no_alloc =*/true,
+        /*.ctx      =*/&ctx_init,
+    };
+
+    gguf_context_ptr ctx_gguf{ gguf_init_from_file(path.c_str(), meta_gguf_params) };
+    if (!ctx_gguf) {
+        err = "failed to open MTP sidecar GGUF";
+        return false;
+    }
+    ggml_context_ptr ctx{ ctx_init };
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    const ggml_tensor *        ref  = model.hc_head_fn ? model.hc_head_fn : model.output;
+    if (ref != nullptr && ref->buffer != nullptr) {
+        buft = ggml_backend_buffer_get_type(ref->buffer);
+    }
+
+    ggml_backend_buffer_ptr buf{ ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        err = format("failed to allocate %s buffer for MTP sidecar tensors", ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    auto sidecar      = std::make_unique<dsv4_mtp_sidecar_data>();
+    sidecar->ctx_gguf = std::move(ctx_gguf);
+    sidecar->ctx      = std::move(ctx);
+    sidecar->buf      = std::move(buf);
+
+    try {
+        llama_file           gguf_file(path.c_str(), "rb");
+        std::vector<uint8_t> read_buf;
+        for (ggml_tensor * cur = ggml_get_first_tensor(sidecar->ctx.get()); cur != nullptr;
+             cur               = ggml_get_next_tensor(sidecar->ctx.get(), cur)) {
+            const int64_t tid = gguf_find_tensor(sidecar->ctx_gguf.get(), cur->name);
+            if (tid < 0) {
+                err = format("MTP sidecar tensor '%s' is missing from GGUF directory", cur->name);
+                return false;
+            }
+
+            const size_t offset =
+                gguf_get_data_offset(sidecar->ctx_gguf.get()) + gguf_get_tensor_offset(sidecar->ctx_gguf.get(), tid);
+            const size_t size = ggml_nbytes(cur);
+            read_buf.resize(size);
+            gguf_file.seek(offset, SEEK_SET);
+            gguf_file.read_raw(read_buf.data(), size);
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, size);
+
+            sidecar->tensors.emplace(cur->name, cur);
+        }
+    } catch (const std::exception & ex) {
+        err = ex.what();
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: loaded %zu DeepSeek4 MTP sidecar tensors into %s buffer (%8.2f MiB)\n", __func__,
+                   sidecar->tensors.size(), ggml_backend_buffer_name(sidecar->buf.get()),
+                   ggml_backend_buffer_get_size(sidecar->buf.get()) / 1024.0 / 1024.0);
+
+    dsv4_mtp_sidecar = std::move(sidecar);
+    return true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1808,6 +1905,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (auto * t_hc = res->get_dsv4_mtp_hc_state()) {
+            GGML_ASSERT(t_hc->type == GGML_TYPE_F32);
+            ggml_backend_t backend_hc = ggml_backend_sched_get_tensor_backend(sched.get(), t_hc);
+            GGML_ASSERT(backend_hc != nullptr);
+
+            dsv4_mtp_hc_state.resize(ggml_nelements(t_hc));
+            ggml_backend_tensor_get_async(backend_hc, t_hc, dsv4_mtp_hc_state.data(), 0, ggml_nbytes(t_hc));
+        } else {
+            dsv4_mtp_hc_state.clear();
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2157,21 +2265,22 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch        =*/model.arch,
+        /*.hparams     =*/model.hparams,
+        /*.cparams     =*/cparams,
+        /*.ubatch      =*/ubatch,
+        /*.gtype       =*/gtype,
+        /*.sched       =*/sched.get(),
+        /*.backend_cpu =*/backend_cpu,
+        /*.cvec        =*/cvec.get(),
+        /*.loras       =*/loras.get(),
+        /*.mctx        =*/mctx,
+        /*.cross       =*/&cross,
+        /*.dsv4_mtp_probe =*/dsv4_mtp_probe,
+        /*.samplers    =*/sampling.samplers,
+        /*.n_outputs   =*/n_outputs,
+        /*.cb          =*/graph_get_cb(),
+        /*.res         =*/res,
     };
 }
 

@@ -2121,6 +2121,12 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cb(hc_state, "l_out_hc", il);
     }
 
+    if (dsv4_mtp_probe && n_tokens == 1 && n_outputs == 1) {
+        ggml_tensor * mtp_hc_state = as_f32(hc_state);
+        cb(mtp_hc_state, "dsv4_mtp_hc_state", -1);
+        res->t_dsv4_mtp_hc_state = mtp_hc_state;
+    }
+
     cur = hc_head(hc_state, model.hc_head_fn, model.hc_head_base, model.hc_head_scale, "hc_head_out");
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);

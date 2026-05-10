@@ -1,29 +1,33 @@
 
 #include "server-context.h"
-#include "server-chat.h"
-#include "server-common.h"
-#include "server-http.h"
-#include "server-task.h"
-#include "server-queue.h"
 
 #include "build-info.h"
 #include "common.h"
+#include "gguf.h"
 #include "llama.h"
-#include "src/llama-model.h"
 #include "log.h"
-#include "sampling.h"
-#include "speculative.h"
-#include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd.h"
+#include "sampling.h"
+#include "server-chat.h"
+#include "server-common.h"
+#include "server-http.h"
+#include "server-queue.h"
+#include "server-task.h"
+#include "speculative.h"
+#include "src/llama-context.h"
+#include "src/llama-model.h"
 
 #include <algorithm>
 #include <array>
-#include <cstddef>
 #include <cinttypes>
-#include <cstring>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
+#include <initializer_list>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <utility>
@@ -85,6 +89,239 @@ static int server_dsv4_cache_alignment(llama_context * ctx, bool has_mtmd) {
     }
 
     return alignment > 1 ? alignment : 0;
+}
+
+static bool server_dsv4_mtp_get_u32(const gguf_context * ctx, const char * key, uint32_t & out, std::string & err) {
+    const int64_t kid = gguf_find_key(ctx, key);
+    if (kid < 0) {
+        err = string_format("missing required metadata key '%s'", key);
+        return false;
+    }
+
+    const enum gguf_type type = gguf_get_kv_type(ctx, kid);
+    switch (type) {
+        case GGUF_TYPE_UINT32:
+            out = gguf_get_val_u32(ctx, kid);
+            return true;
+        case GGUF_TYPE_UINT64:
+            {
+                const uint64_t v = gguf_get_val_u64(ctx, kid);
+                if (v > std::numeric_limits<uint32_t>::max()) {
+                    err = string_format("metadata key '%s' is too large: %" PRIu64, key, v);
+                    return false;
+                }
+                out = (uint32_t) v;
+                return true;
+            }
+        case GGUF_TYPE_INT32:
+            {
+                const int32_t v = gguf_get_val_i32(ctx, kid);
+                if (v < 0) {
+                    err = string_format("metadata key '%s' is negative: %d", key, v);
+                    return false;
+                }
+                out = (uint32_t) v;
+                return true;
+            }
+        default:
+            err = string_format("metadata key '%s' has type %s, expected integer", key, gguf_type_name(type));
+            return false;
+    }
+}
+
+static std::string server_dsv4_mtp_type_names(std::initializer_list<ggml_type> types) {
+    std::string out;
+    for (const enum ggml_type type : types) {
+        if (!out.empty()) {
+            out += "/";
+        }
+        out += ggml_type_name(type);
+    }
+    return out;
+}
+
+static bool server_dsv4_mtp_check_tensor(ggml_context *                   ctx_meta,
+                                         const char *                     name,
+                                         std::initializer_list<int64_t>   ne,
+                                         std::initializer_list<ggml_type> types,
+                                         std::string &                    err) {
+    const ggml_tensor * t = ggml_get_tensor(ctx_meta, name);
+    if (t == nullptr) {
+        err = string_format("missing required MTP tensor '%s'", name);
+        return false;
+    }
+
+    if (ggml_n_dims(t) != (int) ne.size()) {
+        err = string_format("MTP tensor '%s' has %d dims, expected %zu", name, ggml_n_dims(t), ne.size());
+        return false;
+    }
+
+    int i = 0;
+    for (const int64_t dim : ne) {
+        if (t->ne[i] != dim) {
+            err = string_format("MTP tensor '%s' dim[%d]=%" PRId64 ", expected %" PRId64, name, i, t->ne[i], dim);
+            return false;
+        }
+        ++i;
+    }
+
+    bool type_ok = false;
+    for (const enum ggml_type type : types) {
+        if (t->type == type) {
+            type_ok = true;
+            break;
+        }
+    }
+    if (!type_ok) {
+        err = string_format("MTP tensor '%s' has type %s, expected %s", name, ggml_type_name(t->type),
+                            server_dsv4_mtp_type_names(types).c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static bool server_dsv4_validate_mtp_sidecar(const std::string & path, const llama_model * model, std::string & err) {
+    if (model == nullptr || model->arch != LLM_ARCH_DEEPSEEK4) {
+        err = "--mtp-model is only supported with DeepSeek4 target models";
+        return false;
+    }
+    if (model->tok_embd == nullptr || model->output == nullptr) {
+        err = "DeepSeek4 MTP requires target token embedding and output tensors";
+        return false;
+    }
+    if (!std::filesystem::exists(path)) {
+        err = string_format("MTP sidecar file does not exist: %s", path.c_str());
+        return false;
+    }
+
+    ggml_context *          ctx_meta_raw = nullptr;
+    struct gguf_init_params params       = {
+        /*.no_alloc =*/true,
+        /*.ctx      =*/&ctx_meta_raw,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> ctx_gguf(gguf_init_from_file(path.c_str(), params), gguf_free);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_meta(ctx_meta_raw, ggml_free);
+    if (ctx_gguf == nullptr || ctx_meta == nullptr) {
+        err = string_format("failed to read MTP sidecar GGUF metadata: %s", path.c_str());
+        return false;
+    }
+
+    const int64_t arch_kid = gguf_find_key(ctx_gguf.get(), "general.architecture");
+    if (arch_kid < 0 || gguf_get_kv_type(ctx_gguf.get(), arch_kid) != GGUF_TYPE_STRING) {
+        err = "MTP sidecar missing string metadata key 'general.architecture'";
+        return false;
+    }
+    const std::string arch = gguf_get_val_str(ctx_gguf.get(), arch_kid);
+    if (arch != "deepseek4_mtp_support") {
+        err = string_format("MTP sidecar architecture is '%s', expected 'deepseek4_mtp_support'", arch.c_str());
+        return false;
+    }
+
+    uint32_t mtp_layer_count      = 0;
+    uint32_t nextn_predict_layers = 0;
+    uint32_t expert_count         = 0;
+    if (!server_dsv4_mtp_get_u32(ctx_gguf.get(), "deepseek4.mtp_layer_count", mtp_layer_count, err) ||
+        !server_dsv4_mtp_get_u32(ctx_gguf.get(), "deepseek4.nextn_predict_layers", nextn_predict_layers, err) ||
+        !server_dsv4_mtp_get_u32(ctx_gguf.get(), "deepseek4.expert_count", expert_count, err)) {
+        return false;
+    }
+    if (mtp_layer_count != 1 || nextn_predict_layers != 1) {
+        err = string_format("MTP sidecar supports mtp_layer_count=%u nextn_predict_layers=%u, expected 1/1",
+                            mtp_layer_count, nextn_predict_layers);
+        return false;
+    }
+
+    const llama_hparams & hparams = model->hparams;
+    if (expert_count != hparams.n_expert) {
+        err = string_format("MTP sidecar expert_count=%u does not match target n_expert=%u", expert_count,
+                            hparams.n_expert);
+        return false;
+    }
+    if (hparams.n_hc == 0 || hparams.n_lora_q == 0 || hparams.n_lora_o == 0 || hparams.n_o_groups == 0 ||
+        hparams.n_ff_exp == 0 || hparams.n_expert == 0) {
+        err = "DeepSeek4 target hparams are incomplete for MTP validation";
+        return false;
+    }
+
+    const int64_t n_embd     = hparams.n_embd;
+    const int64_t n_hc       = hparams.n_hc;
+    const int64_t n_hc_state = n_embd * n_hc;
+    const int64_t n_hc_mix   = (2 + n_hc) * n_hc;
+    const int64_t n_lora_q   = hparams.n_lora_q;
+    const int64_t n_lora_o   = hparams.n_lora_o;
+    const int64_t n_o_groups = hparams.n_o_groups;
+    const int64_t n_head     = hparams.n_head(0);
+    const int64_t n_head_dim = hparams.n_embd_head_k(0);
+    const int64_t n_ff_exp   = hparams.n_ff_exp;
+    const int64_t n_ff_shexp = hparams.n_ff_shexp > 0 ? hparams.n_ff_shexp : hparams.n_ff_exp * hparams.n_expert_shared;
+    const int64_t n_expert   = hparams.n_expert;
+    const int64_t q_dim      = n_head * n_head_dim;
+    const int64_t out_low_dim = n_lora_o * n_o_groups;
+    if (n_head % n_o_groups != 0) {
+        err = string_format("DeepSeek4 target n_head=%" PRId64 " is not divisible by n_o_groups=%" PRId64, n_head,
+                            n_o_groups);
+        return false;
+    }
+    const int64_t attn_o_a_dim = n_head_dim * (n_head / n_o_groups);
+
+    const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+    if (n_tensors != 32) {
+        err = string_format("MTP sidecar has %" PRId64 " tensors, expected 32", n_tensors);
+        return false;
+    }
+
+    auto check = [&](const char * name, std::initializer_list<int64_t> ne, std::initializer_list<ggml_type> types) {
+        return server_dsv4_mtp_check_tensor(ctx_meta.get(), name, ne, types, err);
+    };
+    const std::initializer_list<ggml_type> plain  = { GGML_TYPE_F32, GGML_TYPE_F16 };
+    const std::initializer_list<ggml_type> routed = { GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K };
+
+    if (!check("mtp.0.hc_head_base.weight", { n_hc }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_head_fn.weight", { n_hc_state, n_hc }, plain) ||
+        !check("mtp.0.hc_head_scale.weight", { 1 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.e_proj.weight", { n_embd, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.h_proj.weight", { n_embd, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.enorm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hnorm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_attn_fn.weight", { n_hc_state, n_hc_mix }, plain) ||
+        !check("mtp.0.hc_attn_scale.weight", { 3 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_attn_base.weight", { n_hc_mix }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_q_a.weight", { n_embd, n_lora_q }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_q_a_norm.weight", { n_lora_q }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_q_b.weight", { n_lora_q, q_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_kv.weight", { n_embd, n_head_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_kv_a_norm.weight", { n_head_dim }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_sinks.weight", { n_head }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.attn_output_a.weight", { attn_o_a_dim, out_low_dim }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.attn_output_b.weight", { out_low_dim, n_embd }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.hc_ffn_fn.weight", { n_hc_state, n_hc_mix }, plain) ||
+        !check("mtp.0.hc_ffn_scale.weight", { 3 }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.hc_ffn_base.weight", { n_hc_mix }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_norm.weight", { n_embd }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_gate_inp.weight", { n_embd, n_expert }, plain) ||
+        !check("mtp.0.exp_probs_b.bias", { n_expert }, { GGML_TYPE_F32 }) ||
+        !check("mtp.0.ffn_gate_exps.weight", { n_embd, n_ff_exp, n_expert }, routed) ||
+        !check("mtp.0.ffn_up_exps.weight", { n_embd, n_ff_exp, n_expert }, routed) ||
+        !check("mtp.0.ffn_down_exps.weight", { n_ff_exp, n_embd, n_expert }, routed) ||
+        !check("mtp.0.ffn_gate_shexp.weight", { n_embd, n_ff_shexp }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.ffn_up_shexp.weight", { n_embd, n_ff_shexp }, { GGML_TYPE_Q8_0 }) ||
+        !check("mtp.0.ffn_down_shexp.weight", { n_ff_shexp, n_embd }, { GGML_TYPE_Q8_0 })) {
+        return false;
+    }
+
+    const ggml_tensor * gate_exps = ggml_get_tensor(ctx_meta.get(), "mtp.0.ffn_gate_exps.weight");
+    const ggml_tensor * up_exps   = ggml_get_tensor(ctx_meta.get(), "mtp.0.ffn_up_exps.weight");
+    if (gate_exps != nullptr && up_exps != nullptr && gate_exps->type != up_exps->type) {
+        err = string_format("MTP routed gate/up expert types differ: %s vs %s", ggml_type_name(gate_exps->type),
+                            ggml_type_name(up_exps->type));
+        return false;
+    }
+
+    return true;
 }
 
 static bool server_env_truthy(const char * name) {
@@ -855,6 +1092,31 @@ private:
         n_ctx = llama_n_ctx(ctx);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (params_base.speculative.has_mtp()) {
+            std::string mtp_err;
+            if (!server_dsv4_validate_mtp_sidecar(params_base.speculative.mtp_model, model, mtp_err)) {
+                SRV_ERR("failed to validate DeepSeek4 MTP sidecar '%s': %s\n",
+                        params_base.speculative.mtp_model.c_str(), mtp_err.c_str());
+                return false;
+            }
+            SRV_INF("validated DeepSeek4 MTP sidecar '%s' (draft=%d)\n", params_base.speculative.mtp_model.c_str(),
+                    params_base.speculative.mtp_draft);
+            const bool mtp_probe = server_env_truthy("DSV4_MTP_PROBE");
+            ctx->set_dsv4_mtp_probe(mtp_probe);
+            if (mtp_probe) {
+                std::string mtp_load_err;
+                if (!ctx->load_dsv4_mtp_sidecar(params_base.speculative.mtp_model, mtp_load_err)) {
+                    throw std::runtime_error(string_format("failed to load DeepSeek4 MTP sidecar tensor data '%s': %s",
+                                                           params_base.speculative.mtp_model.c_str(),
+                                                           mtp_load_err.c_str()));
+                }
+                SRV_WRN("%s\n", "DeepSeek4 MTP probe is enabled; drafting/speculative commit is still disabled");
+            } else {
+                SRV_WRN("%s\n",
+                        "DeepSeek4 MTP drafting is not enabled yet; sidecar validation is loader/probe plumbing only");
+            }
+        }
 
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?

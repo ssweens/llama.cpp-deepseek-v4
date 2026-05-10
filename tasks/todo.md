@@ -249,3 +249,28 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Trace current llama.cpp DeepSeek4 loader/graph/speculative interfaces for the smallest no-behavior loader/probe hook.
 - [x] Produce an implementation sketch for `--mtp-model` / `--mtp-draft` feasibility, explicitly separating no-op loader plumbing from runtime speculative commit.
 - [x] Record spike results, blockers, and recommended next branch in `tasks/dsv4_mtp_feasibility_spike.md`.
+
+## DeepSeek4 MTP loader/probe — `work/dsv4-mtp-loader-probe`
+
+### Plan
+- [x] Download/stage `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` locally without modifying the target GGUFs: `/mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` (`3,807,602,400` bytes).
+- [x] Add default-off DeepSeek4 MTP validation/probe plumbing behind existing speculative flags: `--spec-type mtp`, `--model-draft <MTP.gguf>`, and `--draft-max`.
+- [x] Implement a DeepSeek4 sidecar GGUF metadata/tensor validator for `general.architecture = deepseek4_mtp_support`.
+- [x] Wire server startup to validate the sidecar and fail cleanly on unsupported/non-DeepSeek4 combinations.
+- [x] Keep runtime speculative commit disabled; draft-token diagnostics deferred until sidecar tensor loading.
+- [x] Add default-off generic MTP state output/copy plumbing for `DSV4_MTP_PROBE=1` + `--spec-type mtp`, with DeepSeek4 supplying final HC state as the handoff tensor.
+- [x] Add env-gated sidecar tensor data loading into a persistent backend weight buffer.
+- [x] Add an env-gated DeepSeek4 MTP projection/top-1 probe that feeds base token embedding + captured target HC state through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs probe top-1 vs target argmax without changing emitted tokens.
+- [x] Validate real DeepSeek4 target + MTP sidecar startup/projection probe on IQ1_M CPU-only target; fix CPU BF16 RHS matmul compatibility and explicitly connect the projection-top1 graph output.
+- [ ] Build the full one-token MTP transformer block graph with sidecar attention/FFN/cache state after the projection probe is compiling and observable.
+- [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
+- [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.
+
+### Review
+- `llama-server` build passed after MTP sidecar validation, generic MTP state output/copy, env-gated sidecar tensor loading, projection/top-1 probe changes, and the real-target CPU BF16/top1-output fixes.
+- Server help exposes existing speculative flags `--spec-type`, `--model-draft`, and `--draft-max`.
+- Tiny non-DeepSeek4 target plus `DSV4_MTP_PROBE=1 --spec-type mtp --model-draft ...` exits cleanly before tensor-data loading with the expected unsupported-target error.
+- Tiny no-MTP server health check returned `{"status":"ok"}` after 2 seconds.
+- Real DeepSeek4 IQ1_M + MTP sidecar probe reached health after 82 seconds and logged `dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0` on a one-token completion without changing emitted-token behavior.
+- `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
+- `git diff --check` passed.

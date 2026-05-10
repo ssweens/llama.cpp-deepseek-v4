@@ -1,16 +1,18 @@
 #pragma once
 
-#include "llama.h"
-#include "llama-ext.h"
-#include "llama-cparams.h"
-#include "llama-graph.h"
-#include "llama-adapter.h"
-#include "llama-impl.h"
-
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "llama-adapter.h"
+#include "llama-cparams.h"
+#include "llama-ext.h"
+#include "llama-graph.h"
+#include "llama-impl.h"
+#include "llama.h"
 
 #include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -69,6 +71,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    const std::vector<float> & get_dsv4_mtp_hc_state() const;
+    const ggml_tensor *        get_dsv4_mtp_tensor(const char * name) const;
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -94,6 +99,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_dsv4_mtp_probe(bool value);
+    bool load_dsv4_mtp_sidecar(const std::string & path, std::string & err);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -285,6 +292,18 @@ private:
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
+    // optional DeepSeek4 MTP probe state copied from the final HC tensor for the last single-token decode graph
+    std::vector<float> dsv4_mtp_hc_state;
+
+    struct dsv4_mtp_sidecar_data {
+        gguf_context_ptr                               ctx_gguf;
+        ggml_context_ptr                               ctx;
+        ggml_backend_buffer_ptr                        buf;
+        std::unordered_map<std::string, ggml_tensor *> tensors;
+    };
+
+    std::unique_ptr<dsv4_mtp_sidecar_data> dsv4_mtp_sidecar;
+
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
@@ -302,6 +321,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool dsv4_mtp_probe     = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

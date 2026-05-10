@@ -3509,6 +3509,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.mparams_dft.path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MODEL_DRAFT"));
+    add_opt(common_arg({ "--mtp-model" }, "FNAME",
+                       "DeepSeek4 MTP support sidecar GGUF for future speculative decoding (default: unused)",
+                       [](common_params & params, const std::string & value) { params.speculative.mtp_model = value; })
+                .set_examples({ LLAMA_EXAMPLE_SERVER })
+                .set_env("LLAMA_ARG_MTP_MODEL"));
+    add_opt(common_arg({ "--mtp-draft" }, "N",
+                       string_format("maximum DeepSeek4 MTP draft tokens per speculative step (default: %d)",
+                                     params.speculative.mtp_draft),
+                       [](common_params & params, int value) {
+                           if (value < 1 || value > 16) {
+                               throw std::invalid_argument("MTP draft count must be between 1 and 16");
+                           }
+                           params.speculative.mtp_draft = value;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER })
+                .set_env("LLAMA_ARG_MTP_DRAFT"));
     add_opt(common_arg(
         {"--spec-replace"}, "TARGET", "DRAFT",
         "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
