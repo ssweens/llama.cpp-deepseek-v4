@@ -2432,6 +2432,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 mtp2_Kcur = as_f32(mtp2_Kcur);
                 mtp2_Kcur = apply_fp8_qat_nope_2d(mtp2_Kcur, "dsv4_mtp2_attn_kv_qat", -1);
                 cb(mtp2_Kcur, "dsv4_mtp2_attn_kv", -1);
+                res->t_mtp_raw_draft = mtp2_Kcur;
 
                 ggml_tensor * mtp2_raw_kv = ggml_concat(ctx0, mtp_raw_kv, mtp2_Kcur, 2);
                 cb(mtp2_raw_kv, "dsv4_mtp2_raw_kv", -1);

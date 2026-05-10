@@ -834,6 +834,10 @@ const std::vector<float> & llama_context::get_mtp_next_state() const {
     return mtp_next_state;
 }
 
+const std::vector<float> & llama_context::get_mtp_raw_draft() const {
+    return mtp_raw_draft;
+}
+
 const ggml_tensor * llama_context::get_mtp_tensor(const char * name) const {
     if (!dsv4_mtp_sidecar) {
         return nullptr;
@@ -1111,6 +1115,7 @@ void llama_context::clear_mtp_probe_state() {
     mtp_raw_cache.clear();
     mtp_state.clear();
     mtp_next_state.clear();
+    mtp_raw_draft.clear();
     mtp_probe_top1      = LLAMA_TOKEN_NULL;
     mtp_probe_top1_next = LLAMA_TOKEN_NULL;
 }
@@ -1997,6 +2002,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                           sizeof(mtp_probe_top1_next));
         } else {
             mtp_probe_top1_next = LLAMA_TOKEN_NULL;
+        }
+
+        if (auto * t_mtp_raw_draft = res->get_mtp_raw_draft()) {
+            GGML_ASSERT(t_mtp_raw_draft->type == GGML_TYPE_F32);
+            mtp_raw_draft.resize(ggml_nelements(t_mtp_raw_draft));
+            ggml_backend_tensor_get(t_mtp_raw_draft, mtp_raw_draft.data(), 0, ggml_nbytes(t_mtp_raw_draft));
+        } else {
+            mtp_raw_draft.clear();
         }
 
         if (auto * t_mtp_raw_current = res->get_mtp_raw_current()) {

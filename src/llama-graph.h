@@ -663,6 +663,8 @@ public:
 
     ggml_tensor * get_mtp_raw_current() const { return t_mtp_raw_current; }
 
+    ggml_tensor * get_mtp_raw_draft() const { return t_mtp_raw_draft; }
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -695,6 +697,7 @@ public:
     ggml_tensor * t_mtp_probe_top1      = nullptr;
     ggml_tensor * t_mtp_probe_top1_next = nullptr;
     ggml_tensor * t_mtp_raw_current     = nullptr;
+    ggml_tensor * t_mtp_raw_draft       = nullptr;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

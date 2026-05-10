@@ -73,6 +73,7 @@ struct llama_context {
 
     const std::vector<float> & get_mtp_state() const;
     const std::vector<float> & get_mtp_next_state() const;
+    const std::vector<float> & get_mtp_raw_draft() const;
     const ggml_tensor *        get_mtp_tensor(const char * name) const;
     llama_token                get_mtp_probe_top1() const;
     llama_token                get_mtp_probe_top1_next() const;
@@ -299,6 +300,7 @@ private:
     // optional MTP probe state copied from model-specific handoff tensors for the last single-token decode graph
     std::vector<float> mtp_state;
     std::vector<float> mtp_next_state;
+    std::vector<float> mtp_raw_draft;
     llama_token        mtp_probe_top1      = LLAMA_TOKEN_NULL;
     llama_token        mtp_probe_top1_next = LLAMA_TOKEN_NULL;
 

@@ -169,6 +169,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - the graph computes a one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax;
 - decode now copies both the target HC handoff and the sidecar block's output HC handoff, preparing recursive MTP draft probing;
 - when `--draft-max > 1`, the probe unrolls a second sidecar block in the same graph: draft[0] comes from target HC + current token, draft[1] comes from sidecar HC + draft[0] token, with no target-layer execution and no emitted-token changes;
+- the recursive block's raw K row is copied to host as a draft raw-row candidate for future accept-time private raw-cache commit; it is not appended to persistent raw state yet;
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute; the host cache stores at most `raw_window - 1` prior rows because the graph concatenates the current row separately;
 - the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 

@@ -270,6 +270,7 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - [x] Capture the MTP sidecar output HC state as a graph/context handoff for recursive draft probing.
   - [x] Verify target compressed/indexer frontier rollback for speculative verification uses existing hybrid-ISWA state checkpoints (`mem_recr` frontiers + DeepSeek4 compressed cache rows) before enabling commit.
   - [x] Add an MTP-only recursive draft-2 probe that consumes target HC for draft[0], then sidecar HC plus draft[0] token for draft[1], without running target layers or changing emitted tokens.
+  - [x] Capture recursive draft raw-row candidates as a host handoff for future accepted-token private raw-cache commit.
   - [ ] Generalize the recursive MTP probe beyond draft-2 if future validation shows value beyond DS4's production depth-two path.
   - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
