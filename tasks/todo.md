@@ -267,7 +267,7 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
   - [x] Start with a private raw-window cache (`mtp_raw_cache`/`mtp_n_raw` equivalent) owned by `llama_context`, separate from target KV/cache.
   - [x] Feed the one-token MTP block from that private raw cache instead of current-token-only raw attention on continuation steps.
   - [ ] Add private compressed/indexer cache state for long-context parity with DS4 authority.
-  - [ ] Harden reset/slot lifecycle handling before any speculative verification/commit work.
+  - [x] Harden reset/slot lifecycle handling for the host-backed raw probe state before any speculative verification/commit work.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
 - [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.
 

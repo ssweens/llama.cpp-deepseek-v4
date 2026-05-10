@@ -101,6 +101,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_mtp_probe(bool value);
+    void clear_mtp_probe_state();
     bool load_dsv4_mtp_sidecar(const std::string & path, std::string & err);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

@@ -161,7 +161,7 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
 - the graph computes a one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax;
 - continuation steps feed prior private MTP raw rows from host state into the block and copy the current MTP raw row back after compute;
-- the private raw state resets on discontinuities/non-single-token probe batches and remains separate from target KV/cache state.
+- the private raw state resets on discontinuities/non-single-token probe batches and on server slot prompt/reset paths, and remains separate from target KV/cache state.
 
 This is intentionally still a handoff/probe surface. It does not alter emitted tokens. Private compressed/indexer state and speculative verification/commit are still required before this can become a real speculative drafter.
 

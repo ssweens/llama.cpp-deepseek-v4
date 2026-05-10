@@ -1089,12 +1089,16 @@ void llama_context::set_mtp_probe(bool value) {
         return;
     }
 
-    mtp_probe          = value;
-    mtp_n_raw          = 0;
-    mtp_raw_seq_id     = -1;
-    mtp_raw_last_pos   = -1;
-    mtp_raw_cache.clear();
+    mtp_probe = value;
+    clear_mtp_probe_state();
     sched_need_reserve = true;
+}
+
+void llama_context::clear_mtp_probe_state() {
+    mtp_n_raw        = 0;
+    mtp_raw_seq_id   = -1;
+    mtp_raw_last_pos = -1;
+    mtp_raw_cache.clear();
 }
 
 bool llama_context::load_dsv4_mtp_sidecar(const std::string & path, std::string & err) {

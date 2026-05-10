@@ -438,6 +438,7 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        ctx->clear_mtp_probe_state();
         prompt.tokens.clear();
     }
 
@@ -498,6 +499,7 @@ struct server_slot {
         task.reset();
 
         llama_set_sampler(ctx, id, nullptr);
+        ctx->clear_mtp_probe_state();
 
         // clear alora start
         alora_invocation_start = -1;
