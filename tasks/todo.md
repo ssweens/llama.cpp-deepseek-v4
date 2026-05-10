@@ -261,16 +261,18 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - [x] Add default-off generic MTP state output/copy plumbing for `DSV4_MTP_PROBE=1` + `--spec-type mtp`, with DeepSeek4 supplying final HC state as the handoff tensor.
 - [x] Add env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - [x] Add an env-gated DeepSeek4 MTP projection/top-1 probe that feeds base token embedding + captured target HC state through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs probe top-1 vs target argmax without changing emitted tokens.
-- [x] Validate real DeepSeek4 target + MTP sidecar startup/projection probe on IQ1_M CPU-only target; fix CPU BF16 RHS matmul compatibility and explicitly connect the projection-top1 graph output.
-- [ ] Build the full one-token MTP transformer block graph with sidecar attention/FFN/cache state after the projection probe is compiling and observable.
+- [x] Validate real DeepSeek4 target + MTP sidecar startup/projection probe on IQ1_M CPU-only target; fix CPU BF16 RHS matmul compatibility and explicitly connect probe top-1 graph outputs.
+- [x] Build a raw-current one-token MTP transformer block probe with sidecar attention/FFN/HC tensors and logical layer-1 RoPE, without mutating target KV/cache state.
+- [ ] Add persistent private MTP raw/compressed/indexer cache state before using block-probe output as a real speculative draft.
 - [x] Build `llama-server` and run no-MTP regression/smoke checks to prove default behavior is unchanged.
 - [x] Document results and exact next step for draft-one graph probing: `tasks/dsv4_mtp_loader_probe.md`.
 
 ### Review
-- `llama-server` build passed after MTP sidecar validation, generic MTP state output/copy, env-gated sidecar tensor loading, projection/top-1 probe changes, and the real-target CPU BF16/top1-output fixes.
+- `llama-server` build passed after MTP sidecar validation, generic MTP state output/copy, env-gated sidecar tensor loading, projection/top-1 probe changes, real-target CPU BF16/top1-output fixes, and raw-current MTP block probe wiring.
 - Server help exposes existing speculative flags `--spec-type`, `--model-draft`, and `--draft-max`.
 - Tiny non-DeepSeek4 target plus `DSV4_MTP_PROBE=1 --spec-type mtp --model-draft ...` exits cleanly before tensor-data loading with the expected unsupported-target error.
 - Tiny no-MTP server health check returned `{"status":"ok"}` after 2 seconds.
-- Real DeepSeek4 IQ1_M + MTP sidecar probe reached health after 82 seconds and logged `dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0` on a one-token completion without changing emitted-token behavior.
+- Real DeepSeek4 IQ1_M + MTP sidecar projection probe reached health after 82 seconds and logged `dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0` on a one-token completion without changing emitted-token behavior.
+- Real DeepSeek4 IQ1_M + raw-current MTP block probe reached health after 88 seconds and logged `dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0` on a one-token completion without changing emitted-token behavior.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.

@@ -14,8 +14,9 @@ Date: 2026-05-09
 - Added a host-side copy buffer for that MTP handoff state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
-- Fixed CPU-only DeepSeek4 reserve/probe issues found by the real IQ1_M target run: BF16 activation inputs are cast back to F32 for non-BF16 weight matmuls so CPU supports the op, and the disconnected projection-top1 probe tensor is explicitly expanded into the graph before decode copies it.
-- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables state/projection probe plumbing. Server slot initialization intentionally skips `common_speculative_init()` for MTP until the full runtime drafter is wired.
+- Extended the probe to run a raw-current one-token MTP transformer block using sidecar attention, FFN, HC, and output-head tensors before logging draft top-1 vs target argmax. This still does not mutate target KV/cache state or commit draft tokens.
+- Fixed CPU-only DeepSeek4 reserve/probe issues found by the real IQ1_M target run: BF16 activation inputs are cast back to F32 for non-BF16 weight matmuls so CPU supports the op, and disconnected probe top-1 tensors are explicitly expanded into the graph before decode copies them.
+- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables state/block-probe plumbing. Server slot initialization intentionally skips `common_speculative_init()` for MTP until the full runtime drafter is wired.
 - Documented the new server flags in `tools/server/README.md`.
 
 ## Staged sidecar
@@ -40,7 +41,7 @@ tensors = 32
 
 ## Validation behavior
 
-The server validator is metadata/tensor-directory only in default startup mode. It does not load sidecar tensor data unless `DSV4_MTP_PROBE=1` is also set. Probe mode loads the already-validated sidecar tensors into a persistent backend weight buffer and runs the projection-only probe graph, but still does not run the full MTP transformer block or alter emitted tokens.
+The server validator is metadata/tensor-directory only in default startup mode. It does not load sidecar tensor data unless `DSV4_MTP_PROBE=1` is also set. Probe mode loads the already-validated sidecar tensors into a persistent backend weight buffer and runs a raw-current one-token MTP block probe, but still does not maintain private MTP cache state or alter emitted tokens.
 
 Validation requires:
 
@@ -118,6 +119,12 @@ load_dsv4_mtp_sidecar: loaded 32 DeepSeek4 MTP sidecar tensors into CPU_Mapped b
 dsv4 mtp projection probe: target_argmax=201 projection_top1=20219 match=0
 ```
 
+After the raw-current one-token MTP block probe was added, the same target/sidecar command reached health after 88 seconds; one-token completion returned newline after ~9 seconds and logged:
+
+```text
+dsv4 mtp block probe: target_argmax=201 draft_top1=2390 match=0
+```
+
 The smaller `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` target was rejected as corrupted/incomplete before MTP validation (`blk.4.ffn_down_exps.weight` out of file bounds), so the real probe used the valid IQ1_M target.
 
 Whitespaces:
@@ -132,7 +139,7 @@ Note: whole-file `clang-format --dry-run` on `tools/server/server-context.cpp` r
 
 ## Not implemented yet
 
-- No full MTP transformer-block graph.
+- No persistent private MTP raw/compressed/indexer cache/state.
 - No draft token generation.
 - No speculative verification/commit.
 
@@ -145,9 +152,9 @@ When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP
 - graph reuse accounts for that flag;
 - DeepSeek4 marks the final per-token `hc_state` as generic MTP state output only for `n_tokens == 1 && n_outputs == 1` graphs, avoiding prompt-prefill HC output blowups;
 - decode copies that F32 handoff state into `llama_context::get_mtp_state()`;
-- the graph computes a projection-only top-1 through the sidecar input projections and sidecar output head, and the server logs it against the target argmax.
+- the graph computes a raw-current one-token MTP block through the sidecar input projections, logical layer-1 raw attention, FFN, sidecar HC head/norm, and base output, and the server logs it against the target argmax.
 
-This is intentionally only a handoff/probe surface. It does not alter emitted tokens and does not run the one-layer MTP transformer block yet, so the logged projection top-1 is not a speculative draft token.
+This is intentionally still a handoff/probe surface. It does not alter emitted tokens. The block uses only the current token as raw attention context and avoids target KV/cache mutation; persistent private MTP cache/state is still required before this can become a real speculative drafter.
 
 ## Full-block design notes
 
@@ -164,8 +171,8 @@ The DS4 authority path (`metal_graph_eval_mtp_draft_from_hc`) shows the full MTP
 Important constraints for the next implementation:
 
 - The MTP block must not reuse or mutate target model KV/cache state. It needs private MTP raw-window/cache/state tensors analogous to DS4 authority's `mtp_raw_cache`, `mtp_n_raw`, and per-layer compressed/indexer state.
-- The DS4 authority calls the MTP block with logical layer id `1`; the llama.cpp graph should preserve the same DS4 rope/compression schedule instead of assuming logical layer `0` from the sidecar tensor prefix.
-- The current projection/top-1 probe intentionally stops before the transformer block. Its top-1 log validates sidecar tensor loading, target HC handoff, graph outputs, and server logging, but it is not a useful draft-quality metric.
+- The DS4 authority calls the MTP block with logical layer id `1`; the llama.cpp graph preserves that schedule for the current raw-one block probe.
+- The current block probe intentionally uses raw-current attention only. Its top-1 log validates sidecar tensor loading, target HC handoff, sidecar attention/FFN graph wiring, graph outputs, and server logging, but it is not yet a complete speculative draft-quality metric.
 
 ## Next exact step
 
@@ -177,6 +184,6 @@ work/dsv4-mtp-hc-probe
 
 Recommended scope:
 
-1. Build the missing one-token MTP transformer-block graph and its private cache/state handling between the now-working sidecar input projection and sidecar output head.
-2. Under `DSV4_MTP_PROBE=1`, log full draft top-1 and compare it against the target argmax without changing emitted tokens.
+1. Add persistent private MTP raw/compressed/indexer cache/state handling, starting with raw-window state equivalent to DS4 authority's `mtp_raw_cache` / `mtp_n_raw`.
+2. Under `DSV4_MTP_PROBE=1`, compare cached-state draft top-1 against the current raw-one block top-1 and target argmax without changing emitted tokens.
 3. Do not implement speculative commit until deterministic no-MTP vs probe token streams match exactly.
