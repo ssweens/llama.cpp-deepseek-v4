@@ -254,6 +254,10 @@ I sanitized newly added runbook docs and the regression script's local DS4 path,
 - When MTP accepts drafts but remains slower, split timing into target decode calls avoided, MTP graph time, verifier/replay rollback time, and scheduler/server overhead before making another code change.
 - Keep a target-only baseline and a current-MTP smoke result side by side. If acceptance improves without speed, stop optimizing acceptance and identify the overhead source.
 
+## 2026-05-10 — Scope performance corrections exactly
+- When the user says “prefill during MTP,” do not broaden it to general model prefill. Isolate the MTP path’s own setup/draft/prefill work and compare that against target decode cost before changing unrelated prompt-prefill code.
+- For DeepSeek4 MTP speed, separate three costs before changing behavior: sidecar draft graph cost, target verifier batch cost, and partial-accept replay cost. Accepted drafts can still slow decode if DS4 verifier batches (`n_tokens=2/3`) are slower per visible token than target-only one-token decode.
+
 ## 2026-05-09 — Re-ground DeepSeek4 MTP fixes in references
 - When the user says to use the references, pause implementation and re-read the authoritative DeepSeek4 MTP loop in `/home/bigkahuna/src/ds4` plus the upstream speculative/MTP PR before changing behavior.
 - Do not infer DS4 MTP state transitions from current WIP logs alone. Map each proposed change to reference semantics: when the MTP hidden state/raw cache advances, when verification discards tail state, and which path owns rollback.

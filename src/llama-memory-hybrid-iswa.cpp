@@ -189,7 +189,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                 uint32_t   n_rollback_max) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -217,7 +218,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_seq_max,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recurrent(il); }
-            : filter_recr
+            : filter_recr,
+        n_rollback_max
     )) {
     if (model.arch != LLM_ARCH_DEEPSEEK4) {
         return;

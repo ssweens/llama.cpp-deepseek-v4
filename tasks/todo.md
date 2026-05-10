@@ -289,6 +289,17 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 
 ### Current triangulation checkpoint — accepted drafts are no longer the main blocker
 
+#### MTP verifier/prefill obvious-factor investigation
+- [x] Correct the scope: the pp2048 prompt prefill itself remains ~400 tok/s with MTP enabled; the slow path is the MTP speculative decode/verification path after prefill.
+- [x] Fix the sidecar MTP graph topology churn: raw-cache length now uses a fixed sliding-window tensor plus mask, so changing `n_raw` no longer forces a new MTP graph shape. Short trace now keeps sidecar predictions aligned with integrated MTP across accepted rows.
+- [x] Batch DS4 partial-accept replay instead of replaying accepted tokens through one `decode()` call per token.
+- [x] Test depth/alignment hypothesis: draft-max 3 creates more drafts but standard pp2048/tg32 got worse (`tg≈13.27`) because partial-accept replay dominates; cap was restored to 2.
+- [x] Profile the remaining draft-max 1 verifier path: MTP draft generation is not the wall (`dur(g)=14 ms` in pp2048/tg8 profile); full target-model work dominates (`MUL_MAT_ID`, `MUL_MAT`, `DSV4_SPARSE_ATTN`).
+- [ ] Next real speed fix must target DS4 small continuation verifier batches (`n_tokens=2/3`, `path=decode-replay`) or implement a DS4-style micro verifier/prefix-frontier capture; standard MTP remains slower until verifier batches are faster than separate target decodes.
+- [x] Tested removing the raw-target-top1 pre-gate after the raw-cache fix. It helps draft-max 1 (`tg≈19.9`) but hurts draft-max 2 (`tg≈13.4`) by increasing partial accepts/replay, so raw-top pre-gating is now retained for multi-token drafts and relaxed only for draft-max 1.
+- [x] Added a separate MTP scheduler/graph result to avoid target graph eviction of the MTP sidecar graph. It reduced sidecar draft cost (`dur(g)` around `147 ms -> 113 ms` in draft-max 1 smoke), but standard throughput is still verifier-bound.
+- [x] Retested depth 4 after the raw-cache fix. It remains unsafe: the counting prompt diverged (`...10,10,10...`) despite accepted drafts, confirming deeper verifier batches still need an exact DS4 prefix/frontier solution before exposure.
+
 #### Post-boundary cleanup execution plan
 - [x] Build mounted Docker binaries from commit `2be876ea0` before runtime testing.
 - [x] Smoke IQ2_XXS MTP without diagnostics and compare draft generation/acceptance against the prior diagnostics-on/off mismatch hypothesis: normal path now generates/accepts drafts without diagnostics on raw deterministic prompts.
@@ -359,3 +370,25 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - Container target-only chat baseline (`/tmp/dsv4_mtp_docker_target_chat_resp.json`) and MTP-probe chat run (`/tmp/dsv4_mtp_docker_probe_chat_resp.json`) matched exactly on assistant content, reasoning text, finish reason, and usage. MTP probe log showed sidecar tensors loaded into `CUDA_Host` and preview accounting `draft1_hits=9/30 draft2_hits=1/10`.
 - `/mnt/supmodels/gguf/deepseek-ai__DeepSeek-V4-Flash-Q2_K_S.with-template.gguf` is not usable for this probe; loader reports it is corrupted/incomplete (`blk.4.ffn_down_exps.weight` out of file bounds).
 - `git diff --check` passed.
+
+## DeepSeek4 MTP optimization checkpoint (2026-05-10)
+
+### Plan
+- [x] Build the latest mounted Docker `llama-server` after the adaptive MTP cooldown changes.
+- [x] Clean stale ad hoc benchmark containers before launching a resident MTP benchmark server.
+- [x] Validate IQ2_XXS resident-server MTP with `llama-benchy pp2048 tg32 --runs 3`, coherence enabled, `--draft-max 1`.
+- [x] Record accepted/generated draft counts and compare decode throughput against the same-build target-only baseline.
+- [ ] Re-test deterministic raw ctx8192 parity after the adaptive cooldown if more code changes land.
+- [x] Audit final diff for accidental diagnostics overhead: top-2 logits/margin are gated by `LLAMA_MTP_TRACE`, and normal runs only keep the required MTP state/top1 outputs.
+- [x] Run `git diff --check` and stop all ad hoc MTP containers before commit.
+
+### Review
+- Mounted Docker build passed: `cmake --build build-dsv4-container --target llama-server -j 8`.
+- IQ2_XXS MTP `--draft-max 1` resident benchmark passed coherence. Saved artifacts:
+  - `/tmp/dsv4_iq2xxs_mtp_draft1_adaptive_benchy_pp2048_tg32_runs3.json`
+  - `/tmp/dsv4_iq2xxs_mtp_draft1_adaptive_server_runs3.log`
+  - `/tmp/dsv4_iq2xxs_mtp_draft1_adaptive_benchy_runs3.out`
+- MTP throughput: pp2048 `397.83 ± 3.37 tok/s`, tg32 `30.73 ± 0.34 tok/s`. Same-build target-only comparison: pp2048 `400.30 ± 2.08 tok/s`, tg32 `29.93 ± 0.36 tok/s`. This is the first standard IQ2_XXS decode win on the resident benchmark path, with a small prompt-eval cost.
+- Server draft stats by measured run: `4/6`, `5/8`, and `8/12` accepted/generated; adaptive cooldown avoided drafting on low-value steps instead of forcing sidecar work every token.
+- Target-only artifact saved to `/tmp/dsv4_iq2xxs_target_postrollback_benchy_pp2048_tg32_runs3.json`; server log saved to `/tmp/dsv4_iq2xxs_target_postrollback_server_runs3.log`.
+- Remaining caveat: draft depths above 1 still need cleanup; draft-max 2 has not yet shown a standard benchmark win and draft-max 4 remains correctness-unsafe.

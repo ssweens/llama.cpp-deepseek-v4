@@ -38,7 +38,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                 uint32_t   n_rollback_max = 0);
 
     ~llama_memory_hybrid_iswa() = default;
 

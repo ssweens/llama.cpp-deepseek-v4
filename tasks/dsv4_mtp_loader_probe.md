@@ -3,15 +3,25 @@
 Branch: `work/dsv4-mtp-loader-probe`
 Date: 2026-05-09
 
-## Current status update (2026-05-09)
+## Current status update (2026-05-10)
 
 - MTP runtime is no longer probe-only: `--spec-type mtp --model-draft <MTP-support.gguf>` loads the MTP draft GGUF, routes drafting through `common/speculative.cpp`, and uses the existing server verifier/accept loop.
-- `DSV4_MTP_PROBE=1` is diagnostics-only. Normal MTP runtime works without it; diagnostics mode keeps the full HC/raw handoff copies and detailed preview logging.
+- Implemented DS4-style cheap MTP rollback for the target verifier path: recurrent state rows are widened with two rollback snapshots, DeepSeek4 decode stores per-token compressor/indexer frontier snapshots for small verifier batches, and `seq_rm` rewinds by selecting the saved recurrent row instead of replaying through the target model.
+- Added target HC prefix capture for verifier batches so MTP can restore the sidecar handoff state after full rejects or one-token partial accepts without target replay.
+- MTP top-2/margin diagnostics are now gated by `LLAMA_MTP_TRACE`; normal MTP runs do not pay the unconditional `ggml_top_k` overhead.
+- The draft pre-gate now requires MTP draft[0] to match the target raw top-1, including `--draft-max 1`, so verifier batches only run when the sidecar is aligned with the target next token.
+- Added adaptive MTP throttling in `common/speculative.cpp`: repeated zero-draft or low-acceptance windows enter a short cooldown and use target-only decode for those steps, preserving output while avoiding unproductive sidecar calls.
+- Standard IQ2_XXS `llama-benchy pp2048/tg32 --runs 3`, `--draft-max 1`, passed coherence and measured decode `30.73 ± 0.34 tok/s` vs same-build target-only `29.93 ± 0.36 tok/s`. Prompt eval was `397.83 ± 3.37 tok/s` vs target-only `400.30 ± 2.08 tok/s`, so the branch has a measured decode win and a small prompt-eval cost from MTP-enabled runtime state.
+- Depth > 1 is still not the recommended speed path. Draft-max 2 remains vulnerable to partial-accept economics despite rollback support, and draft-max 4 remains correctness-unsafe on the counting prompt.
+- `DSV4_MTP_PROBE=1` / `LLAMA_MTP_TRACE` are diagnostics-only. Normal MTP runtime works without them.
+
+## Previous status update (2026-05-09)
+
 - Code organization was reset to mirror existing patterns: speculative orchestration lives in `common/speculative.cpp` / server verifier flow, DeepSeek4 MTP metadata/tensor validation lives behind `src/models/deepseek4.*`, and the server no longer calls a `src/models/models.h` MTP hook.
 - Boundary cleanup: generic server/speculative code no longer contains DS4/MTP env names, timing probes, or DS4 MTP log/comment text; `llama_context` uses generic model/memory hooks for MTP draft validation, raw-window policy, and recurrent-state replay instead of direct DS4 references.
 - Docker mounted-code validation shows real accepted drafts and correct visible content on smoke prompts. After sidecar depth-2 plus verifier full-accept cleanup skip, a raw deterministic ctx8192 prompt improved from target-only `46.94 tok/s` to MTP `52.12 tok/s` with matching visible text and `20/20` accepted/generated drafts.
-- Standard IQ2_XXS `llama-benchy pp2048/tg32` is still not solved: freecheck MTP generates 0-1 drafts on the natural bench prompt, so tg remains below the prior target-only baseline. This means the remaining blocker is MTP draft quality/alignment on long natural prompts, not verifier cleanup overhead.
-- Rejected hypotheses: moving the MTP draft to a 5090 via `--device-draft CUDA1` did not improve raw speed enough; sampled-token-conditioned drafting generated more natural-text drafts but caused partial-accept replay to dominate (`accept` hundreds of ms) and is not safe as-is; removing the raw-target-top1 pre-gate did not increase standard bench drafts; disabling repeat penalty did not increase standard bench drafts.
+- Earlier standard IQ2_XXS `llama-benchy pp2048/tg32` runs were slower because DS4 target verifier batches (`n_tokens=2/3`) ran the small continuation `decode-replay` path. Draft generation itself was no longer the wall; target verifier batch/replay cost was.
+- Rejected/qualified hypotheses: moving the MTP draft to a 5090 via `--device-draft CUDA1` did not improve raw speed enough; sampled-token-conditioned drafting generated more natural-text drafts but caused partial-accept replay to dominate (`accept` hundreds of ms) and is not safe as-is; disabling repeat penalty did not increase standard bench speed; lifting MTP cap to 3 after the raw-cache fix made pp2048/tg32 worse (`tg≈13.27`) due partial accepts; lifting to 4 remains correctness-unsafe on the counting prompt.
 
 ## Implemented in this branch
 
@@ -161,11 +171,27 @@ Result: passed.
 
 Note: whole-file `clang-format --dry-run` on `tools/server/server-context.cpp` reports many pre-existing formatting deviations outside touched lines. `git-clang-format --force origin/main -- ...` was applied to changed lines only.
 
+Latest mounted-code quality gate (2026-05-10):
+
+```text
+cmake --build build-dsv4-container --target llama-server -j 8
+```
+
+Result: passed inside `llamatrifecta_deepseekv4:latest` with the worktree mounted at `/src`.
+
+Latest standard IQ2_XXS MTP benchmark:
+
+```text
+llama-benchy --pp 2048 --tg 32 --runs 3 --concurrency 1 --no-cache --no-warmup --no-adapt-prompt --latency-mode none
+```
+
+Result: coherence passed with `--draft-max 1`; pp2048 `397.83 ± 3.37 tok/s`, tg32 `30.73 ± 0.34 tok/s`, TTFR `5158.35 ms`. Same-build target-only comparison: pp2048 `400.30 ± 2.08 tok/s`, tg32 `29.93 ± 0.36 tok/s`, TTFR `5126.33 ms`. Saved to `/tmp/dsv4_iq2xxs_mtp_draft1_adaptive_benchy_pp2048_tg32_runs3.json` and `/tmp/dsv4_iq2xxs_target_postrollback_benchy_pp2048_tg32_runs3.json`.
+
 ## Not implemented yet
 
-- No Qwen-PR-style sidecar/MTP-only graph or separate MTP context fed by target hidden state.
-- No deterministic token-level parity harness for target-only vs MTP.
-- No benchmark-proven speedup; current integrated MTP accepts tokens but is slower than target-only.
+- No deterministic token-level parity harness for target-only vs MTP beyond the existing raw smoke checks.
+- No benchmark-proven speedup for draft depths above 1; current standard win uses `--draft-max 1` plus adaptive cooldown.
+- No full 65k-context memory-placement solution for target+MTP sidecar.
 
 ## HC-state probe plumbing
 

@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include <map>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -109,7 +110,8 @@ struct llama_context {
     void clear_mtp_probe_state();
     void append_mtp_raw_row(const std::vector<float> & row);
     bool eval_mtp_sidecar_one(llama_token token, llama_pos pos, const std::vector<float> & hc,
-                              llama_token & top, std::vector<float> & next_hc, std::vector<float> & raw);
+                              llama_token & top, std::vector<float> & next_hc, std::vector<float> & raw,
+                              float * top_margin = nullptr);
     int32_t draft_mtp_sidecar_tokens(llama_token sampled, llama_token * drafts, int32_t n_max);
     bool save_mtp_replay_snapshot(llama_token sampled);
     bool replay_mtp_accepted_prefix(uint32_t n_accepted);
@@ -243,7 +245,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_eval = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -315,6 +317,8 @@ private:
     // optional MTP probe state copied from model-specific handoff tensors for the last single-token decode graph
     std::vector<float> mtp_state;
     std::vector<float> mtp_next_state;
+    std::vector<float> mtp_state_first;
+    std::vector<float> mtp_state_second;
     std::vector<float> mtp_graph_hc_input;
     std::vector<float> mtp_raw_current_pending;
     std::vector<float> mtp_raw_draft;
@@ -323,6 +327,7 @@ private:
     llama_token        mtp_probe_top1        = LLAMA_TOKEN_NULL;
     llama_token        mtp_probe_top1_next   = LLAMA_TOKEN_NULL;
     llama_token        mtp_probe_top1_third  = LLAMA_TOKEN_NULL;
+    float              mtp_last_draft2_margin = -std::numeric_limits<float>::infinity();
     uint32_t           mtp_last_draft_tokens = 0;
 
     uint32_t mtp_probe_draft_max = 1;
@@ -335,6 +340,12 @@ private:
     llama_seq_id       mtp_last_target_seq  = -1;
     llama_pos          mtp_last_target_pos  = -1;
     llama_token        mtp_last_target_token = LLAMA_TOKEN_NULL;
+    llama_seq_id       mtp_state_first_seq   = -1;
+    llama_pos          mtp_state_first_pos   = -1;
+    llama_token        mtp_state_first_token = LLAMA_TOKEN_NULL;
+    llama_seq_id       mtp_state_second_seq   = -1;
+    llama_pos          mtp_state_second_pos   = -1;
+    llama_token        mtp_state_second_token = LLAMA_TOKEN_NULL;
 
     std::vector<uint8_t> mtp_replay_snapshot;
     llama_seq_id         mtp_replay_seq_id       = -1;
@@ -371,6 +382,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_mtp;
 
     bool sched_need_reserve = true;
     bool mtp_probe          = false;
@@ -396,6 +408,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_prev_mtp;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

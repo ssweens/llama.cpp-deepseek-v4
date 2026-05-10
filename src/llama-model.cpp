@@ -8678,7 +8678,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         /* offload           */ cparams.offload_kqv,
                         /* unified           */ cparams.kv_unified,
                         /* filter_attn       */ std::move(filter_attn),
-                        /* filter_recr       */ std::move(filter_recr));
+                        /* filter_recr       */ std::move(filter_recr),
+                        /* n_rollback_max    */ 2);
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks

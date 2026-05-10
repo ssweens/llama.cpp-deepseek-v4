@@ -892,7 +892,7 @@ private:
             }
 
             const std::string & mtp_draft = params_base.speculative.mparams_dft.path;
-            ctx->set_mtp_probe(true, (uint32_t) params_base.speculative.n_max, false);
+            ctx->set_mtp_probe(true, (uint32_t) params_base.speculative.n_max, server_env_truthy("LLAMA_MTP_TRACE"));
             std::string mtp_load_err;
             if (!ctx->load_mtp_draft(mtp_draft, params_base.speculative.devices, params_base.speculative.n_gpu_layers,
                                      mtp_load_err)) {
@@ -3240,7 +3240,7 @@ private:
                 {
                     const bool use_ckpt = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                    // only save the sampler sampler state if we use checkpoints
+                    // only save the sampler state if we use checkpoints
                     common_sampler_ptr smpl_save;
                     if (use_ckpt) {
                         smpl_save.reset(common_sampler_clone(slot.smpl.get()));

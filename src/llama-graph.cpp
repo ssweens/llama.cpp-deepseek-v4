@@ -809,10 +809,13 @@ void llm_graph_result::reset() {
     t_embd_pooled     = nullptr;
     t_mtp_state           = nullptr;
     t_mtp_next_state      = nullptr;
+    t_mtp_state_first     = nullptr;
+    t_mtp_state_second    = nullptr;
     t_mtp_target_top1     = nullptr;
     t_mtp_probe_top1        = nullptr;
     t_mtp_probe_top1_next   = nullptr;
     t_mtp_probe_top1_third  = nullptr;
+    t_mtp_probe_top2_logits = nullptr;
     t_mtp_raw_current       = nullptr;
     t_mtp_raw_draft         = nullptr;
     t_mtp_raw_draft_accept  = nullptr;
@@ -865,6 +868,12 @@ void llm_graph_result::set_outputs() {
     if (t_mtp_next_state != nullptr) {
         ggml_set_output(t_mtp_next_state);
     }
+    if (t_mtp_state_first != nullptr) {
+        ggml_set_output(t_mtp_state_first);
+    }
+    if (t_mtp_state_second != nullptr) {
+        ggml_set_output(t_mtp_state_second);
+    }
     if (t_mtp_target_top1 != nullptr) {
         ggml_set_output(t_mtp_target_top1);
     }
@@ -876,6 +885,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_mtp_probe_top1_third != nullptr) {
         ggml_set_output(t_mtp_probe_top1_third);
+    }
+    if (t_mtp_probe_top2_logits != nullptr) {
+        ggml_set_output(t_mtp_probe_top2_logits);
     }
     if (t_mtp_raw_current != nullptr) {
         ggml_set_output(t_mtp_raw_current);
@@ -2610,7 +2622,8 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    GGML_UNUSED(rs_size);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.

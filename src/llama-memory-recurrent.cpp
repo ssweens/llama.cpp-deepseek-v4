@@ -30,12 +30,15 @@ llama_memory_recurrent::llama_memory_recurrent(
                      bool   offload,
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter,
+                 uint32_t   n_rollback_max) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer;
 
     head = 0;
     size = mem_size;
     used = 0;
+    this->n_rollback_max = n_rollback_max;
+    recurrent_rollback_idx.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -98,8 +101,9 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), mem_size);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+        const uint32_t n_rows = mem_size * (1 + n_rollback_max);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -172,9 +176,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
+            auto & cell = cells[tail_id];
+            // Partial recurrent rollback via per-token snapshots stored in widened state rows.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (rollback >= 1 && rollback <= (llama_pos) n_rollback_max) {
+                    set_recurrent_rollback_idx(seq_id, (uint32_t) rollback);
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: partial intersection is invalid, so returning false, p0 = %d, cell.pos = %d, p1 = %d\n", p0, cell.pos, p1);
                 return false;
             }
@@ -387,6 +397,13 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+void llama_memory_recurrent::set_recurrent_rollback_idx(llama_seq_id seq_id, uint32_t idx) {
+    if (seq_id < 0 || (size_t) seq_id >= recurrent_rollback_idx.size()) {
+        return;
+    }
+    recurrent_rollback_idx[seq_id] = std::min<uint32_t>(idx, n_rollback_max);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -1180,5 +1197,21 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    return  mem->cells[i + mem->head].src0;
+    const uint32_t cell_idx = i + mem->head;
+    const int32_t  src0     = mem->cells[cell_idx].src0;
+
+    if (mem->n_rollback_max == 0) {
+        return src0;
+    }
+
+    uint32_t idx = 0;
+    if (!mem->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->recurrent_rollback_idx.size()) {
+            idx = mem->recurrent_rollback_idx[seq];
+            mem->recurrent_rollback_idx[seq] = 0;
+        }
+    }
+
+    return (int32_t) (idx * mem->size) + src0;
 }

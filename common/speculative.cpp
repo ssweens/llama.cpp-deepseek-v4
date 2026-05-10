@@ -574,13 +574,26 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt = nullptr;
 
+    uint32_t cooldown = 0;
+    uint32_t zero_draft_streak = 0;
+    uint32_t window_drafts = 0;
+    uint32_t window_accepts = 0;
+    uint32_t last_draft_n = 0;
+
     common_speculative_state_mtp(enum common_speculative_type type, llama_context * ctx_tgt) :
         common_speculative_state(type),
         ctx_tgt(ctx_tgt) {
         GGML_ASSERT(ctx_tgt != nullptr);
     }
 
-    void begin(const llama_tokens & prompt) override { GGML_UNUSED(prompt); }
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+        cooldown = 0;
+        zero_draft_streak = 0;
+        window_drafts = 0;
+        window_accepts = 0;
+        last_draft_n = 0;
+    }
 
     void draft(const common_params_speculative & params,
                const llama_tokens &              prompt_tgt,
@@ -589,7 +602,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
         GGML_UNUSED(prompt_tgt);
 
         draft_tokens.clear();
+        last_draft_n = 0;
         if (params.n_max <= 0) {
+            return;
+        }
+        if (cooldown > 0) {
+            --cooldown;
             return;
         }
 
@@ -601,10 +619,35 @@ struct common_speculative_state_mtp : public common_speculative_state {
                 draft_tokens.push_back(drafts[i]);
             }
         }
+        last_draft_n = draft_tokens.size();
+        if (last_draft_n == 0) {
+            if (++zero_draft_streak >= 3) {
+                cooldown = 4;
+                zero_draft_streak = 0;
+            }
+        } else {
+            zero_draft_streak = 0;
+        }
     }
 
     void accept(uint16_t n_accepted) override {
         llama_mtp_accept(ctx_tgt, n_accepted);
+
+        if (last_draft_n == 0) {
+            return;
+        }
+
+        window_drafts += last_draft_n;
+        window_accepts += std::min<uint32_t>(n_accepted, last_draft_n);
+        last_draft_n = 0;
+
+        if (window_drafts >= 8) {
+            if (window_accepts * 2 < window_drafts) {
+                cooldown = 12;
+            }
+            window_drafts = 0;
+            window_accepts = 0;
+        }
     }
 };
 

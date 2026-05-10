@@ -638,7 +638,8 @@ struct llm_graph_params {
                arch == other.arch && gtype == other.gtype && cvec == other.cvec && loras == other.loras &&
                cross == other.cross && mtp_probe == other.mtp_probe && mtp_diagnostics == other.mtp_diagnostics &&
                mtp_tensors == other.mtp_tensors && mtp_raw_cache == other.mtp_raw_cache &&
-               mtp_hc_input == other.mtp_hc_input && mtp_n_raw == other.mtp_n_raw &&
+               mtp_hc_input == other.mtp_hc_input &&
+               (gtype == LLM_GRAPH_TYPE_MTP || mtp_n_raw == other.mtp_n_raw) &&
                mtp_probe_draft_max == other.mtp_probe_draft_max;
     }
 };
@@ -661,6 +662,10 @@ public:
 
     ggml_tensor * get_mtp_next_state() const { return t_mtp_next_state; }
 
+    ggml_tensor * get_mtp_state_first() const { return t_mtp_state_first; }
+
+    ggml_tensor * get_mtp_state_second() const { return t_mtp_state_second; }
+
     ggml_tensor * get_mtp_target_top1() const { return t_mtp_target_top1; }
 
     ggml_tensor * get_mtp_probe_top1() const { return t_mtp_probe_top1; }
@@ -668,6 +673,8 @@ public:
     ggml_tensor * get_mtp_probe_top1_next() const { return t_mtp_probe_top1_next; }
 
     ggml_tensor * get_mtp_probe_top1_third() const { return t_mtp_probe_top1_third; }
+
+    ggml_tensor * get_mtp_probe_top2_logits() const { return t_mtp_probe_top2_logits; }
 
     ggml_tensor * get_mtp_raw_current() const { return t_mtp_raw_current; }
 
@@ -705,10 +712,13 @@ public:
     ggml_tensor * t_embd_pooled       = nullptr;
     ggml_tensor * t_mtp_state           = nullptr;
     ggml_tensor * t_mtp_next_state      = nullptr;
+    ggml_tensor * t_mtp_state_first     = nullptr;
+    ggml_tensor * t_mtp_state_second    = nullptr;
     ggml_tensor * t_mtp_target_top1     = nullptr;
     ggml_tensor * t_mtp_probe_top1        = nullptr;
     ggml_tensor * t_mtp_probe_top1_next   = nullptr;
     ggml_tensor * t_mtp_probe_top1_third  = nullptr;
+    ggml_tensor * t_mtp_probe_top2_logits = nullptr;
     ggml_tensor * t_mtp_raw_current       = nullptr;
     ggml_tensor * t_mtp_raw_draft         = nullptr;
     ggml_tensor * t_mtp_raw_draft_accept  = nullptr;
