@@ -339,9 +339,9 @@ private:
     std::vector<uint8_t> mtp_replay_snapshot;
     llama_seq_id         mtp_replay_seq_id       = -1;
     llama_pos            mtp_replay_start_pos    = -1;
-    llama_token          mtp_replay_sampled      = LLAMA_TOKEN_NULL;
-    llama_token          mtp_replay_drafts[2]    = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
-    uint32_t             mtp_replay_n_drafts     = 0;
+    llama_token              mtp_replay_sampled      = LLAMA_TOKEN_NULL;
+    std::vector<llama_token> mtp_replay_drafts;
+    uint32_t                 mtp_replay_n_drafts     = 0;
     uint32_t             mtp_replay_raw_keep     = 0;
     uint32_t             mtp_replay_raw_extra    = 0;
     llama_pos            mtp_replay_raw_keep_pos = -1;

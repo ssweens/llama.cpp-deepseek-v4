@@ -9,8 +9,8 @@ Date: 2026-05-09
 - `DSV4_MTP_PROBE=1` is diagnostics-only. Normal MTP runtime works without it; diagnostics mode keeps the full HC/raw handoff copies and detailed preview logging.
 - Code organization was reset to mirror existing patterns: speculative orchestration lives in `common/speculative.cpp` / server verifier flow, DeepSeek4 MTP metadata/tensor validation lives behind `src/models/deepseek4.*`, and the server no longer calls a `src/models/models.h` MTP hook.
 - Boundary cleanup: generic server/speculative code no longer contains DS4/MTP env names, timing probes, or DS4 MTP log/comment text; `llama_context` uses generic model/memory hooks for MTP draft validation, raw-window policy, and recurrent-state replay instead of direct DS4 references.
-- Docker mounted-code validation shows real accepted drafts and correct visible content on smoke prompts, but speedup is not achieved yet. Standard IQ2_XXS benchmark: target-only `tg=30.56±0.62`, integrated MTP draft-1 `tg=9.07±1.76`, integrated depth-2 `tg≈7.7-7.9`.
-- Remaining blocker: target-graph-integrated MTP pays the MTP block/output-head cost in the target decode graph. Upstream Qwen MTP PR #22673 and local `../ds4/` both point to a sidecar/MTP-only graph/context fed by target hidden state; the next fix should replace integrated target graph MTP with that shape.
+- Docker mounted-code validation shows real accepted drafts and correct visible content on smoke prompts. After sidecar depth-2 plus verifier full-accept cleanup skip, a raw deterministic ctx8192 prompt improved from target-only `46.94 tok/s` to MTP `52.12 tok/s` with matching visible text and `20/20` accepted/generated drafts.
+- Standard IQ2_XXS `llama-benchy pp2048/tg32` is still not solved: freecheck MTP generates 0-1 drafts on the natural bench prompt, so tg remains below the prior target-only baseline. This means the remaining blocker is MTP draft quality/alignment on long natural prompts, not verifier cleanup overhead.
 
 ## Implemented in this branch
 

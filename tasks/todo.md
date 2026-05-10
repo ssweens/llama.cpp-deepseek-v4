@@ -288,6 +288,14 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 9. [x] **Normal runtime gate:** MTP works without `DSV4_MTP_PROBE=1`; that env var remains diagnostics-only.
 
 ### Current triangulation checkpoint — accepted drafts are no longer the main blocker
+
+#### Post-boundary cleanup execution plan
+- [x] Build mounted Docker binaries from commit `2be876ea0` before runtime testing.
+- [x] Smoke IQ2_XXS MTP without diagnostics and compare draft generation/acceptance against the prior diagnostics-on/off mismatch hypothesis: normal path now generates/accepts drafts without diagnostics on raw deterministic prompts.
+- [x] If drafts are generated but still slow, isolate the remaining overhead by checking verifier `seq_rm` rollback cost after the live-frontier cap: full-accept verifier cleanup was a no-op tail `seq_rm` and skipping it made raw deterministic MTP faster than target-only (`52.12 tok/s` vs `46.94 tok/s`).
+- [x] Fix the highest-confidence blocker inside DS4/model/memory boundaries only, then repeat the same smoke: safe recursive depth-2 plus full-accept cleanup skip preserve raw output parity and speed up predictable decode.
+- [ ] Standard `llama-benchy` (`pp2048`, `tg32`) is still blocked: freecheck MTP generates 0-1 drafts on natural bench text, so decode remains below target-only despite raw-prompt speedup. Next fix must improve MTP draft quality/alignment for long natural prompts, not verifier overhead.
+- [ ] Once MTP is correct and faster in standard smoke, run deterministic parity and standard resident `llama-benchy` (`pp2048`, `tg32`, runs >= 3).
 - [x] Raw-cache continuity fix increased IQ2_XXS smoke acceptance from low/unstable acceptance to `23/31 = 0.742` accepted drafts on the counting prompt; `n_raw` now grows instead of staying pinned at 2.
 - [x] Explain why high-acceptance MTP smoke is still slower before making more speculative state changes: server-level speculative tail cleanup (`llama_memory_seq_rm`) costs ~111 ms per speculative batch on DS4, and DS4 replay rollback is still expensive on rejected drafts.
 - [ ] Re-ground the next fix in `/home/bigkahuna/src/ds4` and PR #22673 before changing behavior again: identify exactly which component owns draft-state advance, rejection discard, and target verifier rollback.

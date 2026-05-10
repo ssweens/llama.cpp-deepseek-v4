@@ -593,8 +593,9 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;
         }
 
-        llama_token drafts[2] = { LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL };
-        const int32_t n = llama_mtp_draft_tokens(ctx_tgt, id_last, drafts, std::min<int32_t>(params.n_max, 2));
+        const int32_t n_max = std::min<int32_t>(params.n_max, 2);
+        std::vector<llama_token> drafts(n_max, LLAMA_TOKEN_NULL);
+        const int32_t n = llama_mtp_draft_tokens(ctx_tgt, id_last, drafts.data(), n_max);
         for (int32_t i = 0; i < n; ++i) {
             if (drafts[i] != LLAMA_TOKEN_NULL) {
                 draft_tokens.push_back(drafts[i]);

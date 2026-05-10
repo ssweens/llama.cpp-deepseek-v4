@@ -424,38 +424,38 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
     const llama_pos recr_pos_min_before = debug_seq_rm ? mem_recr->seq_pos_min(seq_id) : -1;
     const llama_pos recr_pos_max_before = debug_seq_rm ? mem_recr->seq_pos_max(seq_id) : -1;
 
+    llama_pos p1_eff = p1;
+    if (seq_id >= 0 && p0 >= 0 && p1 < 0 && dsv4_pos_max_before >= p0) {
+        // Tail rollback removes only rows that could have been written by the
+        // live sequence. Do not clear from p0 to the allocated context capacity.
+        p1_eff = dsv4_pos_max_before + 1;
+    }
+
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+    if (!mem_recr->seq_rm(seq_id, p0, p1_eff)) {
         if (debug_seq_rm) {
             LLAMA_LOG_WARN("%s: recurrent seq_rm failed: seq=%d p0=%d p1=%d before attn=[%d,%d] recurrent=[%d,%d]\n",
-                    __func__, seq_id, p0, p1,
+                    __func__, seq_id, p0, p1_eff,
                     attn_pos_min_before, attn_pos_max_before,
                     recr_pos_min_before, recr_pos_max_before);
         }
         return false;
     }
-    if (!mem_attn->seq_rm(seq_id, p0, p1)) {
+    if (!mem_attn->seq_rm(seq_id, p0, p1_eff)) {
         if (debug_seq_rm) {
             LLAMA_LOG_WARN("%s: attention seq_rm failed after recurrent mutation: seq=%d p0=%d p1=%d before attn=[%d,%d] recurrent=[%d,%d]\n",
-                    __func__, seq_id, p0, p1,
+                    __func__, seq_id, p0, p1_eff,
                     attn_pos_min_before, attn_pos_max_before,
                     recr_pos_min_before, recr_pos_max_before);
         }
         return false;
     }
-    llama_pos dsv4_p1 = p1;
-    if (seq_id >= 0 && p0 >= 0 && p1 < 0 && dsv4_pos_max_before >= p0) {
-        // Speculative tail rollback removes only rows that could have been written by the
-        // live sequence.  Do not clear from p0 to the allocated context capacity: DS4's
-        // compressed cache can be huge, and the references roll back the live frontier only.
-        dsv4_p1 = dsv4_pos_max_before + 1;
-    }
-    dsv4_seq_rm(seq_id, p0, dsv4_p1);
+    dsv4_seq_rm(seq_id, p0, p1_eff);
 
     if (debug_seq_rm) {
         LLAMA_LOG_WARN("%s: seq=%d p0=%d p1=%d attn [%d,%d] -> [%d,%d], recurrent [%d,%d] -> [%d,%d], hybrid [%d,%d]\n",
-                __func__, seq_id, p0, p1,
+                __func__, seq_id, p0, p1_eff,
                 attn_pos_min_before, attn_pos_max_before,
                 mem_attn->seq_pos_min(seq_id), mem_attn->seq_pos_max(seq_id),
                 recr_pos_min_before, recr_pos_max_before,

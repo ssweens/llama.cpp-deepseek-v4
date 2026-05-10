@@ -1141,8 +1141,7 @@ void llama_context::clear_mtp_probe_state() {
     mtp_replay_seq_id    = -1;
     mtp_replay_start_pos = -1;
     mtp_replay_sampled   = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[0] = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[1] = LLAMA_TOKEN_NULL;
+    mtp_replay_drafts.clear();
     mtp_replay_n_drafts  = 0;
     mtp_replay_raw_keep     = 0;
     mtp_replay_raw_extra    = 0;
@@ -1269,8 +1268,7 @@ bool llama_context::save_mtp_replay_snapshot(llama_token sampled) {
     mtp_replay_seq_id    = -1;
     mtp_replay_start_pos = -1;
     mtp_replay_sampled   = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[0] = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[1] = LLAMA_TOKEN_NULL;
+    mtp_replay_drafts.clear();
     mtp_replay_n_drafts  = 0;
     mtp_replay_raw_keep     = 0;
     mtp_replay_raw_extra    = 0;
@@ -1307,7 +1305,16 @@ bool llama_context::replay_mtp_accepted_prefix(uint32_t n_accepted) {
         return false;
     }
 
-    llama_token tokens[3] = { mtp_replay_sampled, mtp_replay_drafts[0], mtp_replay_drafts[1] };
+    if (n_accepted > mtp_replay_drafts.size()) {
+        return false;
+    }
+
+    std::vector<llama_token> tokens;
+    tokens.reserve(1 + n_accepted);
+    tokens.push_back(mtp_replay_sampled);
+    for (uint32_t i = 0; i < n_accepted; ++i) {
+        tokens.push_back(mtp_replay_drafts[i]);
+    }
     const uint32_t n_replay = 1 + n_accepted;
 
     const bool suppress_prev = mtp_replay_suppress_raw_append;
@@ -1361,14 +1368,12 @@ int32_t llama_context::draft_mtp_sidecar_tokens(llama_token sampled, llama_token
             mtp_raw_last_pos = -1;
             mtp_raw_cache.clear();
         } else if (mtp_last_target_pos == mtp_raw_last_pos) {
-            // The MTP raw frontier already includes this target token. That happens after a suffix miss:
-            // the next target token must be decoded normally before the drafter can advance again.
             return 0;
         } else if (mtp_last_target_pos != mtp_raw_last_pos + 1) {
             if (mtp_diagnostics) {
                 LLAMA_LOG_WARN("%s: reset raw continuity sampled=%d n_raw=%u target_seq=%d raw_seq=%d target_pos=%d raw_pos=%d\n",
-                               __func__, sampled, mtp_n_raw, mtp_last_target_seq, mtp_raw_seq_id, mtp_last_target_pos,
-                               mtp_raw_last_pos);
+                               __func__, sampled, mtp_n_raw, mtp_last_target_seq, mtp_raw_seq_id,
+                               mtp_last_target_pos, mtp_raw_last_pos);
             }
             mtp_n_raw        = 0;
             mtp_raw_seq_id   = -1;
@@ -1421,20 +1426,46 @@ int32_t llama_context::draft_mtp_sidecar_tokens(llama_token sampled, llama_token
     }
 
     drafts[0] = suffix_top1;
-    const int32_t n = 1;
+    int32_t n = 1;
 
-    mtp_replay_raw_keep     = mtp_n_raw;
-    mtp_replay_raw_extra    = 0;
-    mtp_replay_raw_keep_pos = mtp_raw_last_pos;
+    const uint32_t replay_raw_keep      = mtp_n_raw;
+    const llama_pos replay_raw_keep_pos = mtp_raw_last_pos;
+    uint32_t replay_raw_extra           = 0;
+
+    llama_token current_token = suffix_top1;
+    llama_pos   current_pos   = mtp_last_target_pos + 2;
+    while (n < std::min<int32_t>(n_max, 16)) {
+        llama_token        next_top1 = LLAMA_TOKEN_NULL;
+        std::vector<float> next_hc;
+        std::vector<float> raw_current;
+        if (!eval_mtp_sidecar_one(current_token, current_pos, suffix_hc, next_top1, next_hc, raw_current) ||
+            next_top1 == LLAMA_TOKEN_NULL) {
+            break;
+        }
+
+        append_mtp_raw_row(raw_current);
+        if (mtp_raw_last_pos >= 0) {
+            mtp_raw_last_pos++;
+        }
+        replay_raw_extra++;
+
+        drafts[n++] = next_top1;
+        current_token = next_top1;
+        current_pos++;
+        suffix_hc = std::move(next_hc);
+    }
+
+    mtp_replay_raw_keep     = replay_raw_keep;
+    mtp_replay_raw_extra    = replay_raw_extra;
+    mtp_replay_raw_keep_pos = replay_raw_keep_pos;
 
     mtp_next_state        = std::move(suffix_hc);
     mtp_last_draft_tokens = (uint32_t) n;
-    mtp_replay_drafts[0]  = suffix_top1;
-    mtp_replay_drafts[1]  = LLAMA_TOKEN_NULL;
+    mtp_replay_drafts.assign(drafts, drafts + n);
     mtp_replay_n_drafts   = (uint32_t) n;
     if (mtp_diagnostics) {
-        LLAMA_LOG_WARN("%s: sampled=%d predicted_sampled=%d pos=%d suffix=[%d] integrated_suffix=%d n_raw=%u raw_last=%d\n",
-                       __func__, sampled, predicted_sampled, mtp_last_target_pos + 1, suffix_top1,
+        LLAMA_LOG_WARN("%s: sampled=%d predicted_sampled=%d pos=%d n_suffix=%d first_suffix=%d integrated_suffix=%d n_raw=%u raw_last=%d\n",
+                       __func__, sampled, predicted_sampled, mtp_last_target_pos + 1, n, suffix_top1,
                        get_mtp_probe_top1_next(), mtp_n_raw, mtp_raw_last_pos);
     }
     return n;
@@ -1480,8 +1511,7 @@ void llama_context::commit_mtp_accepted_raw_rows(uint32_t n_accepted) {
     mtp_replay_seq_id    = -1;
     mtp_replay_start_pos = -1;
     mtp_replay_sampled   = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[0] = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[1] = LLAMA_TOKEN_NULL;
+    mtp_replay_drafts.clear();
     mtp_replay_n_drafts  = 0;
     mtp_replay_raw_keep     = 0;
     mtp_replay_raw_extra    = 0;
@@ -1497,8 +1527,7 @@ void llama_context::discard_mtp_sampled_raw_row() {
     mtp_replay_seq_id    = -1;
     mtp_replay_start_pos = -1;
     mtp_replay_sampled   = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[0] = LLAMA_TOKEN_NULL;
-    mtp_replay_drafts[1] = LLAMA_TOKEN_NULL;
+    mtp_replay_drafts.clear();
     mtp_replay_n_drafts  = 0;
     mtp_replay_raw_keep     = 0;
     mtp_replay_raw_extra    = 0;
