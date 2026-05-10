@@ -9,6 +9,9 @@
 - Do not launch heavy local reproduction runs on huge models during a remote-pipeline incident unless the user has explicitly asked for local reproduction.
   - First exhaust the remote logs, sentinels, serial console, and exact command traces already available.
   - If a local run is truly needed, say exactly why it is necessary before starting it.
+- Do not start the full DeepSeek4 endpoint regression suite against the AMD/RADV Vulkan iGPU path without warning the user about expected runtime.
+  - Use Vulkan for targeted stability checks such as pp2048/tg1, a small post-stress chat, and kernel reset logs.
+  - Use a CUDA resident server for the full behavioral regression suite when speed matters, unless the user explicitly wants full behavioral coverage on Vulkan.
 
 - When validating a new model family, do not guess the chat/output format from nearby models.
   - Trace the official source of truth end-to-end first: HF README/docs, encoding or chat-template files, converter metadata injection, GGUF metadata, and llama.cpp parser selection.

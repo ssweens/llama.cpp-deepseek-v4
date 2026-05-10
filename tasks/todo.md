@@ -205,3 +205,47 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 ### Recommendation
 - Commit the K-quant `GET_ROWS` large-row correctness fix and regression test.
 - Do not chase more quick perf patches in this branch. No additional obvious, low-risk, high-impact speed bug was found in this audit; remaining wins likely require larger architectural work or a separate profiler-led effort.
+
+## Vulkan backend device-lost fix — `work/dsv4-vulkan-device-lost`
+
+### Plan
+- [x] Create a fresh branch from merged `origin/main`, preserving existing untracked scratch files.
+- [x] Map the Corral crash stack and current Vulkan command path to the exact ggml-vulkan source functions/shaders.
+- [x] Reproduce with a bounded direct Vulkan backend run, avoiding manual Corral startup and avoiding Corral-managed container mutation.
+- [x] Identify the smallest backend-side trigger for the RADV compute-ring timeout: DSv4 Vulkan sparse-attention prompt prefill submitted one large RADV compute dispatch that scanned masked raw-window positions.
+- [x] Implement a targeted Vulkan backend fix: plumb `raw_window_limit` to `dsv4_sparse_attn.comp` and split large RADV `DSV4_SPARSE_ATTN` dispatches into 4096-work-item submissions using a `base_work_idx` push constant.
+- [x] Build Vulkan targets and run targeted backend/model validation with the resident bench-server flow; final systemctl-managed Corral validation remains for image refresh.
+- [x] Record review notes, quality gates, and any remaining AMD/RADV limitations before commit/push.
+
+### Review
+- Reproduced baseline failure through the resident ad hoc server only: `llama-benchy --pp 2048 --tg 1 --concurrency 1` disconnected and kernel logged AMD compute-ring reset / `vk::DeviceLostError`.
+- Isolated trigger with `GGML_VK_SYNC_LOGGER=1`: timeout window correlated with `DSV4_SPARSE_ATTN`; later `mul_mat_q_f16` stack traces were surfacing an already-lost device.
+- Validation after fix:
+  - Build passed in mounted DeepSeek container: `cmake --build build-dsv4-container --target llama-bench llama-server -j 8`.
+  - Host Vulkan test target rebuild passed: `cmake --build build-vulkan-linux-release --target test-backend-ops -j 8`.
+  - Focused op catalog had no generated `DSV4_SPARSE_ATTN` cases (`0/0`), so model-level validation is the meaningful gate.
+  - Resident server, AMD/RADV `Vulkan0`, IQ2_XXS, `-c 65536 -b 4096 -ub 1024`: `llama-benchy --pp 2048 --tg 1 --concurrency 1` completed, coherence passed, prompt eval `14.77 tok/s`, and `journalctl -k` showed no AMD ring reset/device-wedged entries during the run.
+  - Post-stress small chat with `max_tokens=2048` returned `Paris`, confirming the server stayed usable.
+  - Reduced real endpoint regression on AMD/RADV Vulkan resident server passed 4/4 with `max_tokens=2048`: `simple_ok` 11.14s, `basic_math` 6.13s, `minimal_tool_auto` 91.05s, `tool_replay_turn02_nonstream` 271.34s with `cached_tokens=1408`. Container remained running and kernel logs showed no AMD ring reset/device-wedged entries afterward.
+  - Remaining core endpoint regressions also passed on the same AMD/RADV Vulkan server with `max_tokens=2048`: `minimal_tool_required` 76.81s, `tool_replay_turn02_stream` 366.91s with `sse_events=97` and `cached_tokens=1408`, `tool_replay_turn02_cache_reuse` 642.29s with `second_cached_tokens=1408`. Container remained running and kernel logs showed no AMD ring reset/device-wedged entries afterward.
+- Remaining: rebuild the official DeepSeekV4 Docker image from this branch if needed, then validate through systemd-managed Corral; do not mutate Corral-managed containers directly.
+
+## DeepSeek4 next prefill ideas — MTP vs other candidates
+
+### Research Plan
+- [x] Inspect `/home/bigkahuna/src/ds4` MTP implementation and identify the exact model tensors, graph structure, cache semantics, and generation loop behavior it expects.
+- [x] Inspect current llama.cpp DeepSeek4 code paths to find what is already present, missing, or intentionally incompatible for MTP/speculative heads.
+- [x] Review reference PRs `ggml-org/llama.cpp#22400`, `#22673`, and `am17an/llama.cpp` for implementation scope, correctness risks, CUDA/HIP/ROCm coverage, and mergeability.
+- [x] Estimate MTP impact separately for prefill, decode, and end-to-end agent/tool workloads; call out whether MTP helps prompt processing directly or mainly amortizes decode after prefill.
+- [x] Compare MTP against remaining non-MTP candidates: routed MoE MMQ tuning, prompt compressor/indexer fusion, top-k/argsort improvements, KV write/copy reductions, and Vulkan stability/perf.
+- [x] Produce a written next-steps plan with recommended priority, validation gates, and branch boundaries: `tasks/dsv4_next_prefill_mtp_plan.md`.
+
+## DeepSeek4 MTP feasibility spike — `work/dsv4-mtp-feasibility`
+
+### Plan
+- [x] Find or acquire the DeepSeek4 MTP sidecar GGUF and record whether it is locally available. Not local; remote sidecar exists at `antirez/deepseek-v4-gguf`.
+- [x] Dump MTP sidecar metadata/tensor names/types/shapes without loading the full target model.
+- [x] Cross-check sidecar tensors against `/home/bigkahuna/src/ds4` MTP validation/build code and identify base-model tensor sharing requirements.
+- [x] Trace current llama.cpp DeepSeek4 loader/graph/speculative interfaces for the smallest no-behavior loader/probe hook.
+- [x] Produce an implementation sketch for `--mtp-model` / `--mtp-draft` feasibility, explicitly separating no-op loader plumbing from runtime speculative commit.
+- [x] Record spike results, blockers, and recommended next branch in `tasks/dsv4_mtp_feasibility_spike.md`.
