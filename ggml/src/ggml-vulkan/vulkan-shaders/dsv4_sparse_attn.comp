@@ -71,6 +71,8 @@ layout (push_constant) uniform parameter {
     uint nb_d1;
     uint nb_d2;
     uint nb_d3;
+    uint raw_window_limit;
+    uint base_work_idx;
     // flags
     uint has_window;
     uint has_wmask;
@@ -78,7 +80,7 @@ layout (push_constant) uniform parameter {
 } p;
 
 void main() {
-    const uint work_idx = gl_GlobalInvocationID.x;
+    const uint work_idx = p.base_work_idx + gl_GlobalInvocationID.x;
     const uint total = p.batch * p.n_tokens * p.n_heads;
     if (work_idx >= total) return;
 
@@ -97,11 +99,19 @@ void main() {
         data_d[d_off + d] = 0.0;
     }
 
-    // Phase 1: window positions
+    // Phase 1: window positions. Prompt prefill passes a dense current-prompt
+    // window plus a causal/SWA mask; when raw_window_limit is provided, skip the
+    // prefix that is guaranteed masked by DSv4's raw sliding window.
     if (p.has_window != 0) {
         const uint kvw_batch_off = b * p.nb_kvw3;
+        uint kv_begin = 0;
+        uint kv_end = p.n_window;
+        if (p.raw_window_limit != 0) {
+            kv_end = min(p.n_window, t + 1);
+            kv_begin = kv_end > p.raw_window_limit ? kv_end - p.raw_window_limit : 0;
+        }
 
-        for (uint k = 0; k < p.n_window; k++) {
+        for (uint k = kv_begin; k < kv_end; k++) {
             if (p.has_wmask != 0) {
                 float m = data_wmask[t * p.nb_wmask1 + k + b * p.nb_wmask3];
                 if (isinf(m) && m < 0.0) continue;

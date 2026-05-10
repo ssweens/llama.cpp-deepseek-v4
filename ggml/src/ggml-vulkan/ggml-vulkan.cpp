@@ -1252,6 +1252,8 @@ struct vk_op_dsv4_sparse_attn_push_constants {
     uint32_t nb_d1;
     uint32_t nb_d2;
     uint32_t nb_d3;
+    uint32_t raw_window_limit;
+    uint32_t base_work_idx;
     uint32_t has_window;
     uint32_t has_wmask;
     uint32_t has_sink;
@@ -13265,6 +13267,7 @@ static void ggml_vk_dsv4_sparse_attn(ggml_backend_vk_context * ctx, vk_context& 
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
+    const int32_t raw_window_limit = ggml_get_op_params_i32(dst, 1);
 
     const uint32_t kv_elem_size = ggml_type_size(src_kv_c->type);
 
@@ -13292,6 +13295,8 @@ static void ggml_vk_dsv4_sparse_attn(ggml_backend_vk_context * ctx, vk_context& 
         (uint32_t)(dst->nb[1] / sizeof(float)),
         (uint32_t)(dst->nb[2] / sizeof(float)),
         (uint32_t)(dst->nb[3] / sizeof(float)),
+        raw_window_limit > 0 ? (uint32_t) raw_window_limit : 0u,
+        0u,
         src_kv_w  ? 1u : 0u,
         src_wmask ? 1u : 0u,
         src_sink  ? 1u : 0u,
@@ -13301,7 +13306,6 @@ static void ggml_vk_dsv4_sparse_attn(ggml_backend_vk_context * ctx, vk_context& 
     // We need a custom dispatch since ggml_vk_op_f32 only handles up to 4 src + dst.
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_sparse_attn_f32;
     GGML_ASSERT(pipeline != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, src_q);
     vk_subbuffer kvc_buf = ggml_vk_tensor_subbuffer(ctx, src_kv_c);
@@ -13312,11 +13316,32 @@ static void ggml_vk_dsv4_sparse_attn(ggml_backend_vk_context * ctx, vk_context& 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
 
     const uint32_t total = pc.batch * pc.n_tokens * pc.n_heads;
-    std::array<uint32_t, 3> elements = { total, 1, 1 };
+    if (total == 0) {
+        return;
+    }
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {q_buf, kvc_buf, kvw_buf, wm_buf, idx_buf, snk_buf, dst_buf},
-        pc, elements);
+    const bool chunk_for_radv = ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+                                ctx->device->driver_id == vk::DriverId::eMesaRadv &&
+                                total > 4096;
+    const uint32_t chunk_size = chunk_for_radv ? 4096u : total;
+    const uint32_t n_chunks = CEIL_DIV(total, chunk_size);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_chunks);
+
+    for (uint32_t base = 0; base < total; base += chunk_size) {
+        const uint32_t n = std::min(chunk_size, total - base);
+        pc.base_work_idx = base;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {q_buf, kvc_buf, kvw_buf, wm_buf, idx_buf, snk_buf, dst_buf},
+            pc, { n, 1, 1 });
+
+        if (chunk_for_radv && base + n < total) {
+            ggml_vk_ctx_end(subctx);
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+            ggml_vk_ctx_begin(ctx->device, subctx);
+            ctx->compute_ctx = subctx;
+        }
+    }
 }
 
 // Returns true if node has enqueued work into the queue, false otherwise
