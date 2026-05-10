@@ -424,7 +424,25 @@ Find any meaningful remaining speed improvement or unnecessary blooper bug in th
 - MTP-enabled regression with tool-call guard passed all 7 checks. Artifact: `/tmp/dsv4_iq2xxs_mtp_regression_toolguard.out`; server log: `/tmp/dsv4_iq2xxs_mtp_regression_toolguard_server.log`.
 - Target-only regression was flaky on the first post-change run but passed all 7 on retry. Passing artifact: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry.out`; server log: `/tmp/dsv4_iq2xxs_target_regression_after_toolguard_retry_server.log`. Failed first-run artifact kept as `/tmp/dsv4_iq2xxs_target_regression_after_toolguard.out` for comparison.
 - Post-fix MTP `llama-benchy pp2048 tg32 --runs 3` passed coherence and measured pp2048 `405.28 ± 2.26 tok/s`, tg32 `30.65 ± 0.94 tok/s`, preserving the previous draft-max-1 decode win. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_pp2048_tg32_runs3.json`; server log: `/tmp/dsv4_iq2xxs_mtp_toolguard_benchy_server.log`.
-- Tool workloads are now target-only under an MTP-enabled server. This is an explicit safety scope guard, not the final verifier solution; exact DS4 verifier/frontier work is still required before enabling MTP for structured tool-call parsing and before expecting large draft-depth speedups.
+- Superseded by the exact verifier fix below: the temporary target-only tool workload guard passed regression but was the wrong scope and has been removed.
+
+## DeepSeek4 MTP tool-call exact verifier fix (2026-05-10)
+
+### Plan
+- [x] Undo the tool-call MTP bypass and the documentation that claimed tool workloads are target-only.
+- [x] Fix the actual correctness issue: speculative verifier sampling must mirror the target-only DS4 tool-call greedy-in-tool-call state machine, using a local copy of parser state while verifying draft rows.
+- [x] Keep MTP private state clearing at prompt-cache/checkpoint restore boundaries, because restore/truncation is a real sidecar-state discontinuity.
+- [x] Rebuild mounted Docker `llama-server`.
+- [x] Rerun MTP-enabled IQ2_XXS regression with tool replay and confirm all 7 pass with speculation enabled for tool requests.
+- [x] Rerun target-only regression if needed and standard non-tool `llama-benchy pp2048 tg32` to check speed impact.
+
+### Review
+- Removed the tool-call MTP bypass and README caveat. Tool workloads now remain eligible for MTP under an MTP-enabled server.
+- Added a speculative verifier path that mirrors DeepSeek4 target-only tool parsing semantics: when the local verifier parser state is inside a DSML tool call, verifier rows use argmax sampling just like the one-token target path; the verifier advances only a local parser-state copy and leaves the real slot parser state for `process_token()`.
+- Kept private MTP state clears at prompt-cache load, checkpoint restore, and prompt truncation boundaries.
+- Mounted Docker `llama-server` build passed.
+- MTP-enabled IQ2_XXS regression passed all 7 checks with speculation enabled for tool requests. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolverify_regression.out`; server log: `/tmp/dsv4_iq2xxs_mtp_toolverify_regression_server.log`.
+- Standard non-tool `llama-benchy pp2048 tg32 --runs 3` passed coherence and measured pp2048 `403.07 ± 4.12 tok/s`, tg32 `31.79 ± 1.76 tok/s`. Artifact: `/tmp/dsv4_iq2xxs_mtp_toolverify_benchy_pp2048_tg32_runs3.json`; server log: `/tmp/dsv4_iq2xxs_mtp_toolverify_benchy_server.log`.
 
 ## DeepSeek4 MTP draft-depth decode speed work (2026-05-10)
 

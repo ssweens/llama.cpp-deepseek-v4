@@ -358,17 +358,7 @@ struct server_slot {
 
     bool can_speculate() const { return !!spec; }
 
-    bool can_speculate_for_task() const {
-        if (!can_speculate()) {
-            return false;
-        }
-        // DS4 structured tool-call parsing is state-sensitive and currently exposes
-        // small verifier-batch MTP divergences on restored prompt-cache frontiers.
-        // Keep tool workloads target-only until the exact DS4 verifier/frontier path is implemented.
-        return !(task && task->params.chat_parser_params.parse_tool_calls);
-    }
-
-    void dsv4_update_tool_state(const std::string & piece) {
+    void dsv4_update_tool_state_local(const std::string & piece, bool & tool_call_open, std::string & scan_tail) const {
         if (piece.empty()) {
             return;
         }
@@ -382,21 +372,21 @@ struct server_slot {
             "</DSML｜tool_calls>",
         };
 
-        std::string scan = dsv4_tool_scan_tail + piece;
+        std::string scan = scan_tail + piece;
 
-        if (!dsv4_tool_call_open) {
+        if (!tool_call_open) {
             for (const auto * s : starts) {
                 if (scan.find(s) != std::string::npos) {
-                    dsv4_tool_call_open = true;
+                    tool_call_open = true;
                     break;
                 }
             }
         }
 
-        if (dsv4_tool_call_open) {
+        if (tool_call_open) {
             for (const auto * e : ends) {
                 if (scan.find(e) != std::string::npos) {
-                    dsv4_tool_call_open = false;
+                    tool_call_open = false;
                     break;
                 }
             }
@@ -411,10 +401,14 @@ struct server_slot {
         }
 
         if (scan.size() > keep) {
-            dsv4_tool_scan_tail = scan.substr(scan.size() - keep);
+            scan_tail = scan.substr(scan.size() - keep);
         } else {
-            dsv4_tool_scan_tail = std::move(scan);
+            scan_tail = std::move(scan);
         }
+    }
+
+    void dsv4_update_tool_state(const std::string & piece) {
+        dsv4_update_tool_state_local(piece, dsv4_tool_call_open, dsv4_tool_scan_tail);
     }
 
     void add_token(const completion_token_output & token) {
@@ -429,7 +423,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate_for_task()) {
+        if (!can_speculate()) {
             return 0;
         }
 
@@ -457,7 +451,7 @@ struct server_slot {
     void update_batch(llama_batch & batch) {
         const int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0) {
-            GGML_ASSERT(can_speculate_for_task());
+            GGML_ASSERT(can_speculate());
 
             const auto & params_spec = task->params.speculative;
 
@@ -2397,6 +2391,46 @@ private:
             return common_token_to_piece(slot.ctx, token, render_special);
         };
 
+        auto speculative_sample_and_accept = [&](server_slot & slot) {
+            const bool dsv4_tool_parser =
+                slot.task->params.dsv4_arch && slot.task->params.chat_parser_params.parse_tool_calls;
+            if (!dsv4_tool_parser) {
+                return common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+            }
+
+            GGML_ASSERT(slot.spec_i_batch.size() == slot.spec_draft.size() + 1);
+            llama_tokens result;
+            result.reserve(slot.spec_i_batch.size());
+
+            bool        tool_call_open = slot.dsv4_tool_call_open;
+            std::string scan_tail      = slot.dsv4_tool_scan_tail;
+
+            auto sample_one = [&](int idx) {
+                return tool_call_open ? sample_argmax_token(slot.ctx, idx) : common_sampler_sample(slot.smpl.get(), slot.ctx, idx);
+            };
+
+            auto accept_one = [&](llama_token id) {
+                common_sampler_accept(slot.smpl.get(), id, true);
+                slot.dsv4_update_tool_state_local(generated_token_piece(slot, id), tool_call_open, scan_tail);
+                result.push_back(id);
+            };
+
+            size_t i = 0;
+            for (; i < slot.spec_draft.size(); ++i) {
+                const llama_token id = sample_one(slot.spec_i_batch[i]);
+                accept_one(id);
+                if (slot.spec_draft[i] != id) {
+                    break;
+                }
+            }
+
+            if (i == slot.spec_draft.size()) {
+                accept_one(sample_one(slot.spec_i_batch[i]));
+            }
+
+            return result;
+        };
+
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3264,7 +3298,7 @@ private:
                     }
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    auto accepted = speculative_sample_and_accept(slot);
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
