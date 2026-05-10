@@ -5,17 +5,16 @@ Date: 2026-05-09
 
 ## Implemented in this branch
 
-- Added server-only `--mtp-model FNAME` and `--mtp-draft N` flags.
-- Added default-off fields to `common_params_speculative`:
-  - `mtp_model`
-  - `mtp_draft`
-  - `has_mtp()`
+- Added DeepSeek4 MTP validation/probe plumbing behind the existing speculative interface:
+  - `--spec-type mtp` selects MTP;
+  - existing `--model-draft FNAME` carries the DeepSeek4 MTP support GGUF path;
+  - existing `--draft-max N` / `common_params_speculative::n_max` carries the future draft cap.
 - Added server startup validation for DeepSeek4 MTP sidecar GGUFs.
 - Added a default-off DeepSeek4 final-HC output hook for one-token decode graphs.
 - Added a host-side copy buffer for that final HC state in `llama_context` for the next draft-one probe step.
 - Added env-gated sidecar tensor data loading into a persistent backend weight buffer.
 - Added an env-gated projection/top-1 probe that feeds base token embedding + captured target HC through sidecar `enorm/e_proj`, `hnorm/h_proj`, sidecar HC head/norm, and base output, then logs projection top-1 vs target argmax.
-- Kept runtime MTP drafting/speculative commit disabled. Passing `--mtp-model` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state/projection probe plumbing.
+- Kept runtime MTP drafting/speculative commit disabled. Passing `--spec-type mtp --model-draft <MTP.gguf>` validates only and logs that drafting is not enabled yet; `DSV4_MTP_PROBE=1` additionally loads sidecar tensor data and enables HC-state/projection probe plumbing.
 - Documented the new server flags in `tools/server/README.md`.
 
 ## Staged sidecar
@@ -67,23 +66,24 @@ cmake --build build-x64-linux-gcc-release --target llama-server -j 8
 Help check:
 
 ```text
-llama-server --help | rg -- '--mtp-model|--mtp-draft'
+llama-server --help | rg -- '--spec-type|--model-draft|--draft-max'
 ```
 
-Result: both flags are present in server help.
+Result: existing speculative flags expose the MTP control surface.
 
 Unsupported-target startup check:
 
 ```text
 DSV4_MTP_PROBE=1 llama-server -m /tmp/stories260K.gguf \
-  --mtp-model /mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  --spec-type mtp \
+  --model-draft /mnt/models/gguf/deepseek-ai__DeepSeek-V4-Flash/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
   --ctx-size 32 --no-warmup --port 18191
 ```
 
 Result: server exits with rc `1`, reports no sidecar tensor-data load, and emits clean error:
 
 ```text
-failed to validate DeepSeek4 MTP sidecar '...DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf': --mtp-model is only supported with DeepSeek4 target models
+failed to validate DeepSeek4 MTP sidecar '...DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf': MTP speculative decoding is only supported with DeepSeek4 target models in this build
 ```
 
 Default no-MTP startup check:
@@ -113,7 +113,7 @@ Note: whole-file `clang-format --dry-run` on `tools/server/server-context.cpp` r
 
 ## HC-state probe plumbing
 
-When a valid DeepSeek4 target is loaded with `--mtp-model` and `DSV4_MTP_PROBE=1`:
+When a valid DeepSeek4 target is loaded with `--spec-type mtp --model-draft <MTP.gguf>` and `DSV4_MTP_PROBE=1`:
 
 - server startup loads the MTP sidecar GGUF tensor data into a persistent backend weight buffer, using the target model HC/output tensor buffer type;
 - server startup sets a private context probe flag;

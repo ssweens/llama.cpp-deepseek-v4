@@ -238,10 +238,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `-ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `-md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_MODEL_DRAFT) |
-| `--mtp-model FNAME` | DeepSeek4 MTP support sidecar GGUF for future speculative decoding. Startup validates the sidecar only; `DSV4_MTP_PROBE=1` additionally loads tensor data, captures final HC state, and logs a projection-only top-1 probe. Runtime drafting remains disabled. (default: unused)<br/>(env: LLAMA_ARG_MTP_MODEL) |
-| `--mtp-draft N` | maximum DeepSeek4 MTP draft tokens per speculative step (default: 1)<br/>(env: LLAMA_ARG_MTP_DRAFT) |
+| `--spec-type [none\|mtp\|ngram-cache\|ngram-simple\|ngram-map-k\|ngram-map-k4v\|ngram-mod]` | type of speculative decoding to use when no draft model is provided (default: none). For DeepSeek4 MTP probes, use `--spec-type mtp --model-draft <MTP.gguf>`; `--draft-max` controls the future draft cap. Runtime drafting remains disabled. (env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-replace TARGET DRAFT` | translate the string in TARGET into DRAFT if the draft model and main model are not compatible |
-| `--spec-type [none\|ngram-cache\|ngram-simple\|ngram-map-k\|ngram-map-k4v\|ngram-mod]` | type of speculative decoding to use when no draft model is provided (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
 | `--spec-ngram-size-n N` | ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: 12) |
 | `--spec-ngram-size-m N` | ngram size M for ngram-simple/ngram-map speculative decoding, length of draft m-gram (default: 48) |
 | `--spec-ngram-min-hits N` | minimum hits for ngram-map speculative decoding (default: 1) |

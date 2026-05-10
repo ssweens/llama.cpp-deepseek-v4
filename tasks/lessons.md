@@ -218,3 +218,9 @@ I sanitized newly added runbook docs and the regression script's local DS4 path,
 - **When sanitizing public-facing test materials, include tracked fixtures and filenames.** Search docs, scripts, fixture contents, and default paths together.
 - **Prefer generic replay names and environment-variable defaults.** Avoid machine-local paths, usernames, and product-specific names in committed regression fixtures unless intentionally public.
 - **Keep cleanup commits tightly scoped.** Do not include unrelated planning-doc edits in a sanitization/regression-materials commit; inspect `git show --name-status` before reporting the commit as done.
+
+## 2026-05-09 — MTP/speculative API boundary
+- When adding model-specific MTP support, start from existing speculative decoding params/types and keep the user-facing/control-plane API model-agnostic where reasonable. Add architecture-specific fields only behind the generic speculative boundary, not as parallel server-only concepts.
+
+## 2026-05-09 — Avoid new speculative params when existing ones fit
+- Do not add new public speculative params/args/types for MTP unless the existing speculative interface cannot represent the need. Prefer existing draft/model/speculative params and keep architecture-specific MTP details internal to the implementation.

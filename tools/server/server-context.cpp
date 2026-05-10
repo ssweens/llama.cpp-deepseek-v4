@@ -183,7 +183,7 @@ static bool server_dsv4_mtp_check_tensor(ggml_context *                   ctx_me
 
 static bool server_dsv4_validate_mtp_sidecar(const std::string & path, const llama_model * model, std::string & err) {
     if (model == nullptr || model->arch != LLM_ARCH_DEEPSEEK4) {
-        err = "--mtp-model is only supported with DeepSeek4 target models";
+        err = "MTP speculative decoding is only supported with DeepSeek4 target models in this build";
         return false;
     }
     if (model->tok_embd == nullptr || model->output == nullptr) {
@@ -1093,23 +1093,28 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (params_base.speculative.has_mtp()) {
-            std::string mtp_err;
-            if (!server_dsv4_validate_mtp_sidecar(params_base.speculative.mtp_model, model, mtp_err)) {
-                SRV_ERR("failed to validate DeepSeek4 MTP sidecar '%s': %s\n",
-                        params_base.speculative.mtp_model.c_str(), mtp_err.c_str());
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+            if (!params_base.speculative.has_dft()) {
+                SRV_ERR("%s\n",
+                        "MTP speculative decoding requires --model-draft pointing to a model-native MTP support GGUF");
                 return false;
             }
-            SRV_INF("validated DeepSeek4 MTP sidecar '%s' (draft=%d)\n", params_base.speculative.mtp_model.c_str(),
-                    params_base.speculative.mtp_draft);
+
+            const std::string & sidecar_model = params_base.speculative.mparams_dft.path;
+            std::string mtp_err;
+            if (!server_dsv4_validate_mtp_sidecar(sidecar_model, model, mtp_err)) {
+                SRV_ERR("failed to validate DeepSeek4 MTP sidecar '%s': %s\n", sidecar_model.c_str(), mtp_err.c_str());
+                return false;
+            }
+            SRV_INF("validated DeepSeek4 MTP sidecar '%s' (draft=%d)\n", sidecar_model.c_str(),
+                    params_base.speculative.n_max);
             const bool mtp_probe = server_env_truthy("DSV4_MTP_PROBE");
             ctx->set_dsv4_mtp_probe(mtp_probe);
             if (mtp_probe) {
                 std::string mtp_load_err;
-                if (!ctx->load_dsv4_mtp_sidecar(params_base.speculative.mtp_model, mtp_load_err)) {
+                if (!ctx->load_dsv4_mtp_sidecar(sidecar_model, mtp_load_err)) {
                     throw std::runtime_error(string_format("failed to load DeepSeek4 MTP sidecar tensor data '%s': %s",
-                                                           params_base.speculative.mtp_model.c_str(),
-                                                           mtp_load_err.c_str()));
+                                                           sidecar_model.c_str(), mtp_load_err.c_str()));
                 }
                 SRV_WRN("%s\n", "DeepSeek4 MTP probe is enabled; drafting/speculative commit is still disabled");
             } else {
@@ -1118,7 +1123,7 @@ private:
             }
         }
 
-        if (params_base.speculative.has_dft()) {
+        if (params_base.speculative.has_dft() && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
             // TODO speculative: move to common/speculative.cpp?
             SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
 

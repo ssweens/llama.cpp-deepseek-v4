@@ -156,15 +156,16 @@ enum common_params_sampling_config : uint64_t {
 };
 
 enum common_speculative_type {
-    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+    COMMON_SPECULATIVE_TYPE_NONE,           // no speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT,          // draft model
+    COMMON_SPECULATIVE_TYPE_EAGLE3,         // eagle draft model
+    COMMON_SPECULATIVE_TYPE_MTP,            // multi-token prediction
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,   // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,    // self-speculative decoding with n-gram keys only
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,  // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,    // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COUNT           // number of types, unknown type
 };
 
 // Grammar type enumeration
@@ -340,14 +341,9 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    // DeepSeek4 MTP sidecar support model. This is not a standalone draft llama_model:
-    // it shares the target model's token embedding/output tensors and is validated separately.
-    std::string mtp_model;
-    int32_t     mtp_draft = 1;
-
     bool has_dft() const { return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty(); }
 
-    bool has_mtp() const { return !mtp_model.empty(); }
+    bool has_mtp() const { return type == COMMON_SPECULATIVE_TYPE_MTP && has_dft(); }
 };
 
 struct common_params_vocoder {

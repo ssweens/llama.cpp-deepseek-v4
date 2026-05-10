@@ -19,25 +19,21 @@
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 const std::vector<enum common_speculative_type> common_speculative_types = {
-    COMMON_SPECULATIVE_TYPE_NONE,
-    COMMON_SPECULATIVE_TYPE_DRAFT,
-    COMMON_SPECULATIVE_TYPE_EAGLE3,
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NONE,          COMMON_SPECULATIVE_TYPE_DRAFT,        COMMON_SPECULATIVE_TYPE_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_MTP,           COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, COMMON_SPECULATIVE_TYPE_NGRAM_MOD,    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
-    {"none",          COMMON_SPECULATIVE_TYPE_NONE},
-    {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
-    {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
-    {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-    {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
-    {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
-    {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    { "none",          COMMON_SPECULATIVE_TYPE_NONE          },
+    { "draft",         COMMON_SPECULATIVE_TYPE_DRAFT         },
+    { "eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3        },
+    { "mtp",           COMMON_SPECULATIVE_TYPE_MTP           },
+    { "ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE  },
+    { "ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K   },
+    { "ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V },
+    { "ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD     },
+    { "ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE   }
 };
 
 struct common_speculative_config {
@@ -896,6 +892,8 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
+        case COMMON_SPECULATIVE_TYPE_MTP:
+            return "mtp";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
@@ -971,7 +969,7 @@ common_speculative * common_speculative_init(
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
-        if (has_draft) {
+        if (has_draft && params.type != COMMON_SPECULATIVE_TYPE_MTP) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
         if (has_draft_eagle3) {
