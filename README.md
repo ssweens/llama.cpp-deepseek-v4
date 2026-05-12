@@ -1,3 +1,8 @@
+> **DeepSeek-V4 fork of llama.cpp** — relatively stable experimental support for DeepSeek-V4-Flash / V4-Pro.
+>
+> - Pre-built GGUFs for this fork: <https://huggingface.co/ssweens/DeepSeek-V4-Flash-GGUF-YMMV>
+> - Compatible with antirez's DeepSeek-V4 GGUFs: <https://huggingface.co/antirez/deepseek-v4-gguf>
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
